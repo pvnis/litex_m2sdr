@@ -1,0 +1,23 @@
+# Global parameters
+global:
+  frames_per_packet: 1024
+  wait_initial_cycles: 20
+  wait_between_packets: 10
+  wait_final_cycles: 500
+  data_width: 64
+  max_packets: 8
+  sys_freq: 50000000
+  rfic_freq: 50000000 #TODO RFIC clock frequency (should be chaged later)
+
+# Test cases
+tests:
+  test_1_future_timestamps:
+    description: "Two packets with timestamps well in the future (no urgency)"
+    packets:
+      - id: 1
+        timestamp: 100
+        description: "Packet 1: ts=100 (80 cycles in future)"
+      - id: 2
+        timestamp_offset: 200
+        description: "Packet 2: ts=200 (plenty of time)"
+    wait_after_all_packets: 3000

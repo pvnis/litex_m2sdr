@@ -212,7 +212,7 @@ class AD9361RFIC(LiteXModule):
         )
 
 
-        # TX CDC -> Scheduler_tx (if enabled) -> GPIOTXUnpacker -> PHY.
+        # GPIOTXUnpacker -> PHY.
         self.comb += [
             gpio_tx_unpacker.source.connect(self.phy.sink, keep={"valid", "ready"}),
             self.phy.sink.ia.eq(gpio_tx_unpacker.source.data[0*16:1*16]),

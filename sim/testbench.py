@@ -1,51 +1,19 @@
 #!/usr/bin/env python3
 
-from migen import *
-from migen.genlib.cdc import ClockDomainsRenamer
-from litex.soc.interconnect import stream
-
 from litex.gen import *
 from ExperimentManager import ExperimentManager
 
-# import your actual scheduler and layouts
+import os, sys, argparse, subprocess, importlib
 
-import os, sys, argparse, subprocess
-
-BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, BASE_DIR)
-
-from litex_m2sdr.gateware.ad9361.scheduler import Scheduler
-from testbench_helpers import wait, drive_packet, write_manual_time, read_time, read_current_ts, read_fifo_level
 
 sys_freq = 50000000  # sys clock for the sim (20 ns period)
 
-class Top(Module):
-    def __init__(self, frames_per_packet=1024, data_width=64, max_packets=8):
-        # If your scheduler normally runs in "rfic", keep it in sys for this sim
-        self.clk = Signal()
-
-        self.submodules.top = ClockDomainsRenamer("rfic")(Scheduler(frames_per_packet, data_width, max_packets))
-        # Simple free-running timebase for 'now'
-        self.now = Signal(64)
-        # self.sync += self.now.eq(self.now + 1)
-        # self.comb += self.top.now.eq(self.now)
-        self.enable = self.top.enable
-        self.reset = self.top.reset
-        self._write_time = self.top._write_time
-        self._current_ts = self.top._current_ts
-        self.write_time_manually = self.top.write_time_manually
-        self.control = self.top._control
-        # Shorthand handles
-        self.sink   = self.top.sink
-        self.source = self.top.source
-        self.data_fifo = self.top.data_fifo
-        # Always accept output (no backpressure) so it's easy to observe
-        self.comb += [ self.source.ready.eq(1)]
-
-class SchedulerTestbench():
+class Testbench():
     """Main testbench orchestrator using config-driven approach."""
     
-    def __init__(self, dut, config = ExperimentManager(config_file ="alltest_config.yaml").config):
+    def __init__(self, dut, config):
 
         self.dut = dut
         self.config = config
@@ -59,15 +27,10 @@ class SchedulerTestbench():
     
     def run_all_tests(self):
         """Run all tests from config."""
-        print("\n[TB] ========== SCHEDULER TESTBENCH ==========")
+        print("\n[TB] ========== TESTBENCH ==========")
         self.config.list_tests()
         print("\n")
-        for test_id ,test_name in enumerate(self.config.get_all_tests()):
-            if test_id == 0:
-                yield from read_time(self.dut)
-            elif test_id == 2:
-                yield from write_manual_time(self.dut, self.current_time - 100)
-            
+        for test_id ,test_name in enumerate(self.config.get_all_tests()):            
             yield from self.run_test(test_name, test_id + 1)
         
         print("\n[TB] ========== ALL TESTS COMPLETED ==========\n")
@@ -154,33 +117,143 @@ def stimulus(tb, test_name="all"):
     else:
         yield from tb.run_test(test_name)
 
+def drive_packet(dut, ts_when_due, packet_id=0, test_id = 1, header=0xDEADBEEF, frames_per_packet=1024, verbose=False):
+    """
+    Drive one packet into sched.sink with a given timestamp.
+    
+    Args:
+        dut: Device under test
+        ts_when_due: Timestamp for this packet
+        packet_id: Packet identifier (for logging)
+        header: Header word (default 0xDEADBEEF)
+        frames_per_packet: Number of frames in the packet
+    """
+    print(f"      [drive] Packet {packet_id}: ts={ts_when_due}, frames={frames_per_packet}")
+    
+    yield dut.sink.valid.eq(1)
+    yield dut.enable.eq(1)
+    sink_ready = (yield dut.sink.ready)
+    
+    # Wait until FIFO can accept
+    while sink_ready == 0:
+        print(f"      [drive] Waiting for sink.ready...")
+        yield
+        sink_ready = (yield dut.sink.ready)
+    
+    # Drive the frames
+    for i in range(frames_per_packet):
+        if verbose:        print(f"[stim] Driving word {i}") 
+        yield dut.sink.valid.eq(1)
+        yield dut.sink.first.eq(i == 0)
+        yield dut.sink.last.eq(i == (frames_per_packet - 1))
+        if i == 0:
+            yield dut.sink.data.eq(header)
+        elif i == 1:
+            yield dut.sink.data.eq(ts_when_due)
+        else:
+            yield dut.sink.data.eq((test_id << 32) | (packet_id << 16) | i)
+        
+        # Wait for handshake
+        while True:
+            ready = (yield dut.sink.ready)
+            yield
+            if ready:
+                break
+    
+    yield dut.sink.valid.eq(0)
+    print(f"      [drive] Packet {packet_id}: Complete\n")
+
+def write_manual_time(dut, new_time):
+    """Write a new manual time to the scheduler."""
+    print(f"[CSR] Writing manual time: {new_time}")
+    yield dut._write_time.storage.eq(new_time)
+    yield dut.control.fields.write.eq(1)
+    yield
+    yield dut.control.fields.write.eq(0)
+    print(f"[CSR] Manual time write complete.\n")
+
+def read_time(dut):
+    """Write a new manual time to the scheduler."""
+    print(f"[CSR] Reading current time")
+    yield dut.control.fields.read.eq(1)
+    yield
+    yield dut.control.fields.read.eq(0)
+    print(f"[CSR] Time read complete.\n")
+
+def read_current_ts(dut):
+    """Read the current timestamp from the scheduler."""
+    print(f"[CSR] Reading current timestamp")
+    yield dut.control.fields.read_current_ts.eq(1)
+    yield
+    yield dut.control.fields.read_current_ts.eq(0)
+    current_ts = (yield dut._current_ts.status)
+    print(f"[CSR] Current timestamp read complete: {current_ts}\n")
+    return current_ts
+
+def read_fifo_level(dut):
+    """Read the current FIFO level from the scheduler."""
+    print(f"[CSR] Reading FIFO level")
+    fifo_level = (yield dut._fifo_level.status)
+    print(f"[CSR] FIFO level read complete: {fifo_level}\n")
+    return fifo_level
+
+def wait(wait_cycles):
+    """Wait for N cycles."""
+    for _ in range(wait_cycles):
+        yield
+
 def main():
     argparser = argparse.ArgumentParser(
-        description="Scheduler Testbench - LiteX-M2SDR Simulation",
+        description="Testbench - LiteX-M2SDR Simulation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
             Examples:
-            # Run alltest_config.yaml (default) and save VCD
-            python scheduler_tb.py
+            # Run with header top, VCD in sim/header_sim
+            python testbench.py --top sim.header_sim.top.Top
             
-            # Run to run specific test that will be saved later as mytest.vcd
-            python scheduler_tb.py --xp-name mytest
+            # Run with scheduler top, VCD in sim/scheduler_sim
+            python testbench.py --top sim.scheduler_sim.scheduler_tb.Top --xp-name mytest
+            
+            # Override VCD dir manually (optional)
+            python testbench.py --top sim.scheduler_sim.scheduler_tb.Top --vcd-dir custom_vcd
             
             # Open latest experiment VCD in GTKWave automatically
-            python scheduler_tb.py --gtk
-            
+            python testbench.py --top sim.scheduler_sim.scheduler_tb.Top --gtk
         """
     )
-    argparser.add_argument("--config-file",    default="alltest_config.yaml", help="YAML configuration file for tests")
-    argparser.add_argument("--gtk",              action="store_true",        help="Open GTKWave at end of simulation")
-    argparser.add_argument("--vcd-dir",         default="vcd_outputs",      help="Directory to store VCD files")
-    argparser.add_argument("--xp-name",  default="",                  help="Name of the experiment (used in folder and VCD naming)")
+    argparser.add_argument("--config-file",     default="config_yaml/alltest_config.yaml", help="YAML configuration file for tests")
+    argparser.add_argument("--gtk",             action="store_true",           help="Open GTKWave at end of simulation")
+    argparser.add_argument("--vcd-dir",         default=None,                  help="Directory to store VCD files (overrides module-based default)")
+    argparser.add_argument("--xp-name",         default="",                    help="Name of the experiment (used in folder and VCD naming)")
+    argparser.add_argument("--top",      required=True,                help="Dotted path to the top module class (e.g., sim.scheduler_sim.scheduler_tb.Top)")
     args = argparser.parse_args()
 
-    if args.config_file.endswith("_config.yaml") == False:
+    #handle config file path (must end in _config.yaml and be in config_yaml folder)
+    if args.config_file.endswith("_config.yaml") and os.path.exists(args.config_file):
+        config_file = args.config_file
+    else:
         raise Exception("config file name must end in _config.yaml \nExample: mytest_config.yaml")
-    xp_name = args.config_file[:args.config_file.find("_config.yaml")]
-    experiment = ExperimentManager(experiment_name=xp_name, config_file=args.config_file, vcd_dir=args.vcd_dir)
+    
+    # Dynamically import the top module
+    try:
+        module_path, class_name = args.top.rsplit('.', 1)
+        top_module = importlib.import_module(module_path)
+        Top = getattr(top_module, class_name)
+    except (ImportError, AttributeError) as e:
+        raise Exception(f"Failed to import top module '{args.top}': {e}")
+    
+    # Extract up to the second-to-last dot for the directory (e.g., sim.scheduler_sim)
+    vcd_dir_parts = module_path.split('.')
+    if vcd_dir_parts[0] == 'sim':
+        vcd_dir_parts = vcd_dir_parts[1:]
+        vcd_dir_parts.pop() # remove the last part (module name)
+        vcd_dir_parts.append("vcd_outputs")
+        vcd_dir = os.path.join(*vcd_dir_parts) #replace the . with / 
+
+    else:
+        raise Exception("Top module must be inside the 'sim' package.")
+
+    experiment = ExperimentManager(experiment_name=args.xp_name, config_file=config_file, vcd_dir=vcd_dir)
     frames_per_packet = experiment.config.get_global_param("frames_per_packet", 1024)
     data_width = experiment.config.get_global_param("data_width", 64)
     max_packets = experiment.config.get_global_param("max_packets", 8)
@@ -189,9 +262,10 @@ def main():
 
     top = Top(frames_per_packet, data_width, max_packets)
 
-    tb = SchedulerTestbench(dut =  top, config = experiment.config)
+    tb = Testbench(dut =  top, config = experiment.config)
 
     # Generate VCD filename
+    experiment._create_vcd_dir()
     vcd_path = experiment.get_vcd_path()
     experiment.generate_report()
     print("Top created, starting simulation...")

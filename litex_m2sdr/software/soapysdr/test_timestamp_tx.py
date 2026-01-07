@@ -29,6 +29,7 @@ def main():
     parser.add_argument('-g', '--gain', type=float, default=0, help='TX gain in dB')
     parser.add_argument('-t', '--time', type=float, default=5, help='Transmission time in seconds')
     parser.add_argument('-c', '--channel', type=int, default=0, help='Channel number')
+    parser.add_argument('--ts', type=int, default=0, help='timestamp mode (0=off, 1=on)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
     
     args = parser.parse_args()
@@ -50,7 +51,7 @@ def main():
     
     # Setup TX stream with timestamp mode enabled
     tx_stream = sdr.setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, [args.channel], 
-                               dict(timestamp_mode="1"))
+                               dict(timestamp_mode=str(args.ts)))
 
     # Get stream MTU
     samples_per_buffer = sdr.getStreamMTU(tx_stream)

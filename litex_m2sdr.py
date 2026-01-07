@@ -798,11 +798,11 @@ class BaseSoC(SoCMini):
         assert hasattr(self, "pcie_dma0")
         analyzer_signals = [
             self.pcie_dma0.source, 
+            self.header.tx.sink,
             self.header.tx.source,
-            self.ad9361.sink,
-            self.ad9361.scheduler_tx.latched_ts,
-            self.ad9361.scheduler_tx.frame_count,
-            self.ad9361.scheduler_tx.now,
+            self.header.tx.frame_count,
+            self.header.tx.latched_ts,
+            self.header.tx.now,
             self.ad9361.phy.sink,             
         ]
         self.analyzer = LiteScopeAnalyzer(analyzer_signals,

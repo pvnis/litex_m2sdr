@@ -5,12 +5,11 @@ from datetime import datetime
 class ExperimentManager:
     """ Manages experiment setup including VCD and config handling."""
 
-    def __init__(self, experiment_name = None, config_file = "alltests_config.yaml", vcd_dir="vcd_outputs"):
+    def __init__(self, config_file, vcd_dir,  experiment_name = None):
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
         self.config_file = config_file
         self.vcd_dir = vcd_dir
-        self._create_vcd_dir()
 
         self.config = ConfigLoader(config_file)
         # Create experiment folder
@@ -19,7 +18,7 @@ class ExperimentManager:
         else:
             # Default: timestamp-based
             self.experiment_name = f"{timestamp}"
-        self.experiment_dir = self._create_experiment_folder()
+        
     
     def _create_vcd_dir(self):
         """Create VCD directory if it doesn't exist."""
@@ -27,6 +26,7 @@ class ExperimentManager:
         print(f"[VCD] VCD output directory: {os.path.abspath(self.vcd_dir)}")
     
     def get_vcd_path(self):
+        self.experiment_dir = self._create_experiment_folder()
         if not self.experiment_dir:
             raise RuntimeError("Experiment folder not created. Call create_experiment_folder() first.")
         

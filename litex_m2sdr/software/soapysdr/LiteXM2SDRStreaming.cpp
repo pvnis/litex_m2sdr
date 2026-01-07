@@ -33,6 +33,7 @@ static constexpr size_t RX_DMA_HEADER_SIZE = 0;
 
 /* TX DMA Header */
 static size_t TX_DMA_HEADER_SIZE = 0;
+static size_t print_counter = 0;
 
 /* Setup and configure a stream for RX or TX. */
 SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
@@ -301,6 +302,7 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
     }
 
     /* Configure 2T2R/1T1R mode (PHY) */
+    printf("Configuring PHY for %u channels\n", _nChannels);
     litex_m2sdr_writel(_fd, CSR_AD9361_PHY_CONTROL_ADDR, _nChannels == 1 ? 1 : 0);
 
     /* AD9361 Channel en/dis */
@@ -386,8 +388,8 @@ int SoapyLiteXM2SDR::activateStream(
         _tx_stream.user_count = 0;
         if (_tx_stream.timestamp_mode) {
             this->enableScheduler(false);
-            _tx_stream.base_timestamp = this->getRFICTime();//this->getHardwareTime(std::string());
-            printf("rfic base HW time = %llu\n", this->getRFICTime());
+            _tx_stream.base_timestamp = this->getHardwareTime(std::string());
+            printf("rfic base HW time = %lu\n", this->getTXBaseTimestamp());
         }
 #elif USE_LITEETH
         /* Crossbar Mux: Select Ethernet streaming */
@@ -716,8 +718,8 @@ int SoapyLiteXM2SDR::acquireWriteBuffer(
         SoapySDR_logf(SOAPY_SDR_DEBUG, "TX DMA Header inserted: timestamp increment: %llu, new timestamp: %llu",
                       time_increment, fakeTimestamp);
         
-        uint64_t last_timestamp = litex_m2sdr_readl(_fd, CSR_HEADER_LAST_TX_TIMESTAMP_ADDR);
-        printf("[FROM CSR] Last TX Timestamp = %lu\n ", last_timestamp);
+        // uint64_t last_timestamp = getHeaderLastTimestamp();
+        // printf("[FROM CSR] Last TX Timestamp = %lu\n ", last_timestamp);
     }
 #else
     if (_tx_stream.timestamp_mode) {
@@ -740,7 +742,10 @@ int SoapyLiteXM2SDR::acquireWriteBuffer(
         SoapySDR_logf(SOAPY_SDR_DEBUG, "TX DMA Header inserted: timestamp: %llu", tx_frame_timestamp);
         // printf("TX DMA Header inserted: timestamp: %lu\n", tx_frame_timestamp);
         uint64_t last_timestamp = getHeaderLastTimestamp();
-        printf("[FROM CSR] Last TX Timestamp = %lu\n ", last_timestamp);
+        print_counter++; 
+        if (print_counter % 10000 == 0) {
+            printf("[FROM CSR] Last TX Timestamp = %lu ns\n", last_timestamp);
+        }
     }
 
 #endif
