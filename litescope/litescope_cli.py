@@ -82,7 +82,8 @@ def main():
         analyzer.configure_trigger(cond={str(trigger_signal): f"0b{header:064b}"})
     elif args.frame_count:
         trigger_signal = "basesoc_ad9361_scheduler_frame_count"
-        analyzer.configure_trigger(cond={str(trigger_signal): f"0b{1:064b}"})
+        # Trigger when frame count reaches 3
+        analyzer.configure_trigger(cond={str(trigger_signal): f"0b{3:064b}"})
     
     analyzer.configure_subsampler(1)
     analyzer.run(offset=int(args.offset), length=int(args.length))

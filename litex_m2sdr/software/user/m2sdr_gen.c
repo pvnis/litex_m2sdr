@@ -49,6 +49,8 @@ static int get_prbs_bit(void) {
     prbs_lfsr = (prbs_lfsr << 1) | bit;
     return bit;
 }
+uint64_t last_timestamp = 0;
+uint64_t last_header = 0;
 
 /* Signal (DMA TX) with GPIO PPS */
 /*-----------------------------*/
@@ -199,11 +201,15 @@ static void m2sdr_gen(const char *device_name, double sample_rate, double freque
         if (duration > 200) {
             /* Print banner every 10 lines */
             if (i % 10 == 0) {
-                printf("\e[1mSPEED(Gbps)   BUFFERS   SIZE(MB)   UNDERFLOWS\e[0m\n");
-                uint64_t last_timestamp = litepcie_readl(fd, CSR_HEADER_LAST_TX_TIMESTAMP_ADDR);
-                printf("[FROM CSR] Last TX Timestamp = %llu\n", last_timestamp);
-                uint64_t last_header = litepcie_readl(fd, CSR_HEADER_LAST_TX_HEADER_ADDR);
-                printf("[FROM CSR] Last TX Header = %llu\n", last_header);
+                printf("\e[1mSPEED(Gbps)   BUFFERS   SIZE(MB)   UNDERFLOWS\e[0m\n");    
+                last_timestamp = 0;
+                last_timestamp |= ((uint64_t)litepcie_readl(fd, CSR_HEADER_LAST_TX_TIMESTAMP_ADDR + 0) << 32);
+                last_timestamp |= ((uint64_t)litepcie_readl(fd, CSR_HEADER_LAST_TX_TIMESTAMP_ADDR + 4) << 0);
+                printf("[FROM CSR] Last TX Timestamp = %lu\n", last_timestamp);
+                last_header = 0;                
+                last_header |= ((uint64_t)litepcie_readl(fd, CSR_HEADER_LAST_TX_HEADER_ADDR + 0) << 32);
+                last_header |= ((uint64_t)litepcie_readl(fd, CSR_HEADER_LAST_TX_HEADER_ADDR + 4) << 0);
+                printf("[FROM CSR] Last TX Header = 0x%lX\n", last_header);
                 // uint64_t scheduler_status = litepcie_readl(fd, CSR_AD9361_SCHEDULER_TX_STATUS_ADDR);
                 // uint8_t sink_ready, sink_valid, source_ready, source_valid;
                 // sink_valid = scheduler_status & 0b1;

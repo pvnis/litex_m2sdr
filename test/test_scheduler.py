@@ -134,10 +134,11 @@ def main():
 
     scheduler = SchedulerDriver(bus=bus, name="ad9361_scheduler_tx")
     scheduler.enable_scheduler(enable=0, reset=1)
+    scheduler.enable_scheduler(enable=1, reset=0)
     scheduler.enable_header(enable=1)
 
-    scheduler.write_manual_time(time_ns=0xfcffffffffffffff)
-    print(scheduler.read_current_ts())
+    # scheduler.write_manual_time(time_ns=0x0f830c080f830c09)
+    # print(scheduler.read_now())
     # scheduler.enable_scheduler(enable= 0,reset=1)
     # scheduler.enable_scheduler(enable=1)
     # scheduler.test_time(new_time=100)
@@ -145,7 +146,7 @@ def main():
     # scheduler.enable_scheduler(enable=0)
 
 
-    # scheduler.test_time(new_time=100)
+    scheduler.test_time(new_time=100)
 
     # scheduler.enable_scheduler(enable=0)
     # scheduler.test_time()
