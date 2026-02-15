@@ -61,16 +61,9 @@ static uint32_t parse_u32(const char *s)
     return (uint32_t)v;
 }
 
-static void msleep(unsigned ms)
+static __attribute__((unused)) void msleep(unsigned ms)
 {
     usleep(ms * 1000);
-}
-
-static int64_t get_time_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 /* Connection functions ------------------------------------------------------ */
@@ -105,7 +98,7 @@ static void m2sdr_close(void *conn)
 
 /* 64-bit CSR access (LiteX ordering: upper @ base+0, lower @ base+4) -------- */
 
-static void csr_write64(void *conn, uint32_t addr, uint64_t v)
+static __attribute__((unused)) void csr_write64(void *conn, uint32_t addr, uint64_t v)
 {
     m2sdr_writel(conn, addr + 0, (uint32_t)(v >> 32));
     m2sdr_writel(conn, addr + 4, (uint32_t)(v >>  0));
@@ -551,6 +544,10 @@ int main(int argc, char **argv)
 
     if (optind >= argc)
         help();
+
+#ifndef CSR_SATA_PHY_BASE
+    (void)timeout_ms;
+#endif
 
 #ifdef USE_LITEPCIE
     snprintf(m2sdr_device, sizeof(m2sdr_device), "/dev/m2sdr%d", m2sdr_device_num);
