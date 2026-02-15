@@ -2,9 +2,9 @@
  *
  * M2SDR Board Utility.
  *
- * This file is part of LiteX-M2SDR project.
+ * This file is part of LiteX-M2SDR.
  *
- * Copyright (c) 2024-2025 Enjoy-Digital <enjoy-digital.fr>
+ * Copyright (c) 2024-2026 Enjoy-Digital <enjoy-digital.fr>
  *
  */
 
@@ -19,6 +19,7 @@
 #include <time.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #include "ad9361/util.h"
 #include "ad9361/ad9361.h"
@@ -51,6 +52,16 @@ sig_atomic_t keep_running = 1;
 
 void intHandler(int dummy) {
     keep_running = 0;
+}
+
+static bool confirm_flash_write(void)
+{
+    char buf[8];
+    fprintf(stderr, "WARNING: flash_write can overwrite the FPGA image.\n");
+    fprintf(stderr, "Type 'YES' to continue: ");
+    if (!fgets(buf, sizeof(buf), stdin))
+        return false;
+    return (strncmp(buf, "YES", 3) == 0);
 }
 
 /* Connection Functions */
@@ -489,6 +500,16 @@ static void info(void)
     bool sata_enabled = (features >> CSR_CAPABILITY_FEATURES_SATA_OFFSET) & ((1 << CSR_CAPABILITY_FEATURES_SATA_SIZE) - 1);
     bool gpio_enabled = (features >> CSR_CAPABILITY_FEATURES_GPIO_OFFSET) & ((1 << CSR_CAPABILITY_FEATURES_GPIO_SIZE) - 1);
     bool wr_enabled   = (features >> CSR_CAPABILITY_FEATURES_WR_OFFSET)   & ((1 << CSR_CAPABILITY_FEATURES_WR_SIZE)   - 1);
+    bool jtagbone_enabled = (features >> CSR_CAPABILITY_FEATURES_JTAGBONE_OFFSET) & ((1 << CSR_CAPABILITY_FEATURES_JTAGBONE_SIZE) - 1);
+
+    {
+        uint32_t board_info = m2sdr_readl(conn, CSR_CAPABILITY_BOARD_INFO_ADDR);
+        int variant = (board_info >> CSR_CAPABILITY_BOARD_INFO_VARIANT_OFFSET) & ((1 << CSR_CAPABILITY_BOARD_INFO_VARIANT_SIZE) - 1);
+        const char *variant_str[] = {"M.2", "Baseboard", "Reserved", "Reserved"};
+        const char *variant_name  = (variant < 4) ? variant_str[variant] : "Unknown";
+        printf("Board:\n");
+        printf("  Variant        : %s\n", variant_name);
+    }
 
     printf("Features:\n");
     printf("  PCIe           : %s\n", pcie_enabled ? "Yes" : "No");
@@ -496,6 +517,7 @@ static void info(void)
     printf("  SATA           : %s\n", sata_enabled ? "Yes" : "No");
     printf("  GPIO           : %s\n", gpio_enabled ? "Yes" : "No");
     printf("  White Rabbit   : %s\n", wr_enabled   ? "Yes" : "No");
+    printf("  JTAGBone       : %s\n", jtagbone_enabled ? "Yes" : "No");
 
     if (pcie_enabled) {
         uint32_t pcie_config = m2sdr_readl(conn, CSR_CAPABILITY_PCIE_CONFIG_ADDR);
@@ -514,6 +536,11 @@ static void info(void)
         int eth_speed = (eth_config >> CSR_CAPABILITY_ETH_CONFIG_SPEED_OFFSET) & ((1 << CSR_CAPABILITY_ETH_CONFIG_SPEED_SIZE) - 1);
         const char *eth_speed_str[] = {"1Gbps", "2.5Gbps"};
         printf("  Ethernet Speed : %s\n", eth_speed_str[eth_speed]);
+        {
+            uint32_t board_info = m2sdr_readl(conn, CSR_CAPABILITY_BOARD_INFO_ADDR);
+            int eth_sfp  = (board_info >> CSR_CAPABILITY_BOARD_INFO_ETH_SFP_OFFSET) & ((1 << CSR_CAPABILITY_BOARD_INFO_ETH_SFP_SIZE) - 1);
+            printf("  Ethernet SFP   : %d\n", eth_sfp);
+        }
     }
 
     if (sata_enabled) {
@@ -521,6 +548,16 @@ static void info(void)
         int sata_gen = (sata_config >> CSR_CAPABILITY_SATA_CONFIG_GEN_OFFSET) & ((1 << CSR_CAPABILITY_SATA_CONFIG_GEN_SIZE) - 1);
         const char *sata_gen_str[] = {"Gen1", "Gen2", "Gen3"};
         printf("  SATA Gen       : %s\n", sata_gen_str[sata_gen]);
+        int sata_mode = (sata_config >> CSR_CAPABILITY_SATA_CONFIG_MODE_OFFSET) & ((1 << CSR_CAPABILITY_SATA_CONFIG_MODE_SIZE) - 1);
+        const char *sata_mode_str[] = {"Read-only", "Write-only", "Read+Write", "Reserved"};
+        const char *sata_mode_name = (sata_mode < 4) ? sata_mode_str[sata_mode] : "Unknown";
+        printf("  SATA Mode      : %s\n", sata_mode_name);
+    }
+
+    if (wr_enabled) {
+        uint32_t board_info = m2sdr_readl(conn, CSR_CAPABILITY_BOARD_INFO_ADDR);
+        int wr_sfp   = (board_info >> CSR_CAPABILITY_BOARD_INFO_WR_SFP_OFFSET)  & ((1 << CSR_CAPABILITY_BOARD_INFO_WR_SFP_SIZE)  - 1);
+        printf("  WR SFP         : %d\n", wr_sfp);
     }
 #endif
     printf("\n");
@@ -1507,6 +1544,10 @@ int main(int argc, char **argv)
         filename = argv[optind++];
         if (optind < argc)
             offset = strtoul(argv[optind++], NULL, 0);
+        if (!confirm_flash_write()) {
+            fprintf(stderr, "Aborted.\n");
+            exit(1);
+        }
         flash_write(filename, offset);
     }
 #endif

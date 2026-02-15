@@ -1,7 +1,7 @@
 #
 # This file is part of LiteX-M2SDR.
 #
-# Copyright (c) 2024-2025 Enjoy-Digital <enjoy-digital.fr>
+# Copyright (c) 2024-2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
 from migen import *
@@ -200,8 +200,13 @@ class AD9361RFIC(LiteXModule):
 
         # TX Scheduler ---------------------------------------------------------------------------
         self.submodules.scheduler_tx = scheduler_tx = ClockDomainsRenamer("rfic")(Scheduler())
-        self.comb += scheduler_tx.enable.eq(self._scheduler_tx.fields.enable)   
-        
+        self.comb += scheduler_tx.enable.eq(self._scheduler_tx.fields.enable)
+
+        # Scheduler time input (will be connected by top-level SoC)
+        # This signal must be driven by TimeGenerator.time via CDC
+        self.scheduler_time_input = Signal(64)
+        self.comb += scheduler_tx.time_input.eq(self.scheduler_time_input)
+
         self.tx_pipeline = stream.Pipeline(
             self.sink,
             tx_buffer,

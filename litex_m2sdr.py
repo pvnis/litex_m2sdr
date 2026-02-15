@@ -3,18 +3,15 @@
 #
 # This file is part of LiteX-M2SDR.
 #
-# Copyright (c) 2024-2025 Enjoy-Digital <enjoy-digital.fr>
+# Copyright (c) 2024-2026 Enjoy-Digital <enjoy-digital.fr>
 # SPDX-License-Identifier: BSD-2-Clause
 
 import os
-import time
 import argparse
 
 from migen import *
 
 from litex.gen import *
-from litex.gen.genlib.cdc import BusSynchronizer
-
 from litex.build.generic_platform import Subsignal, Pins
 
 from litex.soc.interconnect.csr import *
@@ -33,23 +30,21 @@ from litex.soc.cores.dna       import DNA
 from litex.soc.cores.gpio      import GPIOOut
 from litex.soc.cores.spi_flash import S7SPIFlash
 
-from litex.build.generic_platform import IOStandard, Subsignal, Pins
+from litex.build.generic_platform import IOStandard
 
 from litepcie.common            import *
 from litepcie.phy.s7pciephy     import S7PCIEPHY
-from litepcie.frontend.ptm      import PCIePTMSniffer
-from litepcie.frontend.ptm      import PTMCapabilities, PTMRequester
 from litepcie.frontend.wishbone import LitePCIeWishboneSlave
 
-from liteeth.common           import convert_ip
 from liteeth.phy.a7_1000basex import A7_1000BASEX, A7_2500BASEX
 from liteeth.frontend.stream  import LiteEthStream2UDPTX, LiteEthUDP2StreamRX
 
 from litesata.phy import LiteSATAPHY
+from litesata.frontend.stream import LiteSATAStream2Sectors, LiteSATASectors2Stream
 
 from litescope import LiteScopeAnalyzer
 
-from litex_m2sdr import Platform
+from litex_m2sdr import Platform, _io_baseboard
 
 from litex_m2sdr.gateware.capability  import Capability
 from litex_m2sdr.gateware.si5351      import SI5351
@@ -59,7 +54,8 @@ from litex_m2sdr.gateware.time        import TimeGenerator
 from litex_m2sdr.gateware.pps         import PPSGenerator
 from litex_m2sdr.gateware.header      import TXRXHeader
 from litex_m2sdr.gateware.measurement import MultiClkMeasurement
-from litex_m2sdr.gateware.gpio        import GPIO, GPIORXPacker, GPIOTXUnpacker
+from litex_m2sdr.gateware.gpio        import GPIO
+from litex_m2sdr.gateware.loopback    import TXRXLoopback
 
 from litex_m2sdr.software import generate_litepcie_software
 
@@ -132,10 +128,13 @@ class CRG(LiteXModule):
             self.refclk_mmcm = S7MMCM(speedgrade=-3)
             self.comb += self.refclk_mmcm.reset.eq(self.rst)
             self.refclk_mmcm.register_clkin(ClockSignal("clk100"), 100e6)
-            self.refclk_mmcm.create_clkout(self.cd_clk_125m_gtp,  125e6, margin=0)
             self.refclk_mmcm.expose_dps("clk200", with_csr=False)
+
+            self.refclk_mmcm.create_clkout(self.cd_clk_125m_gtp,  125e6, margin=0)
             self.refclk_mmcm.params.update(p_CLKOUT0_USE_FINE_PS="TRUE")
-            self.comb += self.cd_refclk_eth.clk.eq(self.cd_clk_125m_gtp.clk)
+
+            self.refclk_mmcm.create_clkout(self.cd_refclk_eth,  125e6, margin=0)
+            self.refclk_mmcm.params.update(p_CLKOUT1_USE_FINE_PS="TRUE")
 
             # DMTD MMCM (62.5MHz).
             self.dmtd_mmcm = S7MMCM(speedgrade=-3)
@@ -150,56 +149,63 @@ class CRG(LiteXModule):
 class BaseSoC(SoCMini):
     SoCCore.csr_map = {
         # SoC.
-        "ctrl"            : 0,
-        "uart"            : 1,
-        "icap"            : 2,
-        "flash_cs_n"      : 3,
-        "xadc"            : 4,
-        "dna"             : 5,
-        "flash"           : 6,
-        "leds"            : 7,
-        "identifier_mem"  : 8,
-        "timer0"          : 9,
+        "ctrl"             :  0,
+        "uart"             :  1,
+        "icap"             :  2,
+        "flash_cs_n"       :  3,
+        "xadc"             :  4,
+        "dna"              :  5,
+        "flash"            :  6,
+        "leds"             :  7,
+        "identifier_mem"   :  8,
+        "timer0"           :  9,
 
         # Capability.
-        "capability"      : 13,
+        "capability"       : 13,
 
         # Time.
-        "time_gen"        : 17,
+        "time_gen"         : 17,
 
         # PCIe.
-        "pcie_phy"        : 10,
-        "pcie_msi"        : 11,
-        "pcie_dma0"       : 12,
+        "pcie_phy"         : 10,
+        "pcie_msi"         : 11,
+        "pcie_dma0"        : 12,
+        "ptm_requester"    : 34,
 
         # Eth.
-        "eth_phy"         : 14,
-        "eth_rx_streamer" : 15,
-        "eth_tx_streamer" : 16,
+        "eth_phy"          : 14,
+        "eth_rx_streamer"  : 15,
+        "eth_tx_streamer"  : 16,
 
         # SATA.
-        "sata_phy"        : 18,
-        "sata_core"       : 19,
-
-        # SDR.
-        "si5351"          : 20,
-        "header"          : 23,
-        "ad9361"          : 24,
-        "crossbar"        : 25,
+        "sata_phy"         : 18,
+        "sata_core"        : 19,
+        "sata_identify"    : 26,
+        "sata_mem2sector"  : 27,
+        "sata_sector2mem"  : 28,
+        "sata_rx_streamer" : 29,
+        "sata_tx_streamer" : 32,
 
         # GPIO.
-        "gpio"            : 21,
+        "gpio"             : 21,
+
+        # SDR.
+        "si5351"           : 20,
+        "header"           : 23,
+        "ad9361"           : 24,
+        "crossbar"         : 25,
+        "txrx_loopback"    : 33,
 
         # Measurements/Analyzer.
-        "clk_measurement" : 30,
-        "analyzer"        : 31,
+        "clk_measurement"  : 30,
+        "analyzer"         : 31,
     }
 
     def __init__(self, variant="m2", sys_clk_freq=int(125e6),
         with_pcie              = True,  with_pcie_ptm=False, pcie_gen=2, pcie_lanes=1,
         with_eth               = False, eth_sfp=0, eth_phy="1000basex", eth_local_ip="192.168.1.50", eth_udp_port=2345,
         with_sata              = False, sata_gen=2,
-        with_white_rabbit      = False, wr_sfp=1,
+        with_white_rabbit      = False, wr_sfp=1, wr_dac_bits=16,
         with_jtagbone          = True,
         with_gpio              = True,
         with_rfic_oversampling = False,
@@ -208,6 +214,8 @@ class BaseSoC(SoCMini):
         # Platform ---------------------------------------------------------------------------------
 
         platform = Platform(build_multiboot=True)
+        if variant == "baseboard":
+            platform.add_extension(_io_baseboard)
         if (with_eth or with_sata) and (variant != "baseboard"):
             msg = "Ethernet and SATA are only supported when mounted in the LiteX Acorn Baseboard Mini! "
             msg += "Available here: https://enjoy-digital-shop.myshopify.com/products/litex-acorn-baseboard-mini"
@@ -216,8 +224,9 @@ class BaseSoC(SoCMini):
         # SoCMini ----------------------------------------------------------------------------------
 
         SoCMini.__init__(self, platform, sys_clk_freq,
-            ident         = f"LiteX-M2SDR SoC / {variant} variant / description: {description} /  built on",
-            ident_version = True,
+            ident             = f"LiteX-M2SDR SoC / {variant} variant / description: {description} /  built on",
+            ident_version     = True,
+            csr_address_width = 15,
         )
 
         # Clocking ---------------------------------------------------------------------------------
@@ -257,12 +266,19 @@ class BaseSoC(SoCMini):
             # SATA Capabilities.
             sata_enabled    = with_sata,
             sata_gen        = {1: "gen1", 2: "gen2", 3: "gen3"}[sata_gen],
+            sata_mode       = "read+write",
 
             # GPIO Capabilities.
             gpio_enabled    = with_gpio,
 
             # White Rabbit Capabilities.
             wr_enabled      = with_white_rabbit,
+
+            # Board.
+            variant        = variant,
+            jtagbone       = with_jtagbone,
+            eth_sfp        = eth_sfp,
+            wr_sfp         = wr_sfp,
         )
 
         # SI5351 Clock Generator -------------------------------------------------------------------
@@ -279,7 +295,6 @@ class BaseSoC(SoCMini):
         self.comb += self.si5351.clkin_ufl.eq(platform.request("sync_clk_in"))
 
         # SI5351 ClkIn/Out.
-        si5351_clk_in = Signal()
         si5351_clk0   = platform.request("si5351_clk0")
         si5351_clk1   = platform.request("si5351_clk1")
         platform.add_false_path_constraints(si5351_clk0, si5351_clk1, self.crg.cd_sys.clk)
@@ -346,9 +361,9 @@ class BaseSoC(SoCMini):
             )
             self.comb += ClockSignal("refclk_pcie").eq(self.pcie_phy.pcie_refclk)
             if variant == "baseboard":
-                platform.toolchain.pre_placement_commands.append("reset_property LOC [get_cells -hierarchical -filter {{NAME=~pcie_s7/*gtp_channel.gtpe2_channel_i}}]")
-                platform.toolchain.pre_placement_commands.append("set_property LOC GTPE2_CHANNEL_X0Y4 [get_cells -hierarchical -filter {{NAME=~pcie_s7/*gtp_channel.gtpe2_channel_i}}]")
+                self.pcie_phy.add_gt_loc_constraints(["GTPE2_CHANNEL_X0Y4"], by_pipe_lane=False)
             self.pcie_phy.update_config({
+                "PCIe_Blk_Locn"            : "X0Y0",
                 "Base_Class_Menu"          : "Wireless_controller",
                 "Sub_Class_Interface_Menu" : "RF_controller",
                 "Class_Code_Base"          : "0D",
@@ -365,8 +380,10 @@ class BaseSoC(SoCMini):
             pcie_msis = {}
             if with_sata:
                 pcie_msis.update({
-                    "SATA_SECTOR2MEM" : Signal(),
-                    "SATA_MEM2SECTOR" : Signal(),
+                    "SATA_SECTOR2MEM"  : Signal(),
+                    "SATA_MEM2SECTOR"  : Signal(),
+                    "SATA_STREAM2SECT" : Signal(),
+                    "SATA_SECT2STREAM" : Signal(),
                 })
 
             # Core.
@@ -483,20 +500,6 @@ class BaseSoC(SoCMini):
         # SATA -------------------------------------------------------------------------------------
 
         if with_sata:
-            # IOs.
-            # ----
-            _sata_io = [
-                ("sata", 0,
-                    # Inverted on M2SDR.
-                    Subsignal("tx_p",  Pins("D7")),
-                    Subsignal("tx_n",  Pins("C7")),
-                    # Inverted on M2SDR.
-                    Subsignal("rx_p",  Pins("D9")),
-                    Subsignal("rx_n",  Pins("C9")),
-                ),
-            ]
-            platform.add_extension(_sata_io)
-
             # PHY.
             # ----
             self.sata_phy = LiteSATAPHY(platform.device,
@@ -517,7 +520,18 @@ class BaseSoC(SoCMini):
                     pcie_msis["SATA_MEM2SECTOR"].eq(self.sata_mem2sector.irq),
                 ]
 
-            #self.add_pcie_slave_probe()
+            # Streamers.
+            # ----------
+            self.sata_rx_streamer = LiteSATAStream2Sectors(port=self.sata_crossbar.get_port())
+            self.sata_tx_streamer = LiteSATASectors2Stream(port=self.sata_crossbar.get_port())
+
+            # IRQs.
+            # -----
+            if with_pcie:
+                self.comb += [
+                    pcie_msis["SATA_STREAM2SECT"].eq(self.sata_rx_streamer.irq),
+                    pcie_msis["SATA_SECT2STREAM"].eq(self.sata_tx_streamer.irq),
+                ]
 
         # AD9361 RFIC ------------------------------------------------------------------------------
 
@@ -549,16 +563,56 @@ class BaseSoC(SoCMini):
             self.header.rx.timestamp.eq(self.time_gen.time),
         ]
 
+        # Time Signal CDC: time domain -> rfic domain ---------------------------------------------
+        # Critical for 5G NR: Provides nanosecond-accurate time to TX scheduler
+
+        self.time_to_rfic_cdc = time_to_rfic_cdc = stream.ClockDomainCrossing(
+            layout     = [("time", 64)],
+            cd_from    = "time",
+            cd_to      = "rfic",
+            with_common_rst = False,
+        )
+        self.comb += [
+            time_to_rfic_cdc.sink.valid.eq(1),
+            time_to_rfic_cdc.sink.time.eq(self.time_gen.time),
+            time_to_rfic_cdc.source.ready.eq(1),
+        ]
+
+        # Connect TimeGenerator time to AD9361 scheduler (via CDC)
+        time_in_rfic_domain = Signal(64)
+        self.sync.rfic += [
+            If(time_to_rfic_cdc.source.valid,
+                time_in_rfic_domain.eq(time_to_rfic_cdc.source.time)
+            )
+        ]
+        self.comb += self.ad9361.scheduler_time_input.eq(time_in_rfic_domain)
+
+        # Connect header extractor timestamp to scheduler
+        # When packets arrive with timestamps, scheduler uses them for timed TX
+        self.comb += [
+            self.ad9361.scheduler_tx.timestamp.eq(self.header.tx.timestamp),
+            self.ad9361.scheduler_tx.header.eq(self.header.tx.header),
+        ]
+
         # TX/RX Datapath ---------------------------------------------------------------------------
 
-        # TX Datapath: PCIe/Eth/Sata (DMA) -> Crossbar -> Header -> AD9361 (check AD9361 core.py to follow the rest of the dataflow) -------------------------
-        # RX Datapath: AD9361 -> Header -> Crossbar -> PCIe/Eth/Sata (DMA) -------------------------
+        # TX Datapath: PCIe/Eth/Sata (DMA) -> Crossbar -> Header -> Loopback -> AD9361 (check AD9361 core.py to follow the rest of the dataflow)
+        # RX Datapath: AD9361 -> Loopback -> Header -> Crossbar -> PCIe/Eth/Sata (DMA)
 
-        # AD9361 <-> Header.
-        # ------------------
+        # AD9361 <-> Loopback <-> Header.
+        # -------------------------------
+        self.txrx_loopback = TXRXLoopback(data_width=64, with_csr=True)
+
+        # Header TX -> Loopback -> RFIC TX.
         self.comb += [
-            self.header.tx.source.connect(self.ad9361.sink),
-            self.ad9361.source.connect(self.header.rx.sink),
+            self.header.tx.source.connect(self.txrx_loopback.tx_sink),
+            self.txrx_loopback.tx_source.connect(self.ad9361.sink),
+        ]
+
+        # RFIC RX -> Loopback -> Header RX.
+        self.comb += [
+            self.ad9361.source.connect(self.txrx_loopback.rx_sink),
+            self.txrx_loopback.rx_source.connect(self.header.rx.sink),
         ]
 
         # Crossbar.
@@ -586,7 +640,7 @@ class BaseSoC(SoCMini):
         if with_eth:
             self.comb += self.eth_tx_streamer.source.connect(self.crossbar.mux.sink1, omit={"error"})
         if with_sata:
-            pass # TODO.
+            self.comb += self.sata_tx_streamer.source.connect(self.crossbar.mux.sink2, omit={"error"})
         self.comb += self.crossbar.mux.source.connect(self.header.tx.sink)
 
         # RX: Header -> Crossbar -> Comms.
@@ -602,7 +656,7 @@ class BaseSoC(SoCMini):
         if with_eth:
             self.comb += self.crossbar.demux.source1.connect(self.eth_rx_streamer.sink)
         if with_sata:
-            pass # TODO.
+            self.comb += self.crossbar.demux.source2.connect(self.sata_rx_streamer.sink, omit={"error"})
 
         # GPIO -------------------------------------------------------------------------------------
 
@@ -662,6 +716,9 @@ class BaseSoC(SoCMini):
                 # Board name.
                 board_name       = "SAWR",
 
+                # Main/DMTD PLL.
+                dac_bits = wr_dac_bits,
+
                 # SFP.
                 sfp_pads        = platform.request("sfp", wr_sfp),
                 sfp_i2c_pads    = sfp_i2c_pads,
@@ -694,7 +751,7 @@ class BaseSoC(SoCMini):
             self.refclk_mmcm_ps_gen = PSGen(
                  cd_psclk    = "clk200",
                  cd_sys      = "wr",
-                 ctrl_size   = 16,
+                 ctrl_size   = wr_dac_bits,
                  )
             self.comb += [
                 self.refclk_mmcm_ps_gen.ctrl_data.eq(self.dac_refclk_data),
@@ -708,7 +765,7 @@ class BaseSoC(SoCMini):
             self.dmtd_mmcm_ps_gen = PSGen(
                  cd_psclk    = "clk200",
                  cd_sys      = "wr",
-                 ctrl_size   = 16,
+                 ctrl_size   = wr_dac_bits,
                  )
             self.comb += [
                 self.dmtd_mmcm_ps_gen.ctrl_data.eq(self.dac_dmtd_data),
@@ -767,6 +824,7 @@ class BaseSoC(SoCMini):
         )
 
     def add_pcie_slave_probe(self, depth=4096):
+        assert hasattr(self, "pcie_slave")
         analyzer_signals = [
             self.pcie_slave.bus,
         ]
@@ -842,9 +900,9 @@ class BaseSoC(SoCMini):
 
     # Ethernet.
     def add_eth_tx_probe(self, depth=1024):
-        assert hasattr(self, "eth_streamer")
+        assert hasattr(self, "eth_tx_streamer")
         analyzer_signals = [
-            self.eth_streamer.sink,
+            self.eth_tx_streamer.sink,
         ]
         self.analyzer = LiteScopeAnalyzer(analyzer_signals,
             depth        = depth,
@@ -913,6 +971,7 @@ def main():
     # White Rabbit parameters.
     parser.add_argument("--with-white-rabbit", action="store_true",     help="Enable White-Rabbit Support.")
     parser.add_argument("--wr-sfp",            default=1, type=int,     help="White Rabbit SFP.", choices=[0, 1])
+    parser.add_argument("--wr-dac-bits",       default=16, type=int,    help="White Rabbit MMCM phase-shift control word width (in bits).")
 
     # Litescope Analyzer Probes.
     probeopts = parser.add_mutually_exclusive_group()
@@ -976,7 +1035,8 @@ def main():
         # White Rabbit.
         with_white_rabbit = args.with_white_rabbit,
         wr_sfp            = args.wr_sfp,
-        description= args.description
+        wr_dac_bits       = args.wr_dac_bits,
+        description       = args.description
     )
 
     # LiteScope Analyzer Probes.
@@ -993,7 +1053,7 @@ def main():
     if args.with_ad9361_spi_probe:
         soc.add_ad9361_spi_probe()
     if args.with_ad9361_data_probe:
-        soc.add_ad96361_data_probe()
+        soc.add_ad9361_data_probe()
 
     def get_csr_name():
         if args.with_pcie_probe or args.with_pcie_dma_probe or args.with_tx_probe or args.with_si5351_i2c_probe or args.with_eth_tx_probe or args.with_ad9361_spi_probe or args.with_ad9361_data_probe:
@@ -1024,7 +1084,7 @@ def main():
         prog = soc.platform.create_programmer()
         prog.reset()
     
-    # Load Bistream.
+    # Load Bitstream.
     if args.load:
         prog = soc.platform.create_programmer()
         prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".bit"))
