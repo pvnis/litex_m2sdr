@@ -577,6 +577,40 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
 #endif
 #endif
 
+    /* IQ correction kwargs (optional; CSRs only exist when --with-iq-correction gateware was built). */
+#if USE_LITEPCIE
+#ifdef CSR_IQ_CORRECTION_ENABLE_STORAGE_ADDR
+    if (args.count("iq_enable"))
+        litex_m2sdr_writel(_fd, CSR_IQ_CORRECTION_ENABLE_STORAGE_ADDR, std::stoi(args.at("iq_enable")));
+    if (args.count("iq_ch_a_a"))
+        litex_m2sdr_writel(_fd, CSR_IQ_CORRECTION_CH_A_A_STORAGE_ADDR, std::stoi(args.at("iq_ch_a_a")));
+    if (args.count("iq_ch_a_b"))
+        litex_m2sdr_writel(_fd, CSR_IQ_CORRECTION_CH_A_B_STORAGE_ADDR, std::stoi(args.at("iq_ch_a_b")));
+    if (args.count("iq_ch_a_c"))
+        litex_m2sdr_writel(_fd, CSR_IQ_CORRECTION_CH_A_C_STORAGE_ADDR, std::stoi(args.at("iq_ch_a_c")));
+    if (args.count("iq_ch_a_d"))
+        litex_m2sdr_writel(_fd, CSR_IQ_CORRECTION_CH_A_D_STORAGE_ADDR, std::stoi(args.at("iq_ch_a_d")));
+    if (args.count("iq_ch_b_a"))
+        litex_m2sdr_writel(_fd, CSR_IQ_CORRECTION_CH_B_A_STORAGE_ADDR, std::stoi(args.at("iq_ch_b_a")));
+    if (args.count("iq_ch_b_b"))
+        litex_m2sdr_writel(_fd, CSR_IQ_CORRECTION_CH_B_B_STORAGE_ADDR, std::stoi(args.at("iq_ch_b_b")));
+    if (args.count("iq_ch_b_c"))
+        litex_m2sdr_writel(_fd, CSR_IQ_CORRECTION_CH_B_C_STORAGE_ADDR, std::stoi(args.at("iq_ch_b_c")));
+    if (args.count("iq_ch_b_d"))
+        litex_m2sdr_writel(_fd, CSR_IQ_CORRECTION_CH_B_D_STORAGE_ADDR, std::stoi(args.at("iq_ch_b_d")));
+#endif
+#endif
+
+    /* DC filter kwargs (optional; CSRs only exist when --with-dc-filter gateware was built). */
+#if USE_LITEPCIE
+#ifdef CSR_DC_FILTER_ENABLE_STORAGE_ADDR
+    if (args.count("dc_filter_enable"))
+        litex_m2sdr_writel(_fd, CSR_DC_FILTER_ENABLE_STORAGE_ADDR, std::stoi(args.at("dc_filter_enable")));
+    if (args.count("dc_filter_alpha"))
+        litex_m2sdr_writel(_fd, CSR_DC_FILTER_ALPHA_SHIFT_STORAGE_ADDR, std::stoi(args.at("dc_filter_alpha")));
+#endif
+#endif
+
     /* RefClk Selection */
     int64_t refclk_hz        = 38400000;   /* Default 38.4 MHz. */
     std::string clock_source = "internal"; /* Default XO. */
