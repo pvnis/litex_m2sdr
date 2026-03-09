@@ -133,7 +133,7 @@ class AD9361RFIC(LiteXModule):
         self.cd_rfic = ClockDomain("rfic")
 
         # SPI --------------------------------------------------------------------------------------
-        self.spi = AD9361SPIMaster(spi_pads, data_width=24, clk_divider=8)
+        self.spi = AD9361SPIMaster(spi_pads, data_width=24, clk_divider=16)
 
         # Config / Status --------------------------------------------------------------------------
         self.sync += [

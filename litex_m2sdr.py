@@ -208,7 +208,7 @@ class BaseSoC(SoCMini):
     }
 
     def __init__(self, variant="m2", sys_clk_freq=int(125e6),
-        with_pcie              = True,  with_pcie_ptm=False, pcie_gen=2, pcie_lanes=1, with_pcie_reset_workaround=False,
+        with_pcie              = True,  with_pcie_ptm=True, pcie_gen=2, pcie_lanes=1, with_pcie_reset_workaround=False,
         with_eth               = False, eth_sfp=0, eth_phy="1000basex", eth_local_ip="192.168.1.50", eth_udp_port=2345,
         with_eth_vrt           = False, vrt_dst_ip="239.168.1.100", vrt_dst_port=4991,
         with_sata              = False, sata_gen=2,
@@ -219,6 +219,15 @@ class BaseSoC(SoCMini):
         with_gpio              = False,
         with_rfic_oversampling = False,
     ):
+        # If the user provided a local litex_wr_nic checkout via `wr_nic_dir`,
+        # make it importable early so features that import `litex_wr_nic`
+        # (e.g. PCIe PTM) can succeed.
+        if wr_nic_dir is not None:
+            wr_import_paths = [os.path.abspath(wr_nic_dir), os.path.abspath(os.path.dirname(wr_nic_dir))]
+            for path in wr_import_paths:
+                if path not in sys.path:
+                    sys.path.insert(0, path)
+
         # Platform ---------------------------------------------------------------------------------
 
         platform = Platform(build_multiboot=True)
@@ -387,6 +396,9 @@ class BaseSoC(SoCMini):
                 self.pcie_phy.add_gt_loc_constraints(["GTPE2_CHANNEL_X0Y4"], by_pipe_lane=False)
             self.pcie_phy.update_config({
                 "PCIe_Blk_Locn"            : "X0Y0",
+                #"Vendor_ID"                : "2058", # Lime Microsystems Ltd.
+                "Vendor_ID"                : "10ee", # Xilinx, Inc. (Using Xilinx's Vendor ID for now since our PCIe controller is based on Xilinx's.)
+                "Device_ID"                : "7021",
                 "Base_Class_Menu"          : "Wireless_controller",
                 "Sub_Class_Interface_Menu" : "RF_controller",
                 "Class_Code_Base"          : "0D",

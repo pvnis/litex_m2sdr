@@ -15,6 +15,7 @@
 /* PCIe PHY Vendor IDs */
 
 #define PCIE_XILINX_VENDOR_ID  0x10ee
+#define PCIE_LMS_VENDOR_ID  0x2058
 
 /* PCIe PHY Device IDs */
 
