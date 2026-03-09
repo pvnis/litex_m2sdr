@@ -512,20 +512,11 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
         );
     #endif
 
-    /* DMA TX Header */
-    #if defined(_TX_DMA_HEADER_TEST)
-        /* Enable */
-        litex_m2sdr_writel(_fd, CSR_HEADER_TX_CONTROL_ADDR,
-           (1 << CSR_HEADER_TX_CONTROL_ENABLE_OFFSET) |
-           (1 << CSR_HEADER_TX_CONTROL_HEADER_ENABLE_OFFSET)
-        );
-    #else
-        /* Disable */
-        litex_m2sdr_writel(_fd, CSR_HEADER_TX_CONTROL_ADDR,
-           (1 << CSR_HEADER_TX_CONTROL_ENABLE_OFFSET) |
-           (0 << CSR_HEADER_TX_CONTROL_HEADER_ENABLE_OFFSET)
-        );
-    #endif
+    /* DMA TX Header - always enabled for TimedTXArbiter timestamp gating. */
+    litex_m2sdr_writel(_fd, CSR_HEADER_TX_CONTROL_ADDR,
+       (1 << CSR_HEADER_TX_CONTROL_ENABLE_OFFSET) |
+       (1 << CSR_HEADER_TX_CONTROL_HEADER_ENABLE_OFFSET)
+    );
 
     /* Disable DMA Loopback. */
     litex_m2sdr_writel(_fd, CSR_PCIE_DMA0_LOOPBACK_ENABLE_ADDR, 0);
@@ -1374,6 +1365,22 @@ void SoapyLiteXM2SDR::setSampleRate(
         _rx_stream.last_time_ns = _rx_stream.time0_ns;
         _rx_stream.time_warned = false;
     }
+
+#if USE_LITEPCIE
+    /* Set NR slot-aligned DMA frame size (one 0.5 ms NR slot minus 2 header words).
+     * This aligns DMA boundaries to slot boundaries for srsRAN/OAI frame scheduling. */
+    {
+        const uint32_t slot_samples = static_cast<uint32_t>(rate * 500e-6);
+        if (slot_samples > 2) {
+            const uint32_t frame_cycles = slot_samples - 2;
+            litex_m2sdr_writel(_fd, CSR_HEADER_TX_FRAME_CYCLES_ADDR, frame_cycles);
+            litex_m2sdr_writel(_fd, CSR_HEADER_RX_FRAME_CYCLES_ADDR, frame_cycles);
+            SoapySDR::logf(SOAPY_SDR_DEBUG,
+                "setSampleRate: NR slot-aligned frame_cycles=%u (%.3f MSPS, slot=%.0f samples)",
+                frame_cycles, rate / 1e6, (double)slot_samples);
+        }
+    }
+#endif
 }
 
 

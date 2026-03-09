@@ -93,12 +93,16 @@ static constexpr size_t RX_DMA_HEADER_SIZE = 16;
 static constexpr size_t RX_DMA_HEADER_SIZE = 0;
 #endif
 
-/* TX DMA Header */
-#if USE_LITEPCIE && defined(_TX_DMA_HEADER_TEST)
+/* TX DMA Header - always 16 bytes on PCIe (sync word + timestamp for TimedTXArbiter). */
+#if USE_LITEPCIE
 static constexpr size_t TX_DMA_HEADER_SIZE = 16;
 #else
 static constexpr size_t TX_DMA_HEADER_SIZE = 0;
 #endif
+
+/* TX burst control flags embedded in the upper 16 bits of DMA header word 0. */
+static constexpr uint64_t TX_FLAG_HAS_TIME  = (1ULL << 63);
+static constexpr uint64_t TX_FLAG_END_BURST = (1ULL << 62);
 
 /* Setup and configure a stream for RX or TX. */
 SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
@@ -877,32 +881,6 @@ int SoapyLiteXM2SDR::acquireWriteBuffer(
     handle = _tx_stream.user_count;
     _tx_stream.user_count++;
 
-    /* Write Sync Word and Timestamp to DMA header */
-#if defined(_TX_DMA_HEADER_TEST)
-    {
-        /* Header is at the beginning of the DMA buffer */
-        uint8_t *tx_buffer = reinterpret_cast<uint8_t*>(_tx_stream.buf) + (buf_offset * _dma_mmap_info.dma_tx_buf_size);
-
-        /* Extract Sync Word to bytes 0 to 8 of the Header */
-        uint64_t header = DMA_HEADER_SYNC_WORD;
-        *reinterpret_cast<uint64_t*>(tx_buffer) = header;
-
-        /* Compute the number of samples per DMA buffer. */
-        uint32_t samples_per_buffer = _dma_mmap_info.dma_tx_buf_size / (_nChannels * _bytesPerComplex);
-
-        /* Compute time increment (in nanoseconds) for this buffer */
-        uint64_t time_increment = static_cast<uint64_t>((samples_per_buffer / _tx_stream.samplerate) * 1e9);
-
-        /* Write Timestamp */
-        static uint64_t fakeTimestamp = 0;
-        fakeTimestamp += time_increment;
-        *reinterpret_cast<uint64_t*>(tx_buffer + 8) = fakeTimestamp;
-        SoapySDR_logf(SOAPY_SDR_DEBUG, "TX DMA Header inserted: timestamp increment: %llu, new timestamp: %llu",
-                      time_increment, fakeTimestamp);
-    }
-#endif
-
-
     /* Detect underflows. */
     if (buffers_pending < 0) {
         return SOAPY_SDR_UNDERFLOW;
@@ -929,21 +907,27 @@ void SoapyLiteXM2SDR::releaseWriteBuffer(
     const size_t numElems,
     int &flags,
     const long long timeNs) {
-    if ((flags & SOAPY_SDR_HAS_TIME) && timeNs > 0) {
-        while (true) {
-            const long long now = this->getHardwareTime("");
-            if (now >= timeNs) {
-                break;
-            }
-            const long long delta = timeNs - now;
-            const long long sleep_us = std::min<long long>(1000, std::max<long long>(1, delta / 1000));
-            std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
-        }
-    }
-
     if (flags & SOAPY_SDR_END_BURST) {
         _tx_stream.burst_end = true;
     }
+
+#if USE_LITEPCIE
+    /* Write DMA header: sync word with burst flags (word 0) and TX timestamp (word 1).
+     * The TimedTXArbiter in the FPGA reads word 1 and holds samples until
+     * time_gen.time >= timeNs. Both values are in nanoseconds. */
+    {
+        const size_t buf_offset = handle % _dma_mmap_info.dma_tx_buf_count;
+        uint8_t *tx_hdr = reinterpret_cast<uint8_t*>(_tx_stream.buf) +
+                          (buf_offset * _dma_mmap_info.dma_tx_buf_size);
+        const bool hasTime  = (flags & SOAPY_SDR_HAS_TIME) && timeNs > 0;
+        const bool endBurst = (flags & SOAPY_SDR_END_BURST);
+        uint64_t sync_word = DMA_HEADER_SYNC_WORD;
+        if (hasTime)  sync_word |= TX_FLAG_HAS_TIME;
+        if (endBurst) sync_word |= TX_FLAG_END_BURST;
+        *reinterpret_cast<uint64_t*>(tx_hdr + 0) = htole64(sync_word);
+        *reinterpret_cast<uint64_t*>(tx_hdr + 8) = htole64(hasTime ? (uint64_t)timeNs : 0ULL);
+    }
+#endif
 
     const size_t mtu = this->getStreamMTU(stream);
     if (numElems < mtu) {
@@ -1388,6 +1372,19 @@ int SoapyLiteXM2SDR::readStreamStatus(
             SoapySDR::log(SOAPY_SDR_SSI, "U");
             return SOAPY_SDR_UNDERFLOW;
         }
+#if USE_LITEPCIE && defined(CSR_TIMED_TX_LATE_COUNT_ADDR)
+        /* Report late TX packets (timestamp missed) from the TimedTXArbiter. */
+        {
+            uint32_t late = litex_m2sdr_readl(_fd, CSR_TIMED_TX_LATE_COUNT_ADDR);
+            if (late != _tx_stream.last_late_count) {
+                _tx_stream.last_late_count = late;
+                chanMask = 1;
+                flags    = SOAPY_SDR_TIME_ERROR;
+                timeNs   = this->getHardwareTime("");
+                return SOAPY_SDR_TIME_ERROR;
+            }
+        }
+#endif
     } else {
         return SOAPY_SDR_NOT_SUPPORTED;
     }
