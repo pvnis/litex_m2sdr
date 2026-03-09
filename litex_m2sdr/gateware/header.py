@@ -32,6 +32,11 @@ class HeaderInserterExtractor(LiteXModule):
         self.header_enable = Signal()   # i (CSR).
         self.frame_cycles  = Signal(32) # i (CSR).
 
+        # Optional PPS+ticks timestamp mode (inserter only).
+        self.ts_mode     = Signal()   # i: 0=ns from TimeGenerator, 1=PPS seconds+ticks
+        self.pps_seconds = Signal(32) # i: whole-seconds counter from PPSGenerator
+        self.pps_ticks   = Signal(32) # i: sample ticks since last PPS edge
+
         if with_csr:
             self.add_csr()
 
@@ -81,7 +86,14 @@ class HeaderInserterExtractor(LiteXModule):
             # Timestamp.
             fsm.act("TIMESTAMP",
                 source.valid.eq(1),
-                source.data[0:64].eq(self.timestamp),
+                If(self.ts_mode,
+                    # PPS+ticks mode: upper 32 bits = whole seconds, lower 32 bits = sample ticks.
+                    source.data[0:32].eq(self.pps_ticks),
+                    source.data[32:64].eq(self.pps_seconds),
+                ).Else(
+                    # Default: pure 64-bit nanosecond timestamp.
+                    source.data[0:64].eq(self.timestamp),
+                ),
                 If(source.valid & source.ready,
                     NextValue(self.update, 1),
                     NextState("FRAME"),
@@ -176,8 +188,24 @@ class TXRXHeader(LiteXModule):
         # RX.
         self.rx = RXHeaderInserter(data_width, with_csr)
 
+        # PPS+ticks timestamp mode signals (wired from litex_m2sdr.py).
+        self.pps_seconds = Signal(32)
+        self.pps_ticks   = Signal(32)
+        self.comb += [
+            self.rx.pps_seconds.eq(self.pps_seconds),
+            self.rx.pps_ticks.eq(self.pps_ticks),
+        ]
+
         # CSR.
         if with_csr:
+            self._ts_mode = CSRStorage(fields=[
+                CSRField("mode", size=1, offset=0, values=[
+                    ("``0b0``", "Pure 64-bit nanosecond timestamp (default)."),
+                    ("``0b1``", "PPS+ticks: upper 32 bits = whole seconds, lower 32 = sample ticks."),
+                ], description="RX timestamp format selection.")
+            ])
+            self.comb += self.rx.ts_mode.eq(self._ts_mode.fields.mode)
+
             self.last_tx_header    = CSRStatus(64, description="Last TX Header.")
             self.last_tx_timestamp = CSRStatus(64, description="Last TX Timestamp.")
             self.last_rx_header    = CSRStatus(64, description="Last RX Header.")

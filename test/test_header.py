@@ -314,3 +314,49 @@ def test_header_inserter_zero_frame_cycles_behaves_as_single_word_frames():
     assert [l for _, l in first_frame] == [0, 0, 1]
     assert [w for w, _ in second_frame] == [0xAAAA0000AAAA0000, 0xBBBB0000BBBB0000, 0x11]
     assert [l for _, l in second_frame] == [0, 0, 1]
+
+
+def test_header_inserter_pps_ticks_mode():
+    """In ts_mode=1, timestamp word = {pps_seconds[31:0], pps_ticks[31:0]} (seconds in upper half)."""
+    dut = HeaderInserterExtractor(mode="inserter", data_width=64, with_csr=False)
+    out = []
+
+    SECONDS = 0x0000_0007  # 7 whole seconds
+    TICKS   = 0x0001_5360  # 87,904 ticks
+
+    def gen():
+        yield dut.enable.eq(1)
+        yield dut.header_enable.eq(1)
+        yield dut.frame_cycles.eq(1)
+        yield dut.header.eq(0x5aa5_5aa5_5aa5_5aa5)
+        # ns timestamp (should be ignored in ts_mode=1)
+        yield dut.timestamp.eq(0xDEAD_BEEF_CAFE_BABE)
+        yield dut.pps_seconds.eq(SECONDS)
+        yield dut.pps_ticks.eq(TICKS)
+        yield dut.ts_mode.eq(1)
+        yield dut.source.ready.eq(1)
+        # Drive one sample.
+        while not (yield dut.sink.ready):
+            yield
+        yield dut.sink.valid.eq(1)
+        yield dut.sink.first.eq(1)
+        yield dut.sink.last.eq(1)
+        yield dut.sink.data.eq(0xABCD)
+        yield
+        yield dut.sink.valid.eq(0)
+        for _ in range(10):
+            yield
+
+    @passive
+    def mon():
+        while True:
+            if (yield dut.source.valid) and (yield dut.source.ready):
+                out.append((yield dut.source.data))
+            yield
+
+    run_simulation(dut, [gen(), mon()])
+    # First word = header, second word = pps timestamp, third word = payload
+    assert len(out) >= 2, f"expected at least 2 output words, got {len(out)}: {[hex(x) for x in out]}"
+    assert out[0] == 0x5aa5_5aa5_5aa5_5aa5, f"header word wrong: {hex(out[0])}"
+    expected_ts = (SECONDS << 32) | TICKS
+    assert out[1] == expected_ts, f"pps timestamp wrong: expected {hex(expected_ts)}, got {hex(out[1])}"

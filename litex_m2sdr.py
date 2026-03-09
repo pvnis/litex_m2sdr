@@ -617,7 +617,20 @@ class BaseSoC(SoCMini):
         self.comb += [
             self.header.rx.header.eq(0x5aa5_5aa5_5aa5_5aa5), # Unused for now, arbitrary.
             self.header.rx.timestamp.eq(self.time_gen.time),
+            # PPS+ticks mode: supply whole-seconds counter and per-PPS sample tick counter.
+            self.header.pps_seconds.eq(self.pps_gen.count),
         ]
+
+        # PPS sample-tick counter: counts RX sample beats since last PPS pulse (for ts_mode=1).
+        pps_ticks = Signal(32)
+        self.sync += [
+            If(self.pps_gen.pps_pulse,
+                pps_ticks.eq(0),
+            ).Elif(self.ad9361.source.valid & self.ad9361.source.ready,
+                pps_ticks.eq(pps_ticks + 1),
+            )
+        ]
+        self.comb += self.header.pps_ticks.eq(pps_ticks)
 
         # TX/RX Datapath ---------------------------------------------------------------------------
 
