@@ -37,6 +37,9 @@ class HeaderInserterExtractor(LiteXModule):
         self.pps_seconds = Signal(32) # i: whole-seconds counter from PPSGenerator
         self.pps_ticks   = Signal(32) # i: sample ticks since last PPS edge
 
+        # TX burst flags (extractor only) — upper 16 bits of the sync word.
+        self.tx_flags    = Signal(16) # o: TX_FLAG_HAS_TIME, TX_FLAG_END_BURST, etc.
+
         if with_csr:
             self.add_csr()
 
@@ -107,6 +110,7 @@ class HeaderInserterExtractor(LiteXModule):
                 sink.ready.eq(1),
                 If(sink.valid & sink.ready & sink.first,
                     NextValue(self.header, sink.data[0:64]),
+                    NextValue(self.tx_flags, sink.data[48:64]),
                     NextState("TIMESTAMP")
                 )
             )
@@ -208,6 +212,7 @@ class TXRXHeader(LiteXModule):
 
             self.last_tx_header    = CSRStatus(64, description="Last TX Header.")
             self.last_tx_timestamp = CSRStatus(64, description="Last TX Timestamp.")
+            self.last_tx_flags     = CSRStatus(16, description="Burst flags from last TX header (upper 16 bits of sync word).")
             self.last_rx_header    = CSRStatus(64, description="Last RX Header.")
             self.last_rx_timestamp = CSRStatus(64, description="Last RX Timestamp.")
             self.sync += [
@@ -215,6 +220,7 @@ class TXRXHeader(LiteXModule):
                 If(self.tx.reset,
                     self.last_tx_header.status.eq(0),
                     self.last_tx_timestamp.status.eq(0),
+                    self.last_tx_flags.status.eq(0),
                 ),
                 If(self.rx.reset,
                     self.last_rx_header.status.eq(0),
@@ -224,6 +230,7 @@ class TXRXHeader(LiteXModule):
                 If(self.tx.update,
                     self.last_tx_header.status.eq(self.tx.header),
                     self.last_tx_timestamp.status.eq(self.tx.timestamp),
+                    self.last_tx_flags.status.eq(self.tx.tx_flags),
                 ),
                 # RX Update.
                 If(self.rx.update,
