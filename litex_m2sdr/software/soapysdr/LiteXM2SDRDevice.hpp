@@ -452,8 +452,9 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         int32_t burst_samps = 0;
         std::map<size_t, uint8_t*> pendingWriteBufs;
 
-        /* Tracks the last-seen late_count from TimedTXArbiter CSR for edge detection. */
-        uint32_t last_late_count = 0;
+        /* Tracks the last-seen late/underrun counts from TimedTXArbiter CSRs. */
+        uint32_t last_late_count    = 0;
+        uint32_t last_underrun_count = 0;
     };
 
     RXStream _rx_stream;

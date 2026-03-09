@@ -1355,9 +1355,9 @@ int SoapyLiteXM2SDR::writeStream(
 /* Check the status of the TX/RX streams. */
 int SoapyLiteXM2SDR::readStreamStatus(
     SoapySDR::Stream *stream,
-    size_t &/*chanMask*/,
-    int &/*flags*/,
-    long long &/*timeNs*/,
+    size_t &chanMask,
+    int &flags,
+    long long &timeNs,
     const long timeoutUs){
 
     if (stream == RX_STREAM) {
@@ -1382,6 +1382,19 @@ int SoapyLiteXM2SDR::readStreamStatus(
                 flags    = SOAPY_SDR_TIME_ERROR;
                 timeNs   = this->getHardwareTime("");
                 return SOAPY_SDR_TIME_ERROR;
+            }
+        }
+#endif
+#if USE_LITEPCIE && defined(CSR_TIMED_TX_UNDERRUN_COUNT_ADDR)
+        /* Report TX underruns (no burst ready) from the TimedTXArbiter. */
+        {
+            uint32_t underrun = litex_m2sdr_readl(_fd, CSR_TIMED_TX_UNDERRUN_COUNT_ADDR);
+            if (underrun != _tx_stream.last_underrun_count) {
+                _tx_stream.last_underrun_count = underrun;
+                chanMask = 1;
+                flags    = SOAPY_SDR_UNDERFLOW;
+                timeNs   = this->getHardwareTime("");
+                return SOAPY_SDR_UNDERFLOW;
             }
         }
 #endif
