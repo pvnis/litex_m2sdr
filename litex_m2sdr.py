@@ -57,6 +57,7 @@ from litex_m2sdr.gateware.time        import TimeGenerator, TimeNsToPS
 from litex_m2sdr.gateware.pps         import PPSGenerator
 from litex_m2sdr.gateware.pcie        import PCIeLinkResetWorkaround
 from litex_m2sdr.gateware.header      import TXRXHeader
+from litex_m2sdr.gateware.timed_tx    import TimedTXArbiter
 from litex_m2sdr.gateware.measurement import MultiClkMeasurement
 from litex_m2sdr.gateware.gpio        import GPIO
 from litex_m2sdr.gateware.loopback    import TXRXLoopback
@@ -199,6 +200,7 @@ class BaseSoC(SoCMini):
         "ad9361"           : 24,
         "crossbar"         : 25,
         "txrx_loopback"    : 33,
+        "timed_tx"         : 37,
 
         # Measurements/Analyzer.
         "clk_measurement"  : 30,
@@ -617,9 +619,14 @@ class BaseSoC(SoCMini):
         # -------------------------------
         self.txrx_loopback = TXRXLoopback(data_width=64, with_csr=True)
 
-        # Header TX -> Loopback -> RFIC TX.
+        # Header TX -> TimedTX Arbiter -> Loopback -> RFIC TX.
+        self.timed_tx = TimedTXArbiter(
+            header_extractor = self.header.tx,
+            time_gen         = self.time_gen,
+        )
         self.comb += [
-            self.header.tx.source.connect(self.txrx_loopback.tx_sink),
+            self.header.tx.source.connect(self.timed_tx.sink),
+            self.timed_tx.source.connect(self.txrx_loopback.tx_sink),
             self.txrx_loopback.tx_source.connect(self.ad9361.sink),
         ]
 
