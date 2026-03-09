@@ -60,6 +60,8 @@ from litex_m2sdr.gateware.header      import TXRXHeader
 from litex_m2sdr.gateware.timed_tx      import TimedTXArbiter
 from litex_m2sdr.gateware.tdd_switch    import TDDSwitch
 from litex_m2sdr.gateware.sample_counter import SampleCounter
+from litex_m2sdr.gateware.iq_correction import IQCorrection
+from litex_m2sdr.gateware.dc_filter     import DCFilter
 from litex_m2sdr.gateware.measurement import MultiClkMeasurement
 from litex_m2sdr.gateware.gpio        import GPIO
 from litex_m2sdr.gateware.loopback    import TXRXLoopback
@@ -223,6 +225,8 @@ class BaseSoC(SoCMini):
         with_jtagbone          = True,
         with_gpio              = False,
         with_tdd               = False,
+        with_iq_correction     = False,
+        with_dc_filter         = False,
         with_rfic_oversampling = False,
     ):
         # If the user provided a local litex_wr_nic checkout via `wr_nic_dir`,
@@ -658,11 +662,21 @@ class BaseSoC(SoCMini):
                 self.ad9361.txnrx_use_override.eq(1),
             ]
 
-        # RFIC RX -> Loopback -> Header RX.
-        self.comb += [
-            self.ad9361.source.connect(self.txrx_loopback.rx_sink),
-            self.txrx_loopback.rx_source.connect(self.header.rx.sink),
-        ]
+        # RFIC RX -> Loopback -> [optional IQ correction] -> [optional DC filter] -> Header RX.
+        self.comb += self.ad9361.source.connect(self.txrx_loopback.rx_sink)
+        rx_source = self.txrx_loopback.rx_source
+
+        if with_iq_correction:
+            self.iq_correction = IQCorrection(data_width=64)
+            self.comb += rx_source.connect(self.iq_correction.sink)
+            rx_source = self.iq_correction.source
+
+        if with_dc_filter:
+            self.dc_filter = DCFilter(data_width=64)
+            self.comb += rx_source.connect(self.dc_filter.sink)
+            rx_source = self.dc_filter.source
+
+        self.comb += rx_source.connect(self.header.rx.sink)
 
         # Sample Counter (counts RX sample beats in sys domain for integer-timestamp mode).
         self.sample_counter = SampleCounter(
@@ -1086,8 +1100,10 @@ def main():
     parser.add_argument("--sata-gen",        default=2, type=int, help="SATA Generation.", choices=[1, 2, 3])
 
     # GPIO parameters.
-    parser.add_argument("--with-gpio",       action="store_true",     help="Enable GPIO support.")
-    parser.add_argument("--with-tdd",        action="store_true",     help="Enable TDD TX/RX switch with lead/lag PA_EN control.")
+    parser.add_argument("--with-gpio",          action="store_true", help="Enable GPIO support.")
+    parser.add_argument("--with-tdd",           action="store_true", help="Enable TDD TX/RX switch with lead/lag PA_EN control.")
+    parser.add_argument("--with-iq-correction", action="store_true", help="Enable RX IQ amplitude/phase correction (2×2 matrix).")
+    parser.add_argument("--with-dc-filter",     action="store_true", help="Enable RX DC blocker IIR filter (suppresses LO leakthrough).")
 
     # White Rabbit parameters.
     parser.add_argument("--with-white-rabbit",   action="store_true",                    help="Enable White-Rabbit Support.")
@@ -1164,7 +1180,11 @@ def main():
         with_gpio     = args.with_gpio,
 
         # TDD switch.
-        with_tdd      = args.with_tdd,
+        with_tdd           = args.with_tdd,
+
+        # RX DSP blocks.
+        with_iq_correction = args.with_iq_correction,
+        with_dc_filter     = args.with_dc_filter,
 
         # White Rabbit.
         with_white_rabbit = args.with_white_rabbit,
