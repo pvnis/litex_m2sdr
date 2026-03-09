@@ -565,6 +565,18 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     if (args.count("rx_agc_mode") > 0)
         _rx_agc_mode = parse_agc_mode(args.at("rx_agc_mode"));
 
+    /* TDD switch kwargs (optional; CSRs only exist when --with-tdd gateware was built). */
+#if USE_LITEPCIE
+#ifdef CSR_TDD_SWITCH_ENABLE_STORAGE_ADDR
+    if (args.count("tdd_enable"))
+        litex_m2sdr_writel(_fd, CSR_TDD_SWITCH_ENABLE_STORAGE_ADDR, std::stoi(args.at("tdd_enable")));
+    if (args.count("tdd_lead"))
+        litex_m2sdr_writel(_fd, CSR_TDD_SWITCH_LEAD_SAMPLES_STORAGE_ADDR, std::stoi(args.at("tdd_lead")));
+    if (args.count("tdd_trail"))
+        litex_m2sdr_writel(_fd, CSR_TDD_SWITCH_TRAIL_SAMPLES_STORAGE_ADDR, std::stoi(args.at("tdd_trail")));
+#endif
+#endif
+
     /* RefClk Selection */
     int64_t refclk_hz        = 38400000;   /* Default 38.4 MHz. */
     std::string clock_source = "internal"; /* Default XO. */

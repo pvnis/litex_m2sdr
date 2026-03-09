@@ -510,6 +510,9 @@ static void help(void)
            "  -rx_gain1 gain         Set the RX gain in dB for channel 1 (default: %d).\n"
            "  -rx_gain2 gain         Set the RX gain in dB for channel 2 (default: %d).\n"
            "  -loopback enable       Set the internal loopback (default: %d).\n"
+           "  -tdd enable            Enable TDD TX/RX switch (0/1, default: off). Requires --with-tdd gateware.\n"
+           "  -tdd_lead N            TDD PA_EN lead time in sys_clk cycles (default: 20).\n"
+           "  -tdd_trail N           TDD PA_EN trail time in sys_clk cycles (default: 10).\n"
            "  -bist_tx_tone          Run TX tone test.\n"
            "  -bist_rx_tone          Run RX tone test.\n"
            "  -bist_prbs             Run PRBS test.\n"
@@ -551,6 +554,9 @@ static struct option options[] = {
     { "oversample",       no_argument },              /* 16 */
     { "chan",             required_argument },        /* 17 */
     { "sync",             required_argument },        /* 18 */
+    { "tdd",              required_argument },        /* 19 */
+    { "tdd_lead",         required_argument },        /* 20 */
+    { "tdd_trail",        required_argument },        /* 21 */
     { NULL },
 };
 
@@ -576,6 +582,9 @@ int main(int argc, char **argv)
     bool     enable_oversample = false;
     char     chan_mode[16] = "2t2r";
     char     sync_mode[16] = "internal";
+    int      tdd_enable  = -1;   /* -1 = not set (don't write CSR) */
+    int      tdd_lead    = -1;
+    int      tdd_trail   = -1;
 
     refclk_freq    = DEFAULT_REFCLK_FREQ;
     samplerate     = DEFAULT_SAMPLERATE;
@@ -679,6 +688,15 @@ int main(int argc, char **argv)
                     strncpy(sync_mode, optarg, sizeof(sync_mode));
                     sync_mode[sizeof(sync_mode) - 1] = '\0';
                     break;
+                case 19: /* tdd enable */
+                    tdd_enable = atoi(optarg);
+                    break;
+                case 20: /* tdd_lead */
+                    tdd_lead = atoi(optarg);
+                    break;
+                case 21: /* tdd_trail */
+                    tdd_trail = atoi(optarg);
+                    break;
                 default:
                     fprintf(stderr, "unknown option index: %d\n", option_index);
                     exit(1);
@@ -724,6 +742,25 @@ int main(int argc, char **argv)
     /* Initialize RF. */
     printf("Selected RefClk: %" PRId64 " Hz\n", refclk_freq);
     m2sdr_init(samplerate, bandwidth, refclk_freq, tx_freq, rx_freq, tx_gain, rx_gain1, rx_gain2, loopback, bist_tx_tone, bist_rx_tone, bist_prbs, bist_tone_freq, enable_8bit_mode, enable_oversample, chan_mode, sync_mode);
+
+#ifdef CSR_TDD_SWITCH_ENABLE_STORAGE_ADDR
+    /* Apply TDD switch CSRs if the user requested them and gateware supports it. */
+    if (tdd_enable >= 0 || tdd_lead >= 0 || tdd_trail >= 0) {
+        void *conn = m2sdr_open();
+        if (tdd_enable >= 0) {
+            printf("TDD switch: enable=%d\n", tdd_enable);
+            m2sdr_writel(conn, CSR_TDD_SWITCH_ENABLE_STORAGE_ADDR, tdd_enable);
+        }
+        if (tdd_lead >= 0) {
+            printf("TDD switch: lead=%d cycles\n", tdd_lead);
+            m2sdr_writel(conn, CSR_TDD_SWITCH_LEAD_SAMPLES_STORAGE_ADDR, tdd_lead);
+        }
+        if (tdd_trail >= 0) {
+            printf("TDD switch: trail=%d cycles\n", tdd_trail);
+            m2sdr_writel(conn, CSR_TDD_SWITCH_TRAIL_SAMPLES_STORAGE_ADDR, tdd_trail);
+        }
+    }
+#endif
 
     m2sdr_close_global();
 
