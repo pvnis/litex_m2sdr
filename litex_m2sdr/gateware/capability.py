@@ -47,7 +47,9 @@ class Capability(LiteXModule):
         # White Rabbit.
         wr_enabled,
         # Board.
-        variant, jtagbone, eth_sfp, wr_sfp):
+        variant, jtagbone, eth_sfp, wr_sfp,
+        # SDR features.
+        timed_tx = False):
 
         # API Version.
         # ------------
@@ -65,7 +67,8 @@ class Capability(LiteXModule):
             CSRField("sata",     size=1, offset=2, reset=int(sata_enabled), description="SATA     is present."),
             CSRField("gpio",     size=1, offset=3, reset=int(gpio_enabled), description="GPIO     is present."),
             CSRField("wr",       size=1, offset=4, reset=int(wr_enabled),   description="White Rabbit is present."),
-            CSRField("jtagbone", size=1, offset=5, reset=int(jtagbone),     description="JTAGBone is present."),
+            CSRField("jtagbone",  size=1, offset=5, reset=int(jtagbone),   description="JTAGBone is present."),
+            CSRField("timed_tx", size=1, offset=6, reset=int(timed_tx),   description="Hardware TX timestamp gating (TimedTXArbiter) is present."),
             # Reserved bits for future features
         ], description="Hardware feature presence bitfield.")
 

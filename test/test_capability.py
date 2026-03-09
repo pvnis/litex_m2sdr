@@ -29,5 +29,6 @@ def test_capability_builds_with_valid_configuration():
         jtagbone=True,
         eth_sfp=0,
         wr_sfp=1,
+        timed_tx=True,
     )
     assert dut is not None

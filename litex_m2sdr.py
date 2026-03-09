@@ -308,6 +308,9 @@ class BaseSoC(SoCMini):
             jtagbone       = with_jtagbone,
             eth_sfp        = eth_sfp,
             wr_sfp         = capability_wr_sfp,
+
+            # SDR features.
+            timed_tx       = with_pcie,
         )
 
         # SI5351 Clock Generator -------------------------------------------------------------------
