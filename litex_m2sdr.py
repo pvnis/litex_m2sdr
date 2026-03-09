@@ -57,7 +57,8 @@ from litex_m2sdr.gateware.time        import TimeGenerator, TimeNsToPS
 from litex_m2sdr.gateware.pps         import PPSGenerator
 from litex_m2sdr.gateware.pcie        import PCIeLinkResetWorkaround
 from litex_m2sdr.gateware.header      import TXRXHeader
-from litex_m2sdr.gateware.timed_tx    import TimedTXArbiter
+from litex_m2sdr.gateware.timed_tx      import TimedTXArbiter
+from litex_m2sdr.gateware.sample_counter import SampleCounter
 from litex_m2sdr.gateware.measurement import MultiClkMeasurement
 from litex_m2sdr.gateware.gpio        import GPIO
 from litex_m2sdr.gateware.loopback    import TXRXLoopback
@@ -201,6 +202,7 @@ class BaseSoC(SoCMini):
         "crossbar"         : 25,
         "txrx_loopback"    : 33,
         "timed_tx"         : 37,
+        "sample_counter"   : 38,
 
         # Measurements/Analyzer.
         "clk_measurement"  : 30,
@@ -638,6 +640,11 @@ class BaseSoC(SoCMini):
             self.ad9361.source.connect(self.txrx_loopback.rx_sink),
             self.txrx_loopback.rx_source.connect(self.header.rx.sink),
         ]
+
+        # Sample Counter (counts RX sample beats in sys domain for integer-timestamp mode).
+        self.sample_counter = SampleCounter(
+            rx_valid = self.ad9361.source.valid & self.ad9361.source.ready,
+        )
 
         # Crossbar.
         # ---------
