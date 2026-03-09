@@ -577,6 +577,16 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
 #endif
 #endif
 
+    /* CFR kwargs (optional; CSRs only exist when --with-cfr gateware was built). */
+#if USE_LITEPCIE
+#ifdef CSR_CREST_FACTOR_REDUCTION_ENABLE_STORAGE_ADDR
+    if (args.count("cfr_enable"))
+        litex_m2sdr_writel(_fd, CSR_CREST_FACTOR_REDUCTION_ENABLE_STORAGE_ADDR, std::stoi(args.at("cfr_enable")));
+    if (args.count("cfr_threshold"))
+        litex_m2sdr_writel(_fd, CSR_CREST_FACTOR_REDUCTION_THRESHOLD_STORAGE_ADDR, std::stoi(args.at("cfr_threshold")));
+#endif
+#endif
+
     /* IQ correction kwargs (optional; CSRs only exist when --with-iq-correction gateware was built). */
 #if USE_LITEPCIE
 #ifdef CSR_IQ_CORRECTION_ENABLE_STORAGE_ADDR

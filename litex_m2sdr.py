@@ -60,6 +60,7 @@ from litex_m2sdr.gateware.header      import TXRXHeader
 from litex_m2sdr.gateware.timed_tx      import TimedTXArbiter
 from litex_m2sdr.gateware.tdd_switch    import TDDSwitch
 from litex_m2sdr.gateware.sample_counter import SampleCounter
+from litex_m2sdr.gateware.cfr           import CrestFactorReduction
 from litex_m2sdr.gateware.iq_correction import IQCorrection
 from litex_m2sdr.gateware.dc_filter     import DCFilter
 from litex_m2sdr.gateware.measurement import MultiClkMeasurement
@@ -225,6 +226,7 @@ class BaseSoC(SoCMini):
         with_jtagbone          = True,
         with_gpio              = False,
         with_tdd               = False,
+        with_cfr               = False,
         with_iq_correction     = False,
         with_dc_filter         = False,
         with_rfic_oversampling = False,
@@ -648,9 +650,17 @@ class BaseSoC(SoCMini):
             header_extractor = self.header.tx,
             time_gen         = self.time_gen,
         )
+        self.comb += self.header.tx.source.connect(self.timed_tx.sink)
+
+        # Optional CFR in TX path.
+        tx_source = self.timed_tx.source
+        if with_cfr:
+            self.cfr = CrestFactorReduction(data_width=64)
+            self.comb += tx_source.connect(self.cfr.sink)
+            tx_source = self.cfr.source
+
         self.comb += [
-            self.header.tx.source.connect(self.timed_tx.sink),
-            self.timed_tx.source.connect(self.txrx_loopback.tx_sink),
+            tx_source.connect(self.txrx_loopback.tx_sink),
             self.txrx_loopback.tx_source.connect(self.ad9361.sink),
         ]
 
@@ -1102,6 +1112,7 @@ def main():
     # GPIO parameters.
     parser.add_argument("--with-gpio",          action="store_true", help="Enable GPIO support.")
     parser.add_argument("--with-tdd",           action="store_true", help="Enable TDD TX/RX switch with lead/lag PA_EN control.")
+    parser.add_argument("--with-cfr",           action="store_true", help="Enable TX Crest Factor Reduction (clip-and-filter to reduce PAPR).")
     parser.add_argument("--with-iq-correction", action="store_true", help="Enable RX IQ amplitude/phase correction (2×2 matrix).")
     parser.add_argument("--with-dc-filter",     action="store_true", help="Enable RX DC blocker IIR filter (suppresses LO leakthrough).")
 
@@ -1181,6 +1192,9 @@ def main():
 
         # TDD switch.
         with_tdd           = args.with_tdd,
+
+        # TX DSP blocks.
+        with_cfr           = args.with_cfr,
 
         # RX DSP blocks.
         with_iq_correction = args.with_iq_correction,
