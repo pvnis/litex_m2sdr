@@ -58,6 +58,7 @@ from litex_m2sdr.gateware.pps         import PPSGenerator
 from litex_m2sdr.gateware.pcie        import PCIeLinkResetWorkaround
 from litex_m2sdr.gateware.header      import TXRXHeader
 from litex_m2sdr.gateware.timed_tx      import TimedTXArbiter
+from litex_m2sdr.gateware.tdd_switch    import TDDSwitch
 from litex_m2sdr.gateware.sample_counter import SampleCounter
 from litex_m2sdr.gateware.measurement import MultiClkMeasurement
 from litex_m2sdr.gateware.gpio        import GPIO
@@ -221,6 +222,7 @@ class BaseSoC(SoCMini):
         wr_ext_clk10_port      = None,  wr_ext_clk10_period=100.0, wr_ext_clk10_name="wr_ext_clk10",
         with_jtagbone          = True,
         with_gpio              = False,
+        with_tdd               = False,
         with_rfic_oversampling = False,
     ):
         # If the user provided a local litex_wr_nic checkout via `wr_nic_dir`,
@@ -634,6 +636,14 @@ class BaseSoC(SoCMini):
             self.timed_tx.source.connect(self.txrx_loopback.tx_sink),
             self.txrx_loopback.tx_source.connect(self.ad9361.sink),
         ]
+
+        # TDD Switch: drive PA_EN / txnrx from TX burst state (optional).
+        if with_tdd:
+            self.tdd_switch = TDDSwitch(timed_tx_arbiter=self.timed_tx)
+            self.comb += [
+                self.ad9361.txnrx_override.eq(self.tdd_switch.pa_en),
+                self.ad9361.txnrx_use_override.eq(1),
+            ]
 
         # RFIC RX -> Loopback -> Header RX.
         self.comb += [
@@ -1064,6 +1074,7 @@ def main():
 
     # GPIO parameters.
     parser.add_argument("--with-gpio",       action="store_true",     help="Enable GPIO support.")
+    parser.add_argument("--with-tdd",        action="store_true",     help="Enable TDD TX/RX switch with lead/lag PA_EN control.")
 
     # White Rabbit parameters.
     parser.add_argument("--with-white-rabbit",   action="store_true",                    help="Enable White-Rabbit Support.")
@@ -1138,6 +1149,9 @@ def main():
 
         # GPIOs.
         with_gpio     = args.with_gpio,
+
+        # TDD switch.
+        with_tdd      = args.with_tdd,
 
         # White Rabbit.
         with_white_rabbit = args.with_white_rabbit,

@@ -56,6 +56,9 @@ class TimedTXArbiter(LiteXModule):
             ts_fifo.sink.ts.eq(header_extractor.timestamp),
         ]
 
+        # Burst-active status (for TDDSwitch).
+        self.tx_burst_active = Signal()
+
         # Registers.
         ts_reg         = Signal(64)
         late_count     = Signal(32)
@@ -96,6 +99,7 @@ class TimedTXArbiter(LiteXModule):
         )
 
         fsm.act("STREAM",
+            self.tx_burst_active.eq(1),
             data_fifo.source.connect(source),
             If(source.valid & source.ready & source.last,
                 NextState("IDLE"),

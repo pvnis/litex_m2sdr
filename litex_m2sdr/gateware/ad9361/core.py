@@ -83,7 +83,9 @@ from litex_m2sdr.gateware.ad9361.agc     import AGCSaturationCount
 class AD9361RFIC(LiteXModule):
     def __init__(self, rfic_pads, spi_pads, sys_clk_freq):
         # Controls ---------------------------------------------------------------------------------
-        self.enable_datapath = Signal(reset=1)
+        self.enable_datapath    = Signal(reset=1)
+        self.txnrx_override     = Signal()   # external TDD signal (from TDDSwitch)
+        self.txnrx_use_override = Signal()   # 1 = use override, 0 = use CSR
 
          # Stream Endpoints ------------------------------------------------------------------------
         self.sink   = stream.Endpoint(dma_layout(64))
@@ -140,7 +142,7 @@ class AD9361RFIC(LiteXModule):
             # AD9361 Control.
             rfic_pads.rst_n.eq(self._config.fields.rst_n),
             rfic_pads.enable.eq(self._config.fields.enable),
-            rfic_pads.txnrx.eq(self._config.fields.txnrx),
+            rfic_pads.txnrx.eq(Mux(self.txnrx_use_override, self.txnrx_override, self._config.fields.txnrx)),
             rfic_pads.en_agc.eq(self._config.fields.en_agc),
 
             # AD9361 Control/Status IOs.
