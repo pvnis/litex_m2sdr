@@ -17,7 +17,7 @@ from litex.soc.interconnect.csr import *
 class AD9361SPIMaster(LiteXModule):
     """4-wire SPI Master
 
-    This module implements a 4-wire SPI Master with CPOL=0 and CPHA=0. It supports configurable data
+    This module implements a 4-wire SPI Master with CPOL=0 and CPHA=1. It supports configurable data
     width and SPI clk divider at build time.
     """
     def __init__(self, pads, data_width=24, clk_divider=2):
@@ -93,7 +93,7 @@ class AD9361SPIMaster(LiteXModule):
             If(cnt == length,
                 NextState("END")
             ).Else(
-                NextValue(cnt, cnt + clk_set)
+                NextValue(cnt, cnt + clk_clr)
             ),
             chip_select.eq(1),
             shift.eq(1),
@@ -120,23 +120,23 @@ class AD9361SPIMaster(LiteXModule):
             If(start,
                 mosi_shift_reg.eq(self._mosi.storage)
             # Shift MOSI.
-            ).Elif(clk_set & shift,
+            ).Elif(clk_clr & shift,
                 mosi_shift_reg.eq(Cat(Signal(), mosi_shift_reg[:-1]))
             ),
 
         ]
 
-        # Output MOSI on Clk falling edge (CPHA=0).
+        # Output MOSI on Clk rising edge (CPHA=1).
         self.comb += mosi.eq(mosi_shift_reg[-1])
-        self.sync += If(clk_clr, pads.mosi.eq(mosi))
+        self.sync += If(clk_set, pads.mosi.eq(mosi))
 
         # MISO Capture/Shift.
         # -------------------
         miso           = Signal()
         miso_shift_reg = Signal(data_width)
 
-        # Capture MISO on Clk rising edge (CPHA=0).
-        self.sync += If(clk_set, miso.eq(pads.miso))
+        # Capture MISO on Clk falling edge (CPHA=1).
+        self.sync += If(clk_clr, miso.eq(pads.miso))
 
         # Shift.
         self.sync += [
