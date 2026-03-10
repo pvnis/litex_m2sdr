@@ -60,17 +60,16 @@ class DCFilter(LiteXModule):
 
         alpha = self._alpha_shift.storage
 
-        # Combinational DC estimates (acc >> alpha_shift).
+        # Registered DC estimates (acc >> alpha_shift), updated each sample.
+        # Registering the barrel shift breaks the acc→shift→acc feedback timing loop
+        # (variable 5-bit shift of a 32-bit value is ~5 ns; combined with the adder
+        # chain in the accumulator update it would exceed the 8 ns clock period).
+        # Using a 1-cycle-delayed DC estimate has no perceptible effect: the DC
+        # corner frequency is <<1 Hz, so a single-sample lag is negligible.
         dc_ia = Signal((16, True))
         dc_qa = Signal((16, True))
         dc_ib = Signal((16, True))
         dc_qb = Signal((16, True))
-        self.comb += [
-            dc_ia.eq(acc_ia >> alpha),
-            dc_qa.eq(acc_qa >> alpha),
-            dc_ib.eq(acc_ib >> alpha),
-            dc_qb.eq(acc_qb >> alpha),
-        ]
 
         # Extract input samples (signed 16-bit).
         x_ia = Signal((16, True))
@@ -84,15 +83,21 @@ class DCFilter(LiteXModule):
             x_qb.eq(sink.data[48:64]),
         ]
 
-        # Update accumulators on each valid sample handshake.
+        # Update accumulators and register DC estimates on each valid sample handshake.
+        # dc_X at time n = acc_X[n-1] >> alpha  (1-cycle registered, breaks feedback loop).
         self.sync += If(sink.valid & sink.ready,
+            dc_ia.eq(acc_ia >> alpha),
+            dc_qa.eq(acc_qa >> alpha),
+            dc_ib.eq(acc_ib >> alpha),
+            dc_qb.eq(acc_qb >> alpha),
             acc_ia.eq(acc_ia + x_ia - dc_ia),
             acc_qa.eq(acc_qa + x_qa - dc_qa),
             acc_ib.eq(acc_ib + x_ib - dc_ib),
             acc_qb.eq(acc_qb + x_qb - dc_qb),
         )
 
-        # Output: x[n] - acc[n] >> alpha, clamped to [-32768, 32767].
+        # Output: x[n] - dc[n], clamped to [-32768, 32767].
+        # dc[n] is the registered estimate from the previous cycle (see above).
         y_ia = Signal((17, True))
         y_qa = Signal((17, True))
         y_ib = Signal((17, True))

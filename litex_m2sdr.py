@@ -654,6 +654,7 @@ class BaseSoC(SoCMini):
         self.timed_tx = TimedTXArbiter(
             header_extractor = self.header.tx,
             time_gen         = self.time_gen,
+            fifo_depth       = 512,  # Reduced from 2048: 4× fewer LUTRAM cells → shorter consume-ptr decode path.
         )
         self.comb += self.header.tx.source.connect(self.timed_tx.sink)
 
@@ -901,6 +902,12 @@ class BaseSoC(SoCMini):
         platform.add_false_path_constraints_by_name("*crg_clkout0", "sync_clk_in")
         platform.add_false_path_constraints_by_name("*crg_clkout0", "rfic_clk")
         platform.add_false_path_constraints_by_name("*crg_clkout0", "ad9361_rfic_rx_clk_p")
+
+        # SI5351 BUFGMUX cascade: clk10 BUFG → BUFGMUX may span top/bottom halves on congested
+        # builds; use general routing for this low-speed (10 MHz) reference path.
+        platform.add_platform_command(
+            "set_property CLOCK_DEDICATED_ROUTE FALSE [get_nets -quiet basesoc_crg_clkout_buf1]"
+        )
 
         # External Async Inputs (CDC/UART/reset/status paths only).
         platform.add_platform_command(

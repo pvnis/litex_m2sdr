@@ -55,14 +55,34 @@ class IQCorrection(LiteXModule):
         self.comb += sink.connect(source, omit={"data"})
 
         def apply_matrix(i_in, q_in, a, b, c, d):
-            """Combinationally compute 2×2 Q2.14 matrix product, clamped to 16 bits."""
-            i_out_wide = Signal((35, True))
-            q_out_wide = Signal((35, True))
+            """1-stage pipelined 2×2 Q2.14 matrix product, clamped to 16 bits.
+
+            Stage 1 (sync): register the four individual DSP multiplications.
+              Critical path: DSP multiply (~4 ns) → register.
+            Stage 2 (comb): sum pairs, shift >> 14, clamp.
+              Critical path: add (~2 ns) + shift (~1 ns) + clamp (~2 ns).
+            """
+            # Stage 1: register individual products (each maps to one DSP48).
+            # reset_less=True: intermediate pipeline registers; startup garbage is
+            # harmless and avoids growing the high-fanout system reset tree.
+            ai_r = Signal((35, True), reset_less=True)
+            bq_r = Signal((35, True), reset_less=True)
+            ci_r = Signal((35, True), reset_less=True)
+            dq_r = Signal((35, True), reset_less=True)
+            self.sync += [
+                ai_r.eq(a * i_in),
+                bq_r.eq(b * q_in),
+                ci_r.eq(c * i_in),
+                dq_r.eq(d * q_in),
+            ]
+            # Stage 2 (comb): add, scale, clamp.
+            i_out_wide = Signal((36, True))
+            q_out_wide = Signal((36, True))
             i_out      = Signal((16, True))
             q_out      = Signal((16, True))
             self.comb += [
-                i_out_wide.eq((a * i_in + b * q_in) >> 14),
-                q_out_wide.eq((c * i_in + d * q_in) >> 14),
+                i_out_wide.eq((ai_r + bq_r) >> 14),
+                q_out_wide.eq((ci_r + dq_r) >> 14),
                 If(i_out_wide > 32767,  i_out.eq(32767)
                 ).Elif(i_out_wide < -32768, i_out.eq(-32768)
                 ).Else(i_out.eq(i_out_wide)),

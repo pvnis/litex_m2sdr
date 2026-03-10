@@ -70,8 +70,9 @@ class CrestFactorReduction(LiteXModule):
             fir_taps = _fir_taps(n_taps)
         n_taps  = len(fir_taps)
         # For a 32-tap symmetric FIR, group delay = (n_taps - 1) // 2 = 15 samples.
-        # We delay the input by n_taps // 2 = 16 cycles to align with the FIR output.
-        delay   = n_taps // 2
+        # We delay the input by n_taps // 2 = 16 cycles to align with the FIR output,
+        # plus 3 extra cycles for the 3-stage FIR MAC pipeline (see fir_mac below).
+        delay   = n_taps // 2 + 3
 
         self.sink   = sink   = stream.Endpoint(dma_layout(data_width))
         self.source = source = stream.Endpoint(dma_layout(data_width))
@@ -189,23 +190,54 @@ class CrestFactorReduction(LiteXModule):
         # -- FIR multiply-accumulate (using coefficient symmetry) --
         # For symmetric FIR: taps[k] == taps[n_taps-1-k].
         # Pair taps from each end to halve the number of multiplications.
-        n_half = n_taps // 2
+        n_half   = n_taps // 2
+        n_groups = 4  # 4 groups of 4 pair-products for stage-2 partial sums
 
         def fir_mac(sr, name):
-            """Combinational FIR using symmetric coefficient pairs. Returns Q14-scaled output."""
-            acc = Signal((40, True), name=f"{name}_acc")
-            products = []
+            """2-stage pipelined FIR using symmetric coefficient pairs. Returns Q14-scaled output.
+
+            Stage 1 (sync): compute pair sums combinationally, register each product.
+              Critical path: add (1 ns) + DSP multiply (~4 ns) → register.
+            Stage 2 (sync): sum 4 groups of 4 registered products, register group sums.
+              Critical path: 3-adder tree of 35-bit values (~6 ns) → register.
+            Stage 3 (sync): sum 4 registered group sums, register.
+              Critical path: 3-level adder tree of 38-bit values (~6 ns) → register.
+            Stage 4 (comb): shift acc_r >> 14 (constant shift = pure wires).
+              Critical path: sub_clamp compare+mux (~3 ns) + enable mux (~1 ns).
+            Total pipeline latency added: 3 clock cycles (delay buffer compensated above).
+            """
+            group_size = n_half // n_groups  # 4
+
+            # Stage 1: register products (pair_sum * coeff).
+            # reset_less=True: intermediate pipeline registers; startup garbage flushed
+            # in the first delay cycles. Avoids adding hundreds of FFs to the system
+            # reset tree (which would cause high-fanout routing failures).
+            products_reg = []
             for k in range(n_half):
-                coeff = fir_taps[k]
-                # Symmetric pair sum: sr[k] + sr[n_taps-1-k]
+                coeff    = fir_taps[k]
                 pair_sum = Signal((17, True), name=f"{name}_ps_{k}")
                 self.comb += pair_sum.eq(sr[k] + sr[n_taps - 1 - k])
-                prod = Signal((35, True), name=f"{name}_p_{k}")
-                self.comb += prod.eq(coeff * pair_sum)
-                products.append(prod)
-            self.comb += acc.eq(sum(products))
+                prod_r = Signal((35, True), reset_less=True, name=f"{name}_p_{k}")
+                self.sync += If(sink.valid & sink.ready, prod_r.eq(coeff * pair_sum))
+                products_reg.append(prod_r)
+
+            # Stage 2: sum groups of 4 registered products, register group sums.
+            group_sums_reg = []
+            for g in range(n_groups):
+                gs_comb = Signal((38, True), name=f"{name}_gs{g}_c")
+                gs_reg  = Signal((38, True), reset_less=True, name=f"{name}_gs{g}_r")
+                self.comb += gs_comb.eq(sum(products_reg[g * group_size:(g + 1) * group_size]))
+                self.sync += If(sink.valid & sink.ready, gs_reg.eq(gs_comb))
+                group_sums_reg.append(gs_reg)
+
+            # Stage 3 (sync): sum 4 group sums, register.
+            #   Critical path: 3-level adder tree of 38-bit values (~6 ns) → register.
+            acc_r = Signal((40, True), reset_less=True, name=f"{name}_acc_r")
+            self.sync += If(sink.valid & sink.ready, acc_r.eq(sum(group_sums_reg)))
+
+            # Stage 4 (comb): scale (constant shift = pure wires).
             out = Signal((17, True), name=f"{name}_out")
-            self.comb += out.eq(acc >> 14)
+            self.comb += out.eq(acc_r >> 14)
             return out
 
         fir_out_ia = fir_mac(fir_ia, "ia")
@@ -234,12 +266,29 @@ class CrestFactorReduction(LiteXModule):
         out_ib = sub_clamp(ib_dly[-1], fir_out_ib, "ib")
         out_qb = sub_clamp(qb_dly[-1], fir_out_qb, "qb")
 
-        # -- Output mux: CFR or pass-through --
+        # -- Output stage: register sub_clamp results to break the long path --
+        # dly[-1] → sub_clamp (10 CARRY4 + LUTs, ~6 ns) just fits → TX BRAM
+        # without this register, the sub_clamp + enable_mux + BRAM setup exceeds 8 ns.
+        # The bypass path (sink.data) is also registered to keep the mux inputs aligned.
+        out_ia_r = Signal((16, True), reset_less=True, name="out_ia_r")
+        out_qa_r = Signal((16, True), reset_less=True, name="out_qa_r")
+        out_ib_r = Signal((16, True), reset_less=True, name="out_ib_r")
+        out_qb_r = Signal((16, True), reset_less=True, name="out_qb_r")
+        sink_data_r = Signal(64, reset_less=True, name="sink_data_r")
+        self.sync += If(sink.valid & sink.ready, [
+            out_ia_r.eq(out_ia),
+            out_qa_r.eq(out_qa),
+            out_ib_r.eq(out_ib),
+            out_qb_r.eq(out_qb),
+            sink_data_r.eq(sink.data),
+        ])
+
+        # -- Output mux: CFR or pass-through (both from registered stage) --
         self.comb += If(self._enable.storage,
-            source.data[ 0:16].eq(out_ia),
-            source.data[16:32].eq(out_qa),
-            source.data[32:48].eq(out_ib),
-            source.data[48:64].eq(out_qb),
+            source.data[ 0:16].eq(out_ia_r),
+            source.data[16:32].eq(out_qa_r),
+            source.data[32:48].eq(out_ib_r),
+            source.data[48:64].eq(out_qb_r),
         ).Else(
-            source.data.eq(sink.data),
+            source.data.eq(sink_data_r),
         )
