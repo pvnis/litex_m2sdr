@@ -518,6 +518,14 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
        (1 << CSR_HEADER_TX_CONTROL_HEADER_ENABLE_OFFSET)
     );
 
+    /* Enable TimedTXArbiter - gateware defaults to pass-through (0); SoapySDR always
+     * enables it so that packets with SOAPY_SDR_HAS_TIME are held until their
+     * timestamp.  Packets without a time get timestamp=0, which is always in the
+     * past, so they are released immediately. */
+#if defined(CSR_TIMED_TX_ENABLE_ADDR)
+    litex_m2sdr_writel(_fd, CSR_TIMED_TX_ENABLE_ADDR, 1);
+#endif
+
     /* Disable DMA Loopback. */
     litex_m2sdr_writel(_fd, CSR_PCIE_DMA0_LOOPBACK_ENABLE_ADDR, 0);
 #endif

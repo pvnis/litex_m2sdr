@@ -36,7 +36,7 @@ class TimedTXArbiter(LiteXModule):
         self.source = source = stream.Endpoint(dma_layout(data_width))
 
         # CSRs.
-        self._enable         = CSRStorage(1, reset=1,
+        self._enable         = CSRStorage(1, reset=0,
             description="Timed TX enable: 1=hold until timestamp, 0=pass-through.")
         self._late_count     = CSRStatus(32,
             description="TX frames received after their deadline (late packets).")
