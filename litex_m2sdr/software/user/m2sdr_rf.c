@@ -312,6 +312,13 @@ static void m2sdr_init(
     printf("Setting Loopback to %d\n", loopback);
     ad9361_bist_loopback(ad9361_phy, loopback);
 
+    /* Bypass PCIe DMA synchronizer so standalone tools (m2sdr_gen/record) work
+     * immediately without waiting for a PPS edge.  SoapySDR sets this to 0
+     * (synchronizer active) on its own device init. */
+#if defined(USE_LITEPCIE) && defined(CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR)
+    m2sdr_writel(conn, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
+#endif
+
     /* Configure 8-bit mode */
     if (enable_8bit_mode) {
         printf("Enabling 8-bit mode.\n");
@@ -513,6 +520,11 @@ static void help(void)
            "  -tdd enable            Enable TDD TX/RX switch (0/1, default: off). Requires --with-tdd gateware.\n"
            "  -tdd_lead N            TDD PA_EN lead time in sys_clk cycles (default: 20).\n"
            "  -tdd_trail N           TDD PA_EN trail time in sys_clk cycles (default: 10).\n"
+           "  -cfr_enable 0/1        Enable Crest Factor Reduction (default: off). Requires --with-cfr gateware.\n"
+           "  -cfr_threshold N       CFR clipping threshold, Q0.15 (0..32767, default: 32767 = full scale).\n"
+           "  -iq_correction_enable 0/1  Enable IQ correction (default: off). Requires --with-iq-correction gateware.\n"
+           "  -dc_filter_enable 0/1  Enable DC blocker filter (default: off). Requires --with-dc-filter gateware.\n"
+           "  -dc_filter_alpha N     DC filter alpha shift (0..31, default: 15; higher = lower corner freq).\n"
            "  -bist_tx_tone          Run TX tone test.\n"
            "  -bist_rx_tone          Run RX tone test.\n"
            "  -bist_prbs             Run PRBS test.\n"
@@ -554,9 +566,14 @@ static struct option options[] = {
     { "oversample",       no_argument },              /* 16 */
     { "chan",             required_argument },        /* 17 */
     { "sync",             required_argument },        /* 18 */
-    { "tdd",              required_argument },        /* 19 */
-    { "tdd_lead",         required_argument },        /* 20 */
-    { "tdd_trail",        required_argument },        /* 21 */
+    { "tdd",                    required_argument },   /* 19 */
+    { "tdd_lead",               required_argument },   /* 20 */
+    { "tdd_trail",              required_argument },   /* 21 */
+    { "cfr_enable",             required_argument },   /* 22 */
+    { "cfr_threshold",          required_argument },   /* 23 */
+    { "iq_correction_enable",   required_argument },   /* 24 */
+    { "dc_filter_enable",       required_argument },   /* 25 */
+    { "dc_filter_alpha",        required_argument },   /* 26 */
     { NULL },
 };
 
@@ -582,9 +599,14 @@ int main(int argc, char **argv)
     bool     enable_oversample = false;
     char     chan_mode[16] = "2t2r";
     char     sync_mode[16] = "internal";
-    int      tdd_enable  = -1;   /* -1 = not set (don't write CSR) */
-    int      tdd_lead    = -1;
-    int      tdd_trail   = -1;
+    int      tdd_enable          = -1;  /* -1 = not set (don't write CSR) */
+    int      tdd_lead            = -1;
+    int      tdd_trail           = -1;
+    int      cfr_enable          = -1;
+    int      cfr_threshold       = -1;
+    int      iq_correction_enable = -1;
+    int      dc_filter_enable    = -1;
+    int      dc_filter_alpha     = -1;
 
     refclk_freq    = DEFAULT_REFCLK_FREQ;
     samplerate     = DEFAULT_SAMPLERATE;
@@ -697,6 +719,21 @@ int main(int argc, char **argv)
                 case 21: /* tdd_trail */
                     tdd_trail = atoi(optarg);
                     break;
+                case 22: /* cfr_enable */
+                    cfr_enable = atoi(optarg);
+                    break;
+                case 23: /* cfr_threshold */
+                    cfr_threshold = atoi(optarg);
+                    break;
+                case 24: /* iq_correction_enable */
+                    iq_correction_enable = atoi(optarg);
+                    break;
+                case 25: /* dc_filter_enable */
+                    dc_filter_enable = atoi(optarg);
+                    break;
+                case 26: /* dc_filter_alpha */
+                    dc_filter_alpha = atoi(optarg);
+                    break;
                 default:
                     fprintf(stderr, "unknown option index: %d\n", option_index);
                     exit(1);
@@ -758,6 +795,47 @@ int main(int argc, char **argv)
         if (tdd_trail >= 0) {
             printf("TDD switch: trail=%d cycles\n", tdd_trail);
             m2sdr_writel(conn, CSR_TDD_SWITCH_TRAIL_SAMPLES_STORAGE_ADDR, tdd_trail);
+        }
+    }
+#endif
+
+#ifdef CSR_CFR_ENABLE_ADDR
+    /* Apply CFR CSRs if the user requested them and gateware supports it. */
+    if (cfr_enable >= 0 || cfr_threshold >= 0) {
+        void *conn = m2sdr_open();
+        if (cfr_enable >= 0) {
+            printf("CFR: enable=%d\n", cfr_enable);
+            m2sdr_writel(conn, CSR_CFR_ENABLE_ADDR, cfr_enable);
+        }
+        if (cfr_threshold >= 0) {
+            printf("CFR: threshold=%d\n", cfr_threshold);
+            m2sdr_writel(conn, CSR_CFR_THRESHOLD_ADDR, cfr_threshold);
+        }
+        uint32_t clip_count = m2sdr_readl(conn, CSR_CFR_CLIP_COUNT_ADDR);
+        printf("CFR: clip_count=%u\n", clip_count);
+    }
+#endif
+
+#ifdef CSR_IQ_CORRECTION_ENABLE_ADDR
+    /* Apply IQ correction enable if the user requested it and gateware supports it. */
+    if (iq_correction_enable >= 0) {
+        void *conn = m2sdr_open();
+        printf("IQ correction: enable=%d\n", iq_correction_enable);
+        m2sdr_writel(conn, CSR_IQ_CORRECTION_ENABLE_ADDR, iq_correction_enable);
+    }
+#endif
+
+#ifdef CSR_DC_FILTER_ENABLE_ADDR
+    /* Apply DC filter CSRs if the user requested them and gateware supports it. */
+    if (dc_filter_enable >= 0 || dc_filter_alpha >= 0) {
+        void *conn = m2sdr_open();
+        if (dc_filter_enable >= 0) {
+            printf("DC filter: enable=%d\n", dc_filter_enable);
+            m2sdr_writel(conn, CSR_DC_FILTER_ENABLE_ADDR, dc_filter_enable);
+        }
+        if (dc_filter_alpha >= 0) {
+            printf("DC filter: alpha_shift=%d\n", dc_filter_alpha);
+            m2sdr_writel(conn, CSR_DC_FILTER_ALPHA_SHIFT_ADDR, dc_filter_alpha);
         }
     }
 #endif
