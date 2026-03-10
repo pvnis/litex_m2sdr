@@ -49,7 +49,12 @@ class Capability(LiteXModule):
         # Board.
         variant, jtagbone, eth_sfp, wr_sfp,
         # SDR features.
-        timed_tx = False):
+        timed_tx          = False,
+        tdd               = False,
+        cfr               = False,
+        iq_correction     = False,
+        dc_filter         = False,
+        rfic_oversampling = False):
 
         # API Version.
         # ------------
@@ -67,8 +72,13 @@ class Capability(LiteXModule):
             CSRField("sata",     size=1, offset=2, reset=int(sata_enabled), description="SATA     is present."),
             CSRField("gpio",     size=1, offset=3, reset=int(gpio_enabled), description="GPIO     is present."),
             CSRField("wr",       size=1, offset=4, reset=int(wr_enabled),   description="White Rabbit is present."),
-            CSRField("jtagbone",  size=1, offset=5, reset=int(jtagbone),   description="JTAGBone is present."),
-            CSRField("timed_tx", size=1, offset=6, reset=int(timed_tx),   description="Hardware TX timestamp gating (TimedTXArbiter) is present."),
+            CSRField("jtagbone",          size=1, offset=5,  reset=int(jtagbone),          description="JTAGBone is present."),
+            CSRField("timed_tx",          size=1, offset=6,  reset=int(timed_tx),          description="Hardware TX timestamp gating (TimedTXArbiter) is present."),
+            CSRField("tdd",               size=1, offset=7,  reset=int(tdd),               description="TDD switch (PA_EN/TR_SW lead-lag) is present."),
+            CSRField("cfr",               size=1, offset=8,  reset=int(cfr),               description="Crest Factor Reduction (CFR) TX DSP block is present."),
+            CSRField("iq_correction",     size=1, offset=9,  reset=int(iq_correction),     description="IQ Correction RX DSP block is present."),
+            CSRField("dc_filter",         size=1, offset=10, reset=int(dc_filter),         description="DC Filter RX DSP block is present."),
+            CSRField("rfic_oversampling", size=1, offset=11, reset=int(rfic_oversampling), description="RFIC oversampling (122.88 MSPS) is enabled."),
             # Reserved bits for future features
         ], description="Hardware feature presence bitfield.")
 

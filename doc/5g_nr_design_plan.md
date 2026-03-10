@@ -1380,29 +1380,29 @@ git commit -m "nr: phase 3 — CFR, IQ correction, DC filter DSP blocks"
 
 ```
 Phase 1 — Minimum Viable 5G NR
-  [ ] GW-1  gateware/timed_tx.py — TimedTXArbiter
-  [ ] GW-2  gateware/header.py   — burst flags in TX sync word
-  [ ] GW-3  litex_m2sdr.py       — wire TimedTXArbiter
-  [ ] SW-1  LiteXM2SDRStreaming.cpp — real TX timestamp + flags
+  [x] GW-1  gateware/timed_tx.py — TimedTXArbiter
+  [x] GW-2  gateware/header.py   — burst flags in TX sync word
+  [x] GW-3  litex_m2sdr.py       — wire TimedTXArbiter
+  [x] SW-1  LiteXM2SDRStreaming.cpp — real TX timestamp + flags
   [ ] SW-2  LiteXM2SDRDevice.cpp   — slot-aligned frame_cycles
-  [ ] SW-3  LiteXM2SDRStreaming.cpp — readStreamStatus() late/underrun
-  [ ] Ph1-commit
+  [x] SW-3  LiteXM2SDRStreaming.cpp — readStreamStatus() late/underrun
+  [x] Ph1-commit
 
 Phase 2 — TDD Clean Switching
-  [ ] GW-4  gateware/tdd_switch.py      — TDDSwitch module
-  [ ] GW-5  gateware/ad9361/core.py     — txnrx override input
-  [ ] GW-6  litex_m2sdr.py              — wire TDDSwitch + with_tdd flag
-  [ ] GW-7  gateware/header.py          — RX mixed timestamp mode
-  [ ] SW-4  LiteXM2SDRDevice.cpp        — tdd_enable/lead/trail kwargs
-  [ ] SW-5  software/user/m2sdr_rf.c    — -tdd CLI options
-  [ ] Ph2-commit
+  [x] GW-4  gateware/tdd_switch.py      — TDDSwitch module
+  [x] GW-5  gateware/ad9361/core.py     — txnrx override input
+  [x] GW-6  litex_m2sdr.py              — wire TDDSwitch + with_tdd flag
+  [x] GW-7  gateware/header.py          — RX mixed timestamp mode
+  [x] SW-4  LiteXM2SDRDevice.cpp        — tdd_enable/lead/trail kwargs
+  [x] SW-5  software/user/m2sdr_rf.c    — -tdd CLI options
+  [x] Ph2-commit
 
 Phase 3 — DSP Blocks
-  [ ] GW-8  gateware/cfr.py             — CrestFactorReduction
-  [ ] GW-9  gateware/iq_correction.py   — IQCorrection 2×2 matrix
-  [ ] GW-10 gateware/dc_filter.py       — DCFilter IIR
-  [ ] GW-11 litex_m2sdr.py              — wire DSP blocks + CLI flags
-  [ ] SW-6  LiteXM2SDRDevice.cpp        — CFR/IQ SoapySDR settings
+  [x] GW-8  gateware/cfr.py             — CrestFactorReduction
+  [x] GW-9  gateware/iq_correction.py   — IQCorrection 2×2 matrix
+  [x] GW-10 gateware/dc_filter.py       — DCFilter IIR
+  [x] GW-11 litex_m2sdr.py              — wire DSP blocks + CLI flags
+  [x] SW-6  LiteXM2SDRDevice.cpp        — CFR/IQ SoapySDR settings
   [ ] SW-7  software/user/m2sdr_iq_cal.py — offline IQ calibration
   [ ] Ph3-commit
 ```

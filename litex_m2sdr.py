@@ -321,6 +321,11 @@ class BaseSoC(SoCMini):
 
             # SDR features.
             timed_tx       = with_pcie,
+            tdd            = with_tdd,
+            cfr            = with_cfr,
+            iq_correction  = with_iq_correction,
+            dc_filter      = with_dc_filter,
+            rfic_oversampling = with_rfic_oversampling,
         )
 
         # SI5351 Clock Generator -------------------------------------------------------------------
