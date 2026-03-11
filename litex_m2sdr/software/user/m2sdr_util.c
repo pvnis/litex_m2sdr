@@ -57,6 +57,7 @@ static char m2sdr_port[16] = "1234";
 #endif
 
 sig_atomic_t keep_running = 1;
+static int flash_yes = 0; /* -y flag: skip flash_write confirmation */
 
 void intHandler(int dummy) {
     keep_running = 0;
@@ -64,6 +65,8 @@ void intHandler(int dummy) {
 
 static bool confirm_flash_write(void)
 {
+    if (flash_yes)
+        return true;
     char buf[8];
     fprintf(stderr, "WARNING: flash_write can overwrite the FPGA image.\n");
     fprintf(stderr, "Type 'YES' to continue: ");
@@ -508,7 +511,12 @@ static void info(void)
     bool sata_enabled = (features >> CSR_CAPABILITY_FEATURES_SATA_OFFSET) & ((1 << CSR_CAPABILITY_FEATURES_SATA_SIZE) - 1);
     bool gpio_enabled = (features >> CSR_CAPABILITY_FEATURES_GPIO_OFFSET) & ((1 << CSR_CAPABILITY_FEATURES_GPIO_SIZE) - 1);
     bool wr_enabled   = (features >> CSR_CAPABILITY_FEATURES_WR_OFFSET)   & ((1 << CSR_CAPABILITY_FEATURES_WR_SIZE)   - 1);
-    bool jtagbone_enabled = (features >> CSR_CAPABILITY_FEATURES_JTAGBONE_OFFSET) & ((1 << CSR_CAPABILITY_FEATURES_JTAGBONE_SIZE) - 1);
+    bool jtagbone_enabled      = (features >> CSR_CAPABILITY_FEATURES_JTAGBONE_OFFSET)      & ((1 << CSR_CAPABILITY_FEATURES_JTAGBONE_SIZE)      - 1);
+    bool timed_tx_enabled      = (features >> CSR_CAPABILITY_FEATURES_TIMED_TX_OFFSET)      & ((1 << CSR_CAPABILITY_FEATURES_TIMED_TX_SIZE)      - 1);
+    bool tdd_enabled           = (features >> CSR_CAPABILITY_FEATURES_TDD_OFFSET)           & ((1 << CSR_CAPABILITY_FEATURES_TDD_SIZE)           - 1);
+    bool cfr_enabled           = (features >> CSR_CAPABILITY_FEATURES_CFR_OFFSET)           & ((1 << CSR_CAPABILITY_FEATURES_CFR_SIZE)           - 1);
+    bool iq_correction_enabled = (features >> CSR_CAPABILITY_FEATURES_IQ_CORRECTION_OFFSET) & ((1 << CSR_CAPABILITY_FEATURES_IQ_CORRECTION_SIZE) - 1);
+    bool dc_filter_enabled     = (features >> CSR_CAPABILITY_FEATURES_DC_FILTER_OFFSET)     & ((1 << CSR_CAPABILITY_FEATURES_DC_FILTER_SIZE)     - 1);
 
     {
         uint32_t board_info = m2sdr_readl(conn, CSR_CAPABILITY_BOARD_INFO_ADDR);
@@ -567,6 +575,12 @@ static void info(void)
         int wr_sfp   = (board_info >> CSR_CAPABILITY_BOARD_INFO_WR_SFP_OFFSET)  & ((1 << CSR_CAPABILITY_BOARD_INFO_WR_SFP_SIZE)  - 1);
         printf("  WR SFP         : %d\n", wr_sfp);
     }
+    printf("DSP Features:\n");
+    printf("  Timed TX       : %s\n", timed_tx_enabled      ? "Yes" : "No");
+    printf("  TDD Switch     : %s\n", tdd_enabled           ? "Yes" : "No");
+    printf("  CFR            : %s\n", cfr_enabled           ? "Yes" : "No");
+    printf("  IQ Correction  : %s\n", iq_correction_enabled ? "Yes" : "No");
+    printf("  DC Filter      : %s\n", dc_filter_enabled     ? "Yes" : "No");
 #endif
     printf("\n");
 
@@ -1482,6 +1496,7 @@ static void help(void)
            "-i ip_address                     Target IP address for Etherbone (required).\n"
            "-p port                           Port number (default = 1234).\n"
 #endif
+           "-y                                Skip flash_write confirmation prompt.\n"
            "\n"
            "available commands:\n"
            "info                              Get Board information.\n"
@@ -1540,9 +1555,9 @@ int main(int argc, char **argv)
     /* Parameters. */
     for (;;) {
         #ifdef USE_LITEPCIE
-        c = getopt(argc, argv, "hc:w:W:zeat:");
+        c = getopt(argc, argv, "hc:w:W:zeat:y");
         #elif USE_LITEETH
-        c = getopt(argc, argv, "hi:p:");
+        c = getopt(argc, argv, "hi:p:y");
         #endif
         if (c == -1)
             break;
@@ -1585,6 +1600,9 @@ int main(int argc, char **argv)
             test_duration = atoi(optarg);
             break;
         #endif
+        case 'y':
+            flash_yes = 1;
+            break;
         default:
             exit(1);
         }

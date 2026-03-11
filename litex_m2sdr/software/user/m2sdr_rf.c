@@ -312,13 +312,6 @@ static void m2sdr_init(
     printf("Setting Loopback to %d\n", loopback);
     ad9361_bist_loopback(ad9361_phy, loopback);
 
-    /* Bypass PCIe DMA synchronizer so standalone tools (m2sdr_gen/record) work
-     * immediately without waiting for a PPS edge.  SoapySDR sets this to 0
-     * (synchronizer active) on its own device init. */
-#if defined(USE_LITEPCIE) && defined(CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR)
-    m2sdr_writel(conn, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
-#endif
-
     /* Configure 8-bit mode */
     if (enable_8bit_mode) {
         printf("Enabling 8-bit mode.\n");
@@ -799,45 +792,49 @@ int main(int argc, char **argv)
     }
 #endif
 
+    /* Apply and report DSP feature settings. */
+    void *conn = m2sdr_open();
+    printf("DSP Features:\n");
+
 #ifdef CSR_CFR_ENABLE_ADDR
-    /* Apply CFR CSRs if the user requested them and gateware supports it. */
-    if (cfr_enable >= 0 || cfr_threshold >= 0) {
-        void *conn = m2sdr_open();
-        if (cfr_enable >= 0) {
-            printf("CFR: enable=%d\n", cfr_enable);
-            m2sdr_writel(conn, CSR_CFR_ENABLE_ADDR, cfr_enable);
-        }
-        if (cfr_threshold >= 0) {
-            printf("CFR: threshold=%d\n", cfr_threshold);
-            m2sdr_writel(conn, CSR_CFR_THRESHOLD_ADDR, cfr_threshold);
-        }
-        uint32_t clip_count = m2sdr_readl(conn, CSR_CFR_CLIP_COUNT_ADDR);
-        printf("CFR: clip_count=%u\n", clip_count);
-    }
+    if (cfr_enable >= 0)
+        m2sdr_writel(conn, CSR_CFR_ENABLE_ADDR, cfr_enable);
+    if (cfr_threshold >= 0)
+        m2sdr_writel(conn, CSR_CFR_THRESHOLD_ADDR, cfr_threshold);
+    printf("  CFR:          enable=%u  threshold=%u  clip_count=%u\n",
+        m2sdr_readl(conn, CSR_CFR_ENABLE_ADDR),
+        m2sdr_readl(conn, CSR_CFR_THRESHOLD_ADDR),
+        m2sdr_readl(conn, CSR_CFR_CLIP_COUNT_ADDR));
+#else
+    printf("  CFR:          not in gateware\n");
 #endif
 
 #ifdef CSR_IQ_CORRECTION_ENABLE_ADDR
-    /* Apply IQ correction enable if the user requested it and gateware supports it. */
-    if (iq_correction_enable >= 0) {
-        void *conn = m2sdr_open();
-        printf("IQ correction: enable=%d\n", iq_correction_enable);
+    if (iq_correction_enable >= 0)
         m2sdr_writel(conn, CSR_IQ_CORRECTION_ENABLE_ADDR, iq_correction_enable);
-    }
+    printf("  IQ Correction: enable=%u\n",
+        m2sdr_readl(conn, CSR_IQ_CORRECTION_ENABLE_ADDR));
+#else
+    printf("  IQ Correction: not in gateware\n");
 #endif
 
 #ifdef CSR_DC_FILTER_ENABLE_ADDR
-    /* Apply DC filter CSRs if the user requested them and gateware supports it. */
-    if (dc_filter_enable >= 0 || dc_filter_alpha >= 0) {
-        void *conn = m2sdr_open();
-        if (dc_filter_enable >= 0) {
-            printf("DC filter: enable=%d\n", dc_filter_enable);
-            m2sdr_writel(conn, CSR_DC_FILTER_ENABLE_ADDR, dc_filter_enable);
-        }
-        if (dc_filter_alpha >= 0) {
-            printf("DC filter: alpha_shift=%d\n", dc_filter_alpha);
-            m2sdr_writel(conn, CSR_DC_FILTER_ALPHA_SHIFT_ADDR, dc_filter_alpha);
-        }
-    }
+    if (dc_filter_enable >= 0)
+        m2sdr_writel(conn, CSR_DC_FILTER_ENABLE_ADDR, dc_filter_enable);
+    if (dc_filter_alpha >= 0)
+        m2sdr_writel(conn, CSR_DC_FILTER_ALPHA_SHIFT_ADDR, dc_filter_alpha);
+    printf("  DC Filter:    enable=%u  alpha_shift=%u\n",
+        m2sdr_readl(conn, CSR_DC_FILTER_ENABLE_ADDR),
+        m2sdr_readl(conn, CSR_DC_FILTER_ALPHA_SHIFT_ADDR));
+#else
+    printf("  DC Filter:    not in gateware\n");
+#endif
+
+#ifdef CSR_TIMED_TX_ENABLE_ADDR
+    printf("  Timed TX:     enable=%u\n",
+        m2sdr_readl(conn, CSR_TIMED_TX_ENABLE_ADDR));
+#else
+    printf("  Timed TX:     not in gateware\n");
 #endif
 
     m2sdr_close_global();

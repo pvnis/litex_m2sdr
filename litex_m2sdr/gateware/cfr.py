@@ -246,17 +246,27 @@ class CrestFactorReduction(LiteXModule):
         fir_out_qb = fir_mac(fir_qb, "qb")
 
         # -- Subtractor with saturation clamp --
+        # Uses bit-level overflow detection instead of comparing against literal
+        # constants.  Migen emits negative constants as e.g. `-16'd32768` in
+        # Verilog, which is an *unsigned* literal (0x8000 = 32768), so the
+        # comparison `diff < -16'd32768` is evaluated as the unsigned inequality
+        # `unsigned(diff) < 32768`.  That is TRUE for every positive diff in
+        # [0, 32767], causing correct pass-through values to be saturated to
+        # -32768.  The correct test uses the overflow bit: overflow occurs when
+        # bit17 (sign) differs from bit16.
         def sub_clamp(delayed, fir_out, name):
-            diff = Signal((18, True), name=f"{name}_diff")
-            out  = Signal((16, True), name=f"{name}_out")
+            diff     = Signal((18, True), name=f"{name}_diff")
+            out      = Signal((16, True), name=f"{name}_out")
+            overflow = Signal(name=f"{name}_ov")
             self.comb += [
                 diff.eq(delayed - fir_out),
-                If(diff > 32767,
-                    out.eq(32767),
-                ).Elif(diff < -32768,
-                    out.eq(-32768),
+                overflow.eq(diff[17] ^ diff[16]),
+                If(overflow,
+                    # bit17=0 → positive overflow → +32767 (0x7FFF)
+                    # bit17=1 → negative overflow → -32768 (0x8000)
+                    out.eq(Cat(Replicate(~diff[17], 15), diff[17])),
                 ).Else(
-                    out.eq(diff),
+                    out.eq(diff[:16]),
                 ),
             ]
             return out
@@ -266,29 +276,17 @@ class CrestFactorReduction(LiteXModule):
         out_ib = sub_clamp(ib_dly[-1], fir_out_ib, "ib")
         out_qb = sub_clamp(qb_dly[-1], fir_out_qb, "qb")
 
-        # -- Output stage: register sub_clamp results to break the long path --
-        # dly[-1] → sub_clamp (10 CARRY4 + LUTs, ~6 ns) just fits → TX BRAM
-        # without this register, the sub_clamp + enable_mux + BRAM setup exceeds 8 ns.
-        # The bypass path (sink.data) is also registered to keep the mux inputs aligned.
-        out_ia_r = Signal((16, True), reset_less=True, name="out_ia_r")
-        out_qa_r = Signal((16, True), reset_less=True, name="out_qa_r")
-        out_ib_r = Signal((16, True), reset_less=True, name="out_ib_r")
-        out_qb_r = Signal((16, True), reset_less=True, name="out_qb_r")
-        sink_data_r = Signal(64, reset_less=True, name="sink_data_r")
-        self.sync += If(sink.valid & sink.ready, [
-            out_ia_r.eq(out_ia),
-            out_qa_r.eq(out_qa),
-            out_ib_r.eq(out_ib),
-            out_qb_r.eq(out_qb),
-            sink_data_r.eq(sink.data),
-        ])
-
-        # -- Output mux: CFR or pass-through (both from registered stage) --
+        # -- Output mux: CFR or pass-through (combinational) --
+        # The overflow-bit sub_clamp is pure bit manipulation (~1 ns XOR + mux),
+        # so no output register is needed for timing closure.  Keeping the output
+        # purely combinational also avoids the 1-cycle valid/data misalignment
+        # that caused ~27 dB SNR degradation at DMA buffer boundaries when data
+        # was registered but valid was passed through combinationally.
         self.comb += If(self._enable.storage,
-            source.data[ 0:16].eq(out_ia_r),
-            source.data[16:32].eq(out_qa_r),
-            source.data[32:48].eq(out_ib_r),
-            source.data[48:64].eq(out_qb_r),
+            source.data[ 0:16].eq(out_ia),
+            source.data[16:32].eq(out_qa),
+            source.data[32:48].eq(out_ib),
+            source.data[48:64].eq(out_qb),
         ).Else(
-            source.data.eq(sink_data_r),
+            source.data.eq(sink.data),
         )

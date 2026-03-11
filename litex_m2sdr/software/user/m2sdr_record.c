@@ -97,6 +97,13 @@ static void m2sdr_record(const char *device_name, const char *filename, size_t s
         exit(1);
     dma.writer_enable = 1;
 
+    /* Bypass PCIe DMA synchronizer: allow RX data flow without waiting for a
+     * PPS edge.  litepcie_dma_init resets the synchronizer (bypass→0); we
+     * re-enable bypass here so standalone capture works without PPS. */
+#ifdef CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR
+    litepcie_writel(dma.fds.fd, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
+#endif
+
     /* Configure RX Header */
     m2sdr_writel(dma.fds.fd, CSR_HEADER_RX_CONTROL_ADDR,
        (1      << CSR_HEADER_RX_CONTROL_ENABLE_OFFSET) |

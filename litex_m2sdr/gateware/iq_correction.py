@@ -55,12 +55,17 @@ class IQCorrection(LiteXModule):
         self.comb += sink.connect(source, omit={"data"})
 
         def apply_matrix(i_in, q_in, a, b, c, d):
-            """1-stage pipelined 2×2 Q2.14 matrix product, clamped to 16 bits.
+            """2-stage pipelined 2×2 Q2.14 matrix product, clamped to 16 bits.
 
             Stage 1 (sync): register the four individual DSP multiplications.
               Critical path: DSP multiply (~4 ns) → register.
-            Stage 2 (comb): sum pairs, shift >> 14, clamp.
-              Critical path: add (~2 ns) + shift (~1 ns) + clamp (~2 ns).
+            Stage 2 (sync): register the sum+shift result.
+              Critical path: adder (~2 ns) + shift-14 (wire rename) → register.
+              This stage prevents Vivado from inferring a non-pipelined DSP48 for
+              the addition (the add+shift was being fused into a DSP with B[17:0]
+              and PREG=0, causing incorrect results in hardware).
+            Stage 3 (comb): clamp to 16-bit signed range.
+              Critical path: comparator (~2 ns) + mux (~1 ns).
             """
             # Stage 1: register individual products (each maps to one DSP48).
             # reset_less=True: intermediate pipeline registers; startup garbage is
@@ -75,8 +80,17 @@ class IQCorrection(LiteXModule):
                 ci_r.eq(c * i_in),
                 dq_r.eq(d * q_in),
             ]
-            # Stage 2 (comb): add, scale, clamp.
-            # Clamp 36-bit signed result to 16-bit signed range.
+            # Stage 2: register sum+shift to break the combinational add-shift path.
+            # Without this register, Vivado infers a DSP48 for the addition with
+            # non-pipelined B[17:0] input (truncating the 35-bit ai_r to 18 bits)
+            # and PREG=0, producing incorrect output in hardware.
+            i_sum_r = Signal((36, True), reset_less=True)
+            q_sum_r = Signal((36, True), reset_less=True)
+            self.sync += [
+                i_sum_r.eq((ai_r + bq_r) >> 14),
+                q_sum_r.eq((ci_r + dq_r) >> 14),
+            ]
+            # Stage 3 (comb): clamp 36-bit signed result to 16-bit signed range.
             #
             # Bug fixed: the original `x < -32768` emits `x < -16'd32768` in Verilog.
             # -16'd32768 is an *unsigned* literal (0x8000 = 32768), so the comparison
@@ -87,27 +101,23 @@ class IQCorrection(LiteXModule):
             # Negative overflow (x < -32768) iff sign bit (x[35]) is 1 AND bits[34:15]
             # are NOT all 1s (if they were all 1s the value would be in [-32768, -1]).
             # Upper bound: x > 32767 uses Migen's $signed({0,15'd32767}) which is correct.
-            i_out_wide = Signal((36, True))
-            q_out_wide = Signal((36, True))
             i_out      = Signal((16, True))
             q_out      = Signal((16, True))
             _NEG_UPPER = (1 << 20) - 1  # 0xFFFFF: all-ones for bits[34:15] (20 bits)
             self.comb += [
-                i_out_wide.eq((ai_r + bq_r) >> 14),
-                q_out_wide.eq((ci_r + dq_r) >> 14),
-                If(i_out_wide > 32767,
+                If(i_sum_r > 32767,
                     i_out.eq(32767),
-                ).Elif(i_out_wide[35] & (i_out_wide[15:35] != _NEG_UPPER),
+                ).Elif(i_sum_r[35] & (i_sum_r[15:35] != _NEG_UPPER),
                     i_out.eq(-32768),
                 ).Else(
-                    i_out.eq(i_out_wide[:16]),
+                    i_out.eq(i_sum_r[:16]),
                 ),
-                If(q_out_wide > 32767,
+                If(q_sum_r > 32767,
                     q_out.eq(32767),
-                ).Elif(q_out_wide[35] & (q_out_wide[15:35] != _NEG_UPPER),
+                ).Elif(q_sum_r[35] & (q_sum_r[15:35] != _NEG_UPPER),
                     q_out.eq(-32768),
                 ).Else(
-                    q_out.eq(q_out_wide[:16]),
+                    q_out.eq(q_sum_r[:16]),
                 ),
             ]
             return i_out, q_out

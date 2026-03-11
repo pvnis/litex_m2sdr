@@ -107,6 +107,13 @@ static void m2sdr_gen(const char *device_name, double sample_rate, double freque
         exit(1);
     }
 
+    /* Bypass PCIe DMA synchronizer: allow TX data flow without waiting for a
+     * PPS edge.  litepcie_dma_init resets the synchronizer (bypass→0); we
+     * re-enable bypass here so standalone transmission works without PPS. */
+#ifdef CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR
+    litepcie_writel(dma.fds.fd, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
+#endif
+
     dma.reader_enable = 1;
 
     /* Tone generation parameters */

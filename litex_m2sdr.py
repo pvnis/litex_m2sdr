@@ -225,6 +225,7 @@ class BaseSoC(SoCMini):
         wr_ext_clk10_port      = None,  wr_ext_clk10_period=100.0, wr_ext_clk10_name="wr_ext_clk10",
         with_jtagbone          = True,
         with_gpio              = False,
+        with_timed_tx          = False,
         with_tdd               = False,
         with_cfr               = False,
         with_iq_correction     = False,
@@ -320,7 +321,7 @@ class BaseSoC(SoCMini):
             wr_sfp         = capability_wr_sfp,
 
             # SDR features.
-            timed_tx       = with_pcie,
+            timed_tx       = with_timed_tx,
             tdd            = with_tdd,
             cfr            = with_cfr,
             iq_correction  = with_iq_correction,
@@ -650,16 +651,19 @@ class BaseSoC(SoCMini):
         # -------------------------------
         self.txrx_loopback = TXRXLoopback(data_width=64, with_csr=True)
 
-        # Header TX -> TimedTX Arbiter -> Loopback -> RFIC TX.
-        self.timed_tx = TimedTXArbiter(
-            header_extractor = self.header.tx,
-            time_gen         = self.time_gen,
-            fifo_depth       = 512,  # Reduced from 2048: 4× fewer LUTRAM cells → shorter consume-ptr decode path.
-        )
-        self.comb += self.header.tx.source.connect(self.timed_tx.sink)
+        # Header TX -> [optional TimedTX Arbiter] -> Loopback -> RFIC TX.
+        if with_timed_tx:
+            self.timed_tx = TimedTXArbiter(
+                header_extractor = self.header.tx,
+                time_gen         = self.time_gen,
+                fifo_depth       = 512,  # Reduced from 2048: 4× fewer LUTRAM cells → shorter consume-ptr decode path.
+            )
+            self.comb += self.header.tx.source.connect(self.timed_tx.sink)
+            tx_source = self.timed_tx.source
+        else:
+            tx_source = self.header.tx.source
 
         # Optional CFR in TX path.
-        tx_source = self.timed_tx.source
         if with_cfr:
             self.cfr = CrestFactorReduction(data_width=64)
             self.comb += tx_source.connect(self.cfr.sink)
@@ -672,6 +676,8 @@ class BaseSoC(SoCMini):
 
         # TDD Switch: drive PA_EN / txnrx from TX burst state (optional).
         if with_tdd:
+            if not with_timed_tx:
+                raise ValueError("--with-tdd requires --with-timed-tx (TDDSwitch uses tx_burst_active from TimedTXArbiter)")
             self.tdd_switch = TDDSwitch(timed_tx_arbiter=self.timed_tx)
             self.comb += [
                 self.ad9361.txnrx_override.eq(self.tdd_switch.pa_en),
@@ -1123,7 +1129,8 @@ def main():
 
     # GPIO parameters.
     parser.add_argument("--with-gpio",          action="store_true", help="Enable GPIO support.")
-    parser.add_argument("--with-tdd",           action="store_true", help="Enable TDD TX/RX switch with lead/lag PA_EN control.")
+    parser.add_argument("--with-timed-tx",       action="store_true", help="Enable TimedTXArbiter: hold TX packets until their timestamp.")
+    parser.add_argument("--with-tdd",           action="store_true", help="Enable TDD TX/RX switch with lead/lag PA_EN control (requires --with-timed-tx).")
     parser.add_argument("--with-cfr",           action="store_true", help="Enable TX Crest Factor Reduction (clip-and-filter to reduce PAPR).")
     parser.add_argument("--with-iq-correction", action="store_true", help="Enable RX IQ amplitude/phase correction (2×2 matrix).")
     parser.add_argument("--with-dc-filter",     action="store_true", help="Enable RX DC blocker IIR filter (suppresses LO leakthrough).")
@@ -1201,6 +1208,9 @@ def main():
 
         # GPIOs.
         with_gpio     = args.with_gpio,
+
+        # Timed TX arbiter.
+        with_timed_tx      = args.with_timed_tx,
 
         # TDD switch.
         with_tdd           = args.with_tdd,
