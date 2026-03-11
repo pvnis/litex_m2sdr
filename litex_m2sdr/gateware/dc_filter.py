@@ -85,7 +85,9 @@ class DCFilter(LiteXModule):
 
         # Update accumulators and register DC estimates on each valid sample handshake.
         # dc_X at time n = acc_X[n-1] >> alpha  (1-cycle registered, breaks feedback loop).
-        self.sync += If(sink.valid & sink.ready,
+        # Gate on enable: when disabled, hold acc/dc at zero so there is no stale state
+        # when the filter is later enabled.
+        self.sync += If(self._enable.storage & sink.valid & sink.ready,
             dc_ia.eq(acc_ia >> alpha),
             dc_qa.eq(acc_qa >> alpha),
             dc_ib.eq(acc_ib >> alpha),
@@ -94,6 +96,15 @@ class DCFilter(LiteXModule):
             acc_qa.eq(acc_qa + x_qa - dc_qa),
             acc_ib.eq(acc_ib + x_ib - dc_ib),
             acc_qb.eq(acc_qb + x_qb - dc_qb),
+        ).Elif(~self._enable.storage,
+            dc_ia.eq(0),
+            dc_qa.eq(0),
+            dc_ib.eq(0),
+            dc_qb.eq(0),
+            acc_ia.eq(0),
+            acc_qa.eq(0),
+            acc_ib.eq(0),
+            acc_qb.eq(0),
         )
 
         # Output: x[n] - dc[n], clamped to [-32768, 32767].
@@ -110,15 +121,32 @@ class DCFilter(LiteXModule):
         ]
 
         def clamp16(y):
-            """Clamp a 17-bit signed value to signed 16-bit range."""
-            clamped = Signal((16, True))
-            self.comb += If(y > 32767,
-                clamped.eq(32767),
-            ).Elif(y < -32768,
-                clamped.eq(-32768),
-            ).Else(
-                clamped.eq(y),
-            )
+            """Clamp a 17-bit signed value to signed 16-bit range.
+
+            Uses bit-level overflow detection instead of comparing against a
+            negative constant.  Migen emits negative constants as `-16'd32768`
+            in Verilog, which is an *unsigned* literal (0x8000 = 32768), so the
+            comparison `y < -16'd32768` is evaluated as the unsigned inequality
+            `unsigned(y) < 32768`.  That is TRUE for every positive y in
+            [0, 32767], causing correct positive values to be clamped to -32768
+            (half-wave rectification).
+
+            The correct test is: overflow occurs when bit 16 (sign) differs
+            from bit 15.  When overflow:
+              bit16=0, bit15=1  →  positive overflow → saturate to +32767
+              bit16=1, bit15=0  →  negative overflow → saturate to -32768
+            """
+            clamped  = Signal((16, True))
+            overflow = Signal()
+            self.comb += [
+                overflow.eq(y[16] ^ y[15]),
+                If(overflow,
+                    # {y[16], ~y[16] × 15}: gives 0x7FFF (+32767) or 0x8000 (-32768).
+                    clamped.eq(Cat(Replicate(~y[16], 15), y[16])),
+                ).Else(
+                    clamped.eq(y[:16]),
+                ),
+            ]
             return clamped
 
         c_ia = clamp16(y_ia)
