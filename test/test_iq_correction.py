@@ -52,7 +52,16 @@ def test_iq_correction_identity_matrix():
 
     def gen():
         yield dut._enable.storage.eq(1)
-        # Identity: a=d=16384, b=c=0 (already reset values)
+        # Explicitly set identity matrix — CSRStorage reset values are not
+        # applied in Migen run_simulation (sync regs start at 0, not reset).
+        yield dut._ch_a_a.storage.eq(16384)
+        yield dut._ch_a_b.storage.eq(0)
+        yield dut._ch_a_c.storage.eq(0)
+        yield dut._ch_a_d.storage.eq(16384)
+        yield dut._ch_b_a.storage.eq(16384)
+        yield dut._ch_b_b.storage.eq(0)
+        yield dut._ch_b_c.storage.eq(0)
+        yield dut._ch_b_d.storage.eq(16384)
         yield dut.sink.valid.eq(1)
         yield dut.source.ready.eq(1)
         yield dut.sink.data.eq(word)
@@ -62,10 +71,13 @@ def test_iq_correction_identity_matrix():
 
     run_simulation(dut, [gen()])
     ia, qa, ib, qb = _unpack(word)
-    for r in results:
-        oia, oqa, oib, oqb = _unpack(r)
-        assert oia == ia, f"I_A changed: {oia} != {ia}"
-        assert oqa == qa, f"Q_A changed: {oqa} != {qa}"
+    # Check last result only: pipeline takes 2 cycles to settle after coefficients
+    # are applied (one cycle for storage→a_a comb, one cycle for ai_r sync register).
+    oia, oqa, oib, oqb = _unpack(results[-1])
+    assert oia == ia, f"I_A changed: {oia} != {ia}"
+    assert oqa == qa, f"Q_A changed: {oqa} != {qa}"
+    assert oib == ib, f"I_B changed: {oib} != {ib}"
+    assert oqb == qb, f"Q_B changed: {oqb} != {qb}"
 
 
 def test_iq_correction_gain_scaling():

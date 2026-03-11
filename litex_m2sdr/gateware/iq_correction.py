@@ -76,19 +76,39 @@ class IQCorrection(LiteXModule):
                 dq_r.eq(d * q_in),
             ]
             # Stage 2 (comb): add, scale, clamp.
+            # Clamp 36-bit signed result to 16-bit signed range.
+            #
+            # Bug fixed: the original `x < -32768` emits `x < -16'd32768` in Verilog.
+            # -16'd32768 is an *unsigned* literal (0x8000 = 32768), so the comparison
+            # becomes `unsigned(x) < 32768` — TRUE for every positive x in [0,32767],
+            # clamping correct positive outputs to -32768 (same bug as DCFilter).
+            #
+            # Fix: use bit-slice conditions (all unsigned) instead of signed constants.
+            # Negative overflow (x < -32768) iff sign bit (x[35]) is 1 AND bits[34:15]
+            # are NOT all 1s (if they were all 1s the value would be in [-32768, -1]).
+            # Upper bound: x > 32767 uses Migen's $signed({0,15'd32767}) which is correct.
             i_out_wide = Signal((36, True))
             q_out_wide = Signal((36, True))
             i_out      = Signal((16, True))
             q_out      = Signal((16, True))
+            _NEG_UPPER = (1 << 20) - 1  # 0xFFFFF: all-ones for bits[34:15] (20 bits)
             self.comb += [
                 i_out_wide.eq((ai_r + bq_r) >> 14),
                 q_out_wide.eq((ci_r + dq_r) >> 14),
-                If(i_out_wide > 32767,  i_out.eq(32767)
-                ).Elif(i_out_wide < -32768, i_out.eq(-32768)
-                ).Else(i_out.eq(i_out_wide)),
-                If(q_out_wide > 32767,  q_out.eq(32767)
-                ).Elif(q_out_wide < -32768, q_out.eq(-32768)
-                ).Else(q_out.eq(q_out_wide)),
+                If(i_out_wide > 32767,
+                    i_out.eq(32767),
+                ).Elif(i_out_wide[35] & (i_out_wide[15:35] != _NEG_UPPER),
+                    i_out.eq(-32768),
+                ).Else(
+                    i_out.eq(i_out_wide[:16]),
+                ),
+                If(q_out_wide > 32767,
+                    q_out.eq(32767),
+                ).Elif(q_out_wide[35] & (q_out_wide[15:35] != _NEG_UPPER),
+                    q_out.eq(-32768),
+                ).Else(
+                    q_out.eq(q_out_wide[:16]),
+                ),
             ]
             return i_out, q_out
 
