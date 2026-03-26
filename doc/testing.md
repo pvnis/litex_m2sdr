@@ -173,3 +173,225 @@ For verifying the FPGA ↔ AD9361 LVDS data interface (not the RF path), use the
 | FPGA ↔ AD9361 LVDS | `m2sdr_rf -bist_prbs` | Clock/data delay calibration |
 | AD9361 TX→RX signal | tone loopback + Python | Signal fidelity through AD9361 baseband |
 | Full RF chain | cable loopback + tone | End-to-end TX→antenna→RX path |
+
+---
+
+## Timed TX / TDD Validation Sequence
+
+This sequence is intended for validating the timed-TX path after gateware changes, with the specific goal of supporting `ocudu-pavo` in TDD mode through the Soapy driver.
+
+The key failure mode we are trying to catch is:
+
+- host TX ring backs up around the scheduled TDD bursts
+- `acquireWriteBuffer()` starts timing out
+- Timed TX reports `LATE` or `UNDERRUN`
+- PCIe stays up, but future-timestamped TX does not retire buffers correctly
+
+### Pre-checks
+
+Confirm the board is alive after reload:
+
+```bash
+m2sdr_util info
+```
+
+Record at least:
+
+- `FPGA Status`
+- `PCIe Speed`
+- `PCIe Lanes`
+- `PCIe PTM`
+- `DSP Features / Timed TX`
+- `Board Time`
+
+Expected:
+
+- `FPGA Status      : Operational`
+- `PCIe Speed       : Gen2`
+- `PCIe Lanes       : x1`
+- `PCIe PTM         : Enabled`
+- `Timed TX         : Yes`
+
+### 1. Baseline untimed TX sanity check
+
+This verifies that plain continuous TX still works before any timed scheduling is involved.
+
+```bash
+cd /home/dmd/m2sdr/litex_m2sdr/software/user
+./m2sdr_streaming_test --tx --samplerate 23040000
+```
+
+Watch for:
+
+- final `PASS`
+- no repeated TX errors
+- no signs of stuck DMA or PCIe stalls
+
+If this fails, stop. The problem is below timed-TX/TDD.
+
+### 2. Timed TX pulse sanity check
+
+This verifies future-timestamped bursts without the full TDD duty-cycle pattern.
+
+```bash
+./m2sdr_streaming_test --timed --samplerate 23040000 --delay 0.25 --duration 0.02 --gap 0.10 --num-pulses 5
+```
+
+Record these lines from the output:
+
+- `=== Phase 4: Timed TX`
+- `RX captured: ...`
+- `TX status  : X late event(s)  Y underrun(s)`
+- `Pulse N/N : onset ... raw ... corrected ... delta ...`
+- `Timing stats : mean ... min ... max ... std ...`
+- final report lines:
+  - `Timed TX: no TX errors`
+  - `Timed TX: all pulses detected`
+  - `Timed TX: no late events`
+
+Pass criteria:
+
+- `TX status  : 0 late event(s)  0 underrun(s)`
+- all per-pulse detections present
+- final `PASS`
+
+### 3. TDD emulation, padded UL
+
+This is the main hardware test for the current gateware. It keeps the DMA reader fed across UL with zeros and is the first test that should pass before trying sparse UL.
+
+```bash
+./m2sdr_streaming_test --tdd \
+  --tdd-srate 23040000 \
+  --tdd-frames 100 \
+  --tdd-lead-ms 1.0 \
+  --tdd-dl-slots 6 \
+  --tdd-dl-symbols 8 \
+  --tdd-ul-slots 3 \
+  --tdd-awb-timeout 200 \
+  --tdd-init-ms 20 \
+  --tdd-pad-ul
+```
+
+This matches the intended `m2sdr.yml` timing shape:
+
+- `23.04 MSPS`
+- `6 DL slots + 8 DL symbols + 3 UL slots`
+- `10 ms` frame
+
+Record these lines:
+
+- `=== Phase 5: TDD Emulation`
+- `TX ring    : ...`
+- `DL burst   : ...`
+- `UL silence : ...`
+- `Guard zeros: ...`
+- `Host queue : ...`
+- `UL mode    : zero-padded (continuous DMA feed)`
+- frame progress lines:
+  - `[frame NNN] hw=... slept=... awb_to=... late=...`
+- timeout/error lines if any:
+  - `[frame NNN] acquireWriteBuffer TIMEOUT (guard)`
+  - `[frame NNN] acquireWriteBuffer error ...`
+  - `[frame NNN] acquireWriteBuffer TIMEOUT (burst B/K)`
+  - `[frame NNN] acquireWriteBuffer error ... (burst ...)`
+- async status lines:
+  - `[status] LATE at ...`
+  - `[status] UNDERRUN at ...`
+- final summary:
+  - `Frames OK    : ...`
+  - `AWB timeouts : ...`
+  - `AWB errors   : ...`
+  - `Late events  : ...`
+  - `Underruns    : ...`
+  - `TDD: no AWB timeouts`
+  - `TDD: no AWB errors`
+  - `TDD: no late events`
+  - `TDD: no underruns`
+
+Pass criteria:
+
+- `AWB timeouts : 0`
+- `AWB errors   : 0`
+- `Late events  : 0`
+- `Underruns    : 0`
+- final `PASS`
+
+Most important counters:
+
+- `AWB timeouts`
+  - primary indicator that the host TX ring is backing up
+- `Late events`
+  - direct indicator that Timed TX missed a scheduled timestamp
+- `Underruns`
+  - indicator that the TX data path starved after the burst stream was armed
+
+### 4. TDD emulation, sparse UL
+
+This is the closest approximation to the discontinuous gNB behavior and is the next test after padded UL passes.
+
+```bash
+./m2sdr_streaming_test --tdd \
+  --tdd-srate 23040000 \
+  --tdd-frames 100 \
+  --tdd-lead-ms 1.0 \
+  --tdd-dl-slots 6 \
+  --tdd-dl-symbols 8 \
+  --tdd-ul-slots 3 \
+  --tdd-awb-timeout 200 \
+  --tdd-init-ms 20 \
+  --tdd-sparse
+```
+
+Record the same counters/log lines as the padded-UL case.
+
+Expected interpretation:
+
+- if padded UL passes and sparse UL fails, the remaining issue is likely gap-handling semantics or sparse submission behavior
+- if both fail in the same way, the remaining issue is likely still in timed scheduling / buffer retirement
+
+### 5. Arbiter bypass control test
+
+Use this only as a diagnostic, not as a target mode.
+
+If the binary/build supports arbiter bypass, rerun timed or TDD tests with the arbiter bypassed and compare behavior.
+
+What to compare:
+
+- whether `AWB timeouts` disappear
+- whether `Late events` disappear
+- whether TX starts behaving like immediate untimed release
+
+Interpretation:
+
+- bypass passes but normal timed mode fails:
+  - failure is in timed scheduling / TimedTXArbiter path
+- bypass also fails:
+  - problem is lower level, likely DMA / stream plumbing / driver interaction
+
+### Suggested capture format
+
+For each run, save:
+
+- full command line
+- git revision or bitstream build timestamp
+- whether the bitstream is `current` or `m2sdr_previous`
+- the final summary block
+- the first timeout or status event line, if any
+
+Recommended shell capture:
+
+```bash
+mkdir -p /tmp/m2sdr_test_logs
+./m2sdr_streaming_test ... 2>&1 | tee /tmp/m2sdr_test_logs/tdd_padded_$(date +%Y%m%d_%H%M%S).log
+```
+
+### Decision tree
+
+- untimed TX fails:
+  - investigate PCIe/DMA/base TX path first
+- timed pulses fail:
+  - investigate future-timestamped TX before TDD
+- timed pulses pass, padded TDD fails:
+  - investigate sustained timed scheduling under TDD load
+- padded TDD passes, sparse TDD fails:
+  - investigate discontinuous submission semantics relevant to `ocudu-pavo`

@@ -2,6 +2,10 @@ PREFIX ?= /usr/local
 CFLAGS  = -O3 -Wall -g -I../kernel -Ilibliteeth -Iliblitepcie -Ilibm2sdr -Iad9361 -MMD -fPIC
 CFLAGS += -D$(INTERFACE)
 CXXFLAGS = $(CFLAGS) -Icimgui -Icimgui/imgui -Icimgui/imgui/backends -DCIMGUI_USE_SDL2 -DCIMGUI_USE_OPENGL3
+
+SOAPY_CFLAGS := $(shell pkg-config --cflags SoapySDR 2>/dev/null)
+SOAPY_LIBS   := $(shell pkg-config --libs   SoapySDR 2>/dev/null)
+HAVE_SOAPY   := $(shell pkg-config --exists SoapySDR 2>/dev/null && echo 1 || echo 0)
 SDL2_CFLAGS := $(shell pkg-config --cflags sdl2 2>/dev/null)
 SDL2_LIBS   := $(shell pkg-config --libs sdl2 2>/dev/null)
 HAVE_SDL2   := $(shell pkg-config --exists sdl2 2>/dev/null && echo 1 || echo 0)
@@ -22,6 +26,11 @@ else ifeq ($(INTERFACE),USE_LITEPCIE)
     BINARIES += m2sdr_scan
   else
     $(warning SDL2 not found; skipping m2sdr_scan build)
+  endif
+  ifeq ($(HAVE_SOAPY),1)
+    BINARIES += m2sdr_streaming_test
+  else
+    $(warning SoapySDR not found; skipping m2sdr_streaming_test build)
   endif
 else
   $(error INTERFACE must be USE_LITEPCIE or USE_LITEETH)
@@ -104,6 +113,12 @@ m2sdr_fm_tx: liblitepcie/liblitepcie.a m2sdr_fm_tx.o
 m2sdr_fm_rx: liblitepcie/liblitepcie.a m2sdr_fm_rx.o
 	$(CC) $(LDFLAGS) -o $@ $^ -Lliblitepcie -lm -llitepcie -lsndfile -lsamplerate
 
+m2sdr_streaming_test: m2sdr_streaming_test.o
+	$(CXX) $(LDFLAGS) -o $@ $^ $(SOAPY_LIBS) -lpthread -lm
+
+m2sdr_streaming_test.o: m2sdr_streaming_test.cpp
+	$(CXX) -c $(CFLAGS) $(SOAPY_CFLAGS) -o $@ $<
+
 M2SDR_SCAN_IMGUI_SRCS := \
 	cimgui/cimgui.cpp \
 	cimgui/imgui/imgui.cpp \
@@ -121,7 +136,7 @@ m2sdr_scan: liblitepcie/liblitepcie.a libm2sdr/libm2sdr.a ad9361/libad9361_m2sdr
 endif
 
 clean:
-	rm -f $(PROGS) *.o *.a *.d *~
+	rm -f $(PROGS) m2sdr_streaming_test *.o *.a *.d *~
 	rm -f liblitepcie/*.a liblitepcie/*.o liblitepcie/*.d
 	rm -f libm2sdr/*.a libm2sdr/*.o libm2sdr/*.d
 	rm -f libliteeth/*.a libliteeth/*.o libliteeth/*.d

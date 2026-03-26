@@ -9,6 +9,9 @@
 #pragma once
 
 #include <mutex>
+#include <thread>
+#include <deque>
+#include <condition_variable>
 #include <cstring>
 #include <cstdlib>
 #include <stdexcept>
@@ -18,6 +21,7 @@
 #include <vector>
 #include <string>
 #include <cstdint>
+#include <atomic>
 
 #include "liblitepcie.h"
 #include "etherbone.h"
@@ -420,6 +424,13 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     };
 
     struct RXStream: Stream {
+        struct ReadyBuffer {
+            int64_t handle = 0;
+            int flags = 0;
+            long long timeNs = 0;
+            size_t numElems = 0;
+        };
+
         double gain[2]{};
         bool   gainMode[2]{};
         double iqbalance[2]{};
@@ -431,14 +442,56 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         bool overflow  = false;
         bool burst_end = false;
         bool time_valid = false;
+        bool timed_start_pending = false;
         long long time0_ns = 0;
+        long long start_time_ns = 0;
         int64_t time0_count = 0;
         long long remainderTimeNs = 0;
         long long last_time_ns = 0;
         bool time_warned = false;
+        bool dma_writer_started = false; /* re-snap time0_ns when DMA actually starts */
+        bool rx_debug = false;
+        uint64_t rx_debug_limit = 0;
+        long rx_debug_threshold_us = 0;
+        std::atomic<uint64_t> rx_debug_seq{0};
+        bool wallclock_pacing = true;
+        long long pacing_margin_ns = 50000;
+        size_t batch_buffers = 1;
+        bool batch_buffers_explicit = false;
+        double batch_queue_ms = 250.0;
+        int worker_rt_prio = -1;
+        int worker_cpu = -1;
+        size_t batch_buf_size = 0;
+        size_t batch_buf_count = 0;
+        void *batch_buf = nullptr;
+
+#if USE_LITEPCIE
+        std::mutex recv_mutex;
+        std::condition_variable recv_cv;
+        std::deque<ReadyBuffer> ready_buffs;
+        std::deque<ReadyBuffer> pending_ready_buffs;
+        std::deque<int64_t> pending_dma_handles;
+        std::deque<size_t> free_batch_handles;
+        std::thread recv_thread;
+        std::thread deliver_thread;
+        bool recv_thread_stop = false;
+        bool recv_thread_running = false;
+        bool deliver_thread_running = false;
+        std::string recv_error;
+        int64_t enqueue_count = 0;
+        int64_t overflow_lost_buffers = 0;
+#endif
     };
 
     struct TXStream: Stream {
+        struct WriteJob {
+            std::vector<uint8_t> data;
+            size_t numElems = 0;
+            int flags = 0;
+            long long timeNs = 0;
+            std::chrono::steady_clock::time_point enqueue_tp{};
+        };
+
         double gain[2]{};
         double iqbalance[2]{};
         double samplerate = 0.0;
@@ -455,6 +508,42 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         /* Tracks the last-seen late/underrun counts from TimedTXArbiter CSRs. */
         uint32_t last_late_count    = 0;
         uint32_t last_underrun_count = 0;
+
+        /* DMA reader is not started until the first releaseWriteBuffer so that
+         * the FPGA never reads a zeroed buffer header (ts=0) before the real
+         * sync-word/timestamp has been written, which would cause the
+         * TimedTXArbiter to pass the burst immediately (ts=0 < now). */
+        bool dma_started = false;
+
+        bool tx_debug_headers = false;
+        uint64_t tx_debug_limit = 0;
+        std::atomic<uint64_t> tx_debug_seq{0};
+        std::atomic<uint64_t> tx_submit_seq{0};
+        int worker_rt_prio = -1;
+        int worker_cpu = -1;
+        size_t write_queue_depth = 128;
+        bool tx_queue_debug = false;
+        long tx_queue_debug_threshold_us = 50;
+        uint64_t tx_queue_debug_limit = 0;
+        std::atomic<uint64_t> tx_queue_debug_seq{0};
+
+#if USE_LITEPCIE
+        std::mutex submit_mutex;
+        std::condition_variable submit_cv;
+        std::deque<size_t> pending_submit_handles;
+        std::thread submit_thread;
+        bool submit_thread_stop = false;
+        bool submit_thread_running = false;
+        std::string submit_error;
+
+        std::mutex write_mutex;
+        std::condition_variable write_cv;
+        std::deque<WriteJob> pending_write_jobs;
+        std::thread write_thread;
+        bool write_thread_stop = false;
+        bool write_thread_running = false;
+        std::string write_error;
+#endif
     };
 
     RXStream _rx_stream;
@@ -503,6 +592,19 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         size_t offset);
 
     void setSampleMode();
+    void startTxSubmitWorker();
+    void stopTxSubmitWorker();
+    void txSubmitLoop();
+    void checkTxSubmitError();
+    void startTxWriteWorker();
+    void stopTxWriteWorker();
+    void txWriteLoop();
+    void checkTxWriteError();
+    void startRxReceiveWorker();
+    void stopRxReceiveWorker();
+    void rxDeliverLoop();
+    void rxReceiveLoop();
+    void checkRxReceiveError();
 
     const char *dir2Str(const int direction) const {
         return (direction == SOAPY_SDR_RX) ? "RX" : "TX";
@@ -511,6 +613,7 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     litex_m2sdr_device_desc_t _fd;
     struct ad9361_rf_phy *ad9361_phy;
     uint8_t _spi_id = 0;
+    bool _pcie_dma_synchronizer_bypass = true;
 
     uint32_t _bitMode           = 16;
     uint32_t _oversampling      = 0;

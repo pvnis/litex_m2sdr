@@ -6468,6 +6468,12 @@ int32_t ad9361_clk_factor_round_rate(struct refclk_scale *clk_priv,
 {
 	int32_t ret;
 
+	if (!prate || *prate == 0 || rate == 0) {
+		dev_err(&clk_priv->spi->dev, "%s: invalid clock rate rate=%u parent=%u\n",
+			__func__, rate, prate ? *prate : 0);
+		return -EINVAL;
+	}
+
 	if (rate >= *prate) {
 		clk_priv->mult = DIV_ROUND_CLOSEST(rate, *prate);
 		clk_priv->div = 1;

@@ -656,10 +656,24 @@ class BaseSoC(SoCMini):
             self.timed_tx = TimedTXArbiter(
                 header_extractor = self.header.tx,
                 time_gen         = self.time_gen,
-                fifo_depth       = 512,  # Reduced from 2048: 4× fewer LUTRAM cells → shorter consume-ptr decode path.
+                # Timed TX must be able to absorb at least one full 8 KiB PCIe
+                # DMA payload before its release timestamp. 2048 x 64-bit words
+                # is enough for two post-header DMA payloads.
+                fifo_depth       = 2048,
+                ts_fifo_depth    = 32,
             )
             self.comb += self.header.tx.source.connect(self.timed_tx.sink)
-            tx_source = self.timed_tx.source
+            # Break the timed-TX -> DSP combinational path. Gap-fill adds a
+            # source-side mux in the arbiter; buffering here keeps that local
+            # so it does not extend through the downstream TX/RX loopback DSP
+            # chain and back into BRAM timing.
+            self.timed_tx_buffer = stream.Buffer(dma_layout(64))
+            self.comb += self.timed_tx.source.connect(self.timed_tx_buffer.sink)
+            tx_source = self.timed_tx_buffer.source
+            # Reset data_fifo/ts_fifo when PCIe synchronizer loses sync (DMA stopped).
+            # This clears stale data from killed runs so the arbiter starts fresh.
+            if with_pcie:
+                self.comb += self.timed_tx.reset.eq(~self.pcie_dma0.synchronizer.synced)
         else:
             tx_source = self.header.tx.source
 

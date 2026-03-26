@@ -17,6 +17,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 
 #include "ad9361/platform.h"
 #include "ad9361/ad9361.h"
@@ -98,9 +99,10 @@ litex_m2sdr_device_desc_t spi_get_fd(const struct spi_device *spi)
             if (!spi_warned_fallback) {
                 spi_warned_fallback = true;
                 fprintf(stderr,
-                        "spi_write_then_read(): SPI id %u not found, using last registered fd\n",
+                        "spi_write_then_read(): SPI id %u not found, rebinding to last registered fd\n",
                         (unsigned)spi->id_no);
             }
+            spi_fd_map[spi->id_no] = spi_last_fd;
             return spi_last_fd;
         }
 #if USE_LITEPCIE
@@ -300,6 +302,19 @@ int spi_write_then_read(struct spi_device *spi,
     return 0;
 }
 
+int ad9361_wait_product_id(void *conn, int attempts, int sleep_us)
+{
+    int last = -1;
+    for (int i = 0; i < attempts; ++i) {
+        last = m2sdr_ad9361_spi_read(conn, REG_PRODUCT_ID);
+        if ((last & PRODUCT_ID_MASK) == PRODUCT_ID_9361) {
+            return last;
+        }
+        usleep(sleep_us);
+    }
+    return last;
+}
+
 /* AD9361 Delays */
 
 void udelay(unsigned long usecs)
@@ -402,6 +417,152 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     }
 #endif
 
+    {
+        const char *env_debug = std::getenv("M2SDR_SOAPY_TX_DEBUG");
+        const char *env_limit = std::getenv("M2SDR_SOAPY_TX_DEBUG_LIMIT");
+        const char *env_rt_prio = std::getenv("M2SDR_SOAPY_TX_WORKER_RT_PRIO");
+        const char *env_cpu = std::getenv("M2SDR_SOAPY_TX_WORKER_CPU");
+        const char *env_queue_depth = std::getenv("M2SDR_SOAPY_TX_QUEUE_DEPTH");
+        const char *env_queue_debug = std::getenv("M2SDR_SOAPY_TX_QUEUE_DEBUG");
+        const char *env_queue_debug_us = std::getenv("M2SDR_SOAPY_TX_QUEUE_DEBUG_US");
+        const char *env_queue_debug_limit = std::getenv("M2SDR_SOAPY_TX_QUEUE_DEBUG_LIMIT");
+        const bool debug_enabled =
+            (args.count("tx_debug_headers") && args.at("tx_debug_headers") != "0") ||
+            (env_debug && std::string(env_debug) != "0");
+        if (debug_enabled)
+            _tx_stream.tx_debug_headers = true;
+        if (args.count("tx_debug_limit"))
+            _tx_stream.tx_debug_limit = std::strtoull(args.at("tx_debug_limit").c_str(), nullptr, 0);
+        else if (env_limit)
+            _tx_stream.tx_debug_limit = std::strtoull(env_limit, nullptr, 0);
+        if (args.count("tx_worker_rt_prio"))
+            _tx_stream.worker_rt_prio = std::strtol(args.at("tx_worker_rt_prio").c_str(), nullptr, 0);
+        else if (env_rt_prio)
+            _tx_stream.worker_rt_prio = std::strtol(env_rt_prio, nullptr, 0);
+        if (args.count("tx_worker_cpu"))
+            _tx_stream.worker_cpu = std::strtol(args.at("tx_worker_cpu").c_str(), nullptr, 0);
+        else if (env_cpu)
+            _tx_stream.worker_cpu = std::strtol(env_cpu, nullptr, 0);
+        if (args.count("tx_queue_depth"))
+            _tx_stream.write_queue_depth = std::strtoull(args.at("tx_queue_depth").c_str(), nullptr, 0);
+        else if (env_queue_depth)
+            _tx_stream.write_queue_depth = std::strtoull(env_queue_depth, nullptr, 0);
+        if (_tx_stream.write_queue_depth == 0)
+            _tx_stream.write_queue_depth = 128;
+        if ((args.count("tx_queue_debug") && args.at("tx_queue_debug") != "0") ||
+            (env_queue_debug && std::string(env_queue_debug) != "0")) {
+            _tx_stream.tx_queue_debug = true;
+        }
+        if (args.count("tx_queue_debug_us"))
+            _tx_stream.tx_queue_debug_threshold_us = std::strtol(args.at("tx_queue_debug_us").c_str(), nullptr, 0);
+        else if (env_queue_debug_us)
+            _tx_stream.tx_queue_debug_threshold_us = std::strtol(env_queue_debug_us, nullptr, 0);
+        if (_tx_stream.tx_queue_debug_threshold_us <= 0)
+            _tx_stream.tx_queue_debug_threshold_us = 50;
+        if (args.count("tx_queue_debug_limit"))
+            _tx_stream.tx_queue_debug_limit = std::strtoull(args.at("tx_queue_debug_limit").c_str(), nullptr, 0);
+        else if (env_queue_debug_limit)
+            _tx_stream.tx_queue_debug_limit = std::strtoull(env_queue_debug_limit, nullptr, 0);
+        if (_tx_stream.tx_debug_headers) {
+            std::fprintf(stderr,
+                "TXDBG enabled%s\n",
+                _tx_stream.tx_debug_limit ? " with limit" : "");
+            if (_tx_stream.tx_debug_limit) {
+                std::fprintf(stderr,
+                    "TXDBG limit=%llu\n",
+                    (unsigned long long)_tx_stream.tx_debug_limit);
+            }
+        }
+        SoapySDR::logf(SOAPY_SDR_INFO,
+            "TX worker_rt_prio=%d worker_cpu=%d queue_depth=%zu queue_debug=%d",
+            _tx_stream.worker_rt_prio,
+            _tx_stream.worker_cpu,
+            _tx_stream.write_queue_depth,
+            _tx_stream.tx_queue_debug ? 1 : 0);
+    }
+    {
+        const char *env_debug = std::getenv("M2SDR_SOAPY_RX_DEBUG");
+        const char *env_limit = std::getenv("M2SDR_SOAPY_RX_DEBUG_LIMIT");
+        const char *env_threshold = std::getenv("M2SDR_SOAPY_RX_DEBUG_US");
+        const char *env_batch = std::getenv("M2SDR_SOAPY_RX_BATCH_BUFFERS");
+        const char *env_queue_ms = std::getenv("M2SDR_SOAPY_RX_BATCH_QUEUE_MS");
+        const char *env_pacing = std::getenv("M2SDR_SOAPY_RX_WALLCLOCK_PACING");
+        const char *env_pacing_margin = std::getenv("M2SDR_SOAPY_RX_PACING_MARGIN_US");
+        const char *env_rt_prio = std::getenv("M2SDR_SOAPY_RX_WORKER_RT_PRIO");
+        const char *env_cpu = std::getenv("M2SDR_SOAPY_RX_WORKER_CPU");
+        const char *env_sync_bypass = std::getenv("M2SDR_SOAPY_PCIE_DMA_SYNCHRONIZER_BYPASS");
+        const bool debug_enabled =
+            (args.count("rx_debug") && args.at("rx_debug") != "0") ||
+            (env_debug && std::string(env_debug) != "0");
+        if (debug_enabled)
+            _rx_stream.rx_debug = true;
+        if (args.count("rx_debug_limit"))
+            _rx_stream.rx_debug_limit = std::strtoull(args.at("rx_debug_limit").c_str(), nullptr, 0);
+        else if (env_limit)
+            _rx_stream.rx_debug_limit = std::strtoull(env_limit, nullptr, 0);
+        if (args.count("rx_debug_us"))
+            _rx_stream.rx_debug_threshold_us = std::strtol(args.at("rx_debug_us").c_str(), nullptr, 0);
+        else if (env_threshold)
+            _rx_stream.rx_debug_threshold_us = std::strtol(env_threshold, nullptr, 0);
+        if (args.count("rx_batch_buffers"))
+        {
+            _rx_stream.batch_buffers = std::max<size_t>(1, std::strtoull(args.at("rx_batch_buffers").c_str(), nullptr, 0));
+            _rx_stream.batch_buffers_explicit = true;
+        }
+        else if (env_batch)
+        {
+            _rx_stream.batch_buffers = std::max<size_t>(1, std::strtoull(env_batch, nullptr, 0));
+            _rx_stream.batch_buffers_explicit = true;
+        }
+        if (args.count("rx_batch_queue_ms"))
+            _rx_stream.batch_queue_ms = std::max(1.0, std::strtod(args.at("rx_batch_queue_ms").c_str(), nullptr));
+        else if (env_queue_ms)
+            _rx_stream.batch_queue_ms = std::max(1.0, std::strtod(env_queue_ms, nullptr));
+        if (args.count("rx_wallclock_pacing"))
+            _rx_stream.wallclock_pacing = (args.at("rx_wallclock_pacing") != "0");
+        else if (env_pacing)
+            _rx_stream.wallclock_pacing = (std::string(env_pacing) != "0");
+        if (args.count("rx_pacing_margin_us"))
+            _rx_stream.pacing_margin_ns = std::max<long long>(
+                0, static_cast<long long>(std::llround(std::strtod(args.at("rx_pacing_margin_us").c_str(), nullptr) * 1000.0)));
+        else if (env_pacing_margin)
+            _rx_stream.pacing_margin_ns = std::max<long long>(
+                0, static_cast<long long>(std::llround(std::strtod(env_pacing_margin, nullptr) * 1000.0)));
+        if (args.count("rx_worker_rt_prio"))
+            _rx_stream.worker_rt_prio = std::strtol(args.at("rx_worker_rt_prio").c_str(), nullptr, 0);
+        else if (env_rt_prio)
+            _rx_stream.worker_rt_prio = std::strtol(env_rt_prio, nullptr, 0);
+        if (args.count("rx_worker_cpu"))
+            _rx_stream.worker_cpu = std::strtol(args.at("rx_worker_cpu").c_str(), nullptr, 0);
+        else if (env_cpu)
+            _rx_stream.worker_cpu = std::strtol(env_cpu, nullptr, 0);
+        if (args.count("pcie_dma_synchronizer_bypass"))
+            _pcie_dma_synchronizer_bypass = (args.at("pcie_dma_synchronizer_bypass") != "0");
+        else if (env_sync_bypass)
+            _pcie_dma_synchronizer_bypass = (std::string(env_sync_bypass) != "0");
+        if (_rx_stream.rx_debug) {
+            std::fprintf(stderr,
+                "RXDBG enabled%s threshold=%ldus\n",
+                _rx_stream.rx_debug_limit ? " with limit" : "",
+                _rx_stream.rx_debug_threshold_us);
+            if (_rx_stream.rx_debug_limit) {
+                std::fprintf(stderr,
+                    "RXDBG limit=%llu\n",
+                    (unsigned long long)_rx_stream.rx_debug_limit);
+            }
+        }
+        SoapySDR::logf(SOAPY_SDR_INFO,
+            "RX batch buffers=%zu%s queue_ms=%.1f pacing=%d margin_us=%.1f worker_rt_prio=%d worker_cpu=%d sync_bypass=%d",
+            _rx_stream.batch_buffers,
+            _rx_stream.batch_buffers_explicit ? "" : " (auto)",
+            _rx_stream.batch_queue_ms,
+            _rx_stream.wallclock_pacing ? 1 : 0,
+            static_cast<double>(_rx_stream.pacing_margin_ns) / 1000.0,
+            _rx_stream.worker_rt_prio,
+            _rx_stream.worker_cpu,
+            _pcie_dma_synchronizer_bypass ? 1 : 0);
+    }
+
 #if USE_LITEPCIE
     /* Open LitePCIe descriptor. */
     if (args.count("path") == 0) {
@@ -494,8 +655,11 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
 
     /* Configure PCIe Synchronizer and DMA Headers. */
 #if USE_LITEPCIE
-    /* Enable Synchronizer */
-    litex_m2sdr_writel(_fd, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 0);
+    /* Default to bypassing the PCIe DMA synchronizer for normal streaming.
+     * The standalone record/gen tools do the same so RX/TX can flow without
+     * waiting on PPS-style sync. Keep this configurable for experiments. */
+    litex_m2sdr_writel(_fd, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR,
+                       _pcie_dma_synchronizer_bypass ? 1 : 0);
 
     /* DMA RX Header */
     #if defined(_RX_DMA_HEADER_TEST)
@@ -523,11 +687,35 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
      * timestamp.  Packets without a time get timestamp=0, which is always in the
      * past, so they are released immediately. */
 #if defined(CSR_TIMED_TX_ENABLE_ADDR)
-    litex_m2sdr_writel(_fd, CSR_TIMED_TX_ENABLE_ADDR, 1);
+    if (args.count("bypass_timed_tx_arbiter") > 0) {
+        litex_m2sdr_writel(_fd, CSR_TIMED_TX_ENABLE_ADDR, 0);
+    } else {
+        litex_m2sdr_writel(_fd, CSR_TIMED_TX_ENABLE_ADDR, 1);
+    }
 #endif
 
-    /* Disable DMA Loopback. */
-    litex_m2sdr_writel(_fd, CSR_PCIE_DMA0_LOOPBACK_ENABLE_ADDR, 0);
+    /* Configure loopback mode.
+     * Use AD9361 PHY-level TX→RX loopback (bit 1 of CSR_AD9361_PHY_CONTROL).
+     * This loopback runs in the rfic clock domain at RFIC sample rate, so
+     * backpressure and rate-limiting work correctly.  It also sits after the
+     * TimedTXArbiter (TX path: DMA → arbiter → PHY sink → [loopback] → PHY
+     * source → RX DSP → DMA), so timed TX scheduling is exercised.
+     * TXRXLoopback crossbar and PCIe DMA loopback are always disabled. */
+    {
+        const bool phy_loopback = (args.count("loopback") > 0 && args.at("loopback") == "1");
+#if defined(CSR_AD9361_PHY_CONTROL_ADDR) && defined(CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET)
+        uint32_t phy_ctrl = litex_m2sdr_readl(_fd, CSR_AD9361_PHY_CONTROL_ADDR);
+        if (phy_loopback)
+            phy_ctrl |=  (1u << CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET);
+        else
+            phy_ctrl &= ~(1u << CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET);
+        litex_m2sdr_writel(_fd, CSR_AD9361_PHY_CONTROL_ADDR, phy_ctrl);
+#endif
+#if defined(CSR_TXRX_LOOPBACK_CONTROL_ADDR)
+        litex_m2sdr_writel(_fd, CSR_TXRX_LOOPBACK_CONTROL_ADDR, 0);
+#endif
+        litex_m2sdr_writel(_fd, CSR_PCIE_DMA0_LOOPBACK_ENABLE_ADDR, 0);
+    }
 #endif
 
     bool do_init = true;
@@ -677,16 +865,58 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
 
         /* Initialize AD9361 SPI. */
         m2sdr_ad9361_spi_init((void *)(intptr_t)_fd, 1);
+
+        /* Wait until the AD9361 answers reliably on SPI before handing control
+         * to the full ADI init sequence. */
+        const int product_id = ad9361_wait_product_id((void *)(intptr_t)_fd, 20, 5000);
+        if ((product_id & PRODUCT_ID_MASK) != PRODUCT_ID_9361) {
+            throw std::runtime_error(
+                "AD9361 SPI probe failed (PRODUCT_ID=0x" + std::to_string(product_id) + ")");
+        }
     }
 
-    /* Initialize AD9361 RFIC. */
-    default_init_param.reference_clk_rate = refclk_hz;
-    default_init_param.gpio_resetb        = AD9361_GPIO_RESET_PIN;
-    default_init_param.gpio_sync          = -1;
-    default_init_param.gpio_cal_sw1       = -1;
-    default_init_param.gpio_cal_sw2       = -1;
-    default_init_param.id_no = _spi_id;
-    ad9361_init(&ad9361_phy, &default_init_param, do_init);
+    /* Initialize AD9361 RFIC.
+     * Use a local copy so repeated device constructions never share mutable
+     * init state across attempts. */
+    AD9361_InitParam init_param = default_init_param;
+    init_param.reference_clk_rate = refclk_hz;
+    init_param.gpio_resetb        = AD9361_GPIO_RESET_PIN;
+    init_param.gpio_sync          = -1;
+    init_param.gpio_cal_sw1       = -1;
+    init_param.gpio_cal_sw2       = -1;
+    init_param.id_no              = _spi_id;
+    int ad9361_ret = -1;
+    constexpr int ad9361_init_attempts = 3;
+    for (int attempt = 1; attempt <= ad9361_init_attempts; ++attempt) {
+        ad9361_phy = nullptr;
+        if (attempt > 1) {
+            SoapySDR::logf(SOAPY_SDR_WARNING,
+                "Retrying AD9361 init (attempt %d/%d)", attempt, ad9361_init_attempts);
+            litex_m2sdr_writel(_fd, CSR_AD9361_CONFIG_ADDR, 0b00);
+            usleep(5000);
+            litex_m2sdr_writel(_fd, CSR_AD9361_CONFIG_ADDR, 0b11);
+            usleep(5000);
+            m2sdr_ad9361_spi_init((void *)(intptr_t)_fd, 1);
+            const int product_id = ad9361_wait_product_id((void *)(intptr_t)_fd, 20, 5000);
+            if ((product_id & PRODUCT_ID_MASK) != PRODUCT_ID_9361) {
+                ad9361_ret = -ENODEV;
+                continue;
+            }
+        }
+        ad9361_ret = ad9361_init(&ad9361_phy, &init_param, do_init);
+        if (ad9361_ret >= 0 && ad9361_phy != NULL) {
+            break;
+        }
+    }
+    if (ad9361_ret < 0 || ad9361_phy == NULL) {
+        throw std::runtime_error(
+            "AD9361 init failed (ret=" + std::to_string(ad9361_ret) +
+            ", phy=" + std::string(ad9361_phy == NULL ? "null" : "ok") + ")");
+    }
+
+    /* AD9361 BIST loopback is not used; loopback is handled at the FPGA level
+     * via TXRXLoopback (CSR_PCIE_DMA0_LOOPBACK_ENABLE_ADDR), which sits after
+     * the TimedTXArbiter so timed TX scheduling is preserved in loopback mode. */
 
     if (do_init) {
         /* Configure AD9361 TX/RX FIRs. */
@@ -783,6 +1013,15 @@ SoapyLiteXM2SDR::~SoapyLiteXM2SDR(void) {
         }
         _rx_stream.buf = NULL;
         _tx_stream.opened = false;
+    }
+#endif
+
+    /* Disable AD9361 PHY loopback on close. */
+#if defined(CSR_AD9361_PHY_CONTROL_ADDR) && defined(CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET)
+    {
+        uint32_t phy_ctrl = litex_m2sdr_readl(_fd, CSR_AD9361_PHY_CONTROL_ADDR);
+        phy_ctrl &= ~(1u << CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET);
+        litex_m2sdr_writel(_fd, CSR_AD9361_PHY_CONTROL_ADDR, phy_ctrl);
     }
 #endif
 

@@ -518,6 +518,9 @@ static void help(void)
            "  -iq_correction_enable 0/1  Enable IQ correction (default: off). Requires --with-iq-correction gateware.\n"
            "  -dc_filter_enable 0/1  Enable DC blocker filter (default: off). Requires --with-dc-filter gateware.\n"
            "  -dc_filter_alpha N     DC filter alpha shift (0..31, default: 15; higher = lower corner freq).\n"
+           "  -timed_tx_enable 0/1   Enable timed TX arbiter: TX held until timestamp (default: off).\n"
+           "                         Also enables TX header extraction (header_enable). Requires --with-timed-tx gateware.\n"
+           "  -reset_timed_tx_counts Reset late and underrun counters to zero. Requires --with-timed-tx gateware.\n"
            "  -bist_tx_tone          Run TX tone test.\n"
            "  -bist_rx_tone          Run RX tone test.\n"
            "  -bist_prbs             Run PRBS test.\n"
@@ -567,6 +570,8 @@ static struct option options[] = {
     { "iq_correction_enable",   required_argument },   /* 24 */
     { "dc_filter_enable",       required_argument },   /* 25 */
     { "dc_filter_alpha",        required_argument },   /* 26 */
+    { "timed_tx_enable",        required_argument },   /* 27 */
+    { "reset_timed_tx_counts",  no_argument },         /* 28 */
     { NULL },
 };
 
@@ -600,6 +605,8 @@ int main(int argc, char **argv)
     int      iq_correction_enable = -1;
     int      dc_filter_enable    = -1;
     int      dc_filter_alpha     = -1;
+    int      timed_tx_enable          = -1;
+    bool     reset_timed_tx_counts    = false;
 
     refclk_freq    = DEFAULT_REFCLK_FREQ;
     samplerate     = DEFAULT_SAMPLERATE;
@@ -727,6 +734,12 @@ int main(int argc, char **argv)
                 case 26: /* dc_filter_alpha */
                     dc_filter_alpha = atoi(optarg);
                     break;
+                case 27: /* timed_tx_enable */
+                    timed_tx_enable = atoi(optarg);
+                    break;
+                case 28: /* reset_timed_tx_counts */
+                    reset_timed_tx_counts = true;
+                    break;
                 default:
                     fprintf(stderr, "unknown option index: %d\n", option_index);
                     exit(1);
@@ -831,8 +844,26 @@ int main(int argc, char **argv)
 #endif
 
 #ifdef CSR_TIMED_TX_ENABLE_ADDR
-    printf("  Timed TX:     enable=%u\n",
-        m2sdr_readl(conn, CSR_TIMED_TX_ENABLE_ADDR));
+    if (reset_timed_tx_counts)
+        m2sdr_writel(conn, CSR_TIMED_TX_RESET_COUNTS_ADDR, 1);
+    if (timed_tx_enable >= 0) {
+        /* Enable/disable the TimedTX arbiter and the TX header extractor together.
+         * header_enable (bit 1 of CSR_HEADER_TX_CONTROL) must be set so the extractor
+         * strips the 16-byte DMA header (sync word + timestamp) from each TX frame
+         * and feeds the timestamp to the arbiter's ts_fifo. */
+        uint32_t tx_ctrl = m2sdr_readl(conn, CSR_HEADER_TX_CONTROL_ADDR);
+        if (timed_tx_enable) {
+            tx_ctrl |=  (1 << CSR_HEADER_TX_CONTROL_HEADER_ENABLE_OFFSET);
+        } else {
+            tx_ctrl &= ~(1 << CSR_HEADER_TX_CONTROL_HEADER_ENABLE_OFFSET);
+        }
+        m2sdr_writel(conn, CSR_HEADER_TX_CONTROL_ADDR, tx_ctrl);
+        m2sdr_writel(conn, CSR_TIMED_TX_ENABLE_ADDR, timed_tx_enable);
+    }
+    printf("  Timed TX:     enable=%u  late=%u  underrun=%u\n",
+        m2sdr_readl(conn, CSR_TIMED_TX_ENABLE_ADDR),
+        m2sdr_readl(conn, CSR_TIMED_TX_LATE_COUNT_ADDR),
+        m2sdr_readl(conn, CSR_TIMED_TX_UNDERRUN_COUNT_ADDR));
 #else
     printf("  Timed TX:     not in gateware\n");
 #endif
