@@ -1922,6 +1922,12 @@ int SoapyLiteXM2SDR::acquireWriteBuffer(
 
     /* Get the buffer. */
     int buf_offset = _tx_stream.user_count % _dma_mmap_info.dma_tx_buf_count;
+    getDirectAccessBufferAddrs(stream, buf_offset, buffs);
+
+    /* Update the DMA counters. */
+    handle = _tx_stream.user_count;
+    _tx_stream.user_count++;
+    return getStreamMTU(stream);
 #elif USE_VFIO
     {
     int buffers_pending = (int)(_tx_stream.user_count - _tx_stream.hw_count);
