@@ -45,6 +45,12 @@ enum class SoapyLiteXM2SDREthernetMode {
 };
 #endif
 
+#if USE_VFIO
+extern "C" {
+#include "../user/libm2sdr_vfio/m2sdr_vfio.h"
+}
+#endif
+
 #define DEBUG
 
 //#define _RX_DMA_HEADER_TEST
@@ -93,6 +99,9 @@ typedef int litex_m2sdr_device_desc_t;
 #define litex_m2sdr_writel(_fd, _addr, _val) eb_write32(_fd, _val, _addr)
 #define litex_m2sdr_readl(_fd, _addr) eb_read32(_fd, _addr)
 typedef struct eb_connection *litex_m2sdr_device_desc_t;
+#elif USE_VFIO
+#define FD_INIT -1
+typedef int litex_m2sdr_device_desc_t;
 #endif
 
 class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
@@ -386,6 +395,10 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
 
     struct litepcie_ioctl_mmap_dma_info _dma_mmap_info;
     void *_dma_buf;
+
+#if USE_VFIO
+    struct m2sdr_vfio *_vfio = nullptr;
+#endif
 
     size_t _rx_buf_size = 0;
     size_t _tx_buf_size = 0;

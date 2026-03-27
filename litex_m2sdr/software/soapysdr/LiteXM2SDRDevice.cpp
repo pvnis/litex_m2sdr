@@ -609,6 +609,36 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     SoapySDR::logf(SOAPY_SDR_INFO, "Opened devnode %s, serial %s", eth_ip.c_str(), getLiteXM2SDRSerial(_fd).c_str());
 
     std::string eth_mode = "udp";
+#elif USE_VFIO
+    {
+        std::string pci_addr = "0000:01:00.0";
+        if (args.count("pci_addr") > 0)
+            pci_addr = args.at("pci_addr");
+        else if (args.count("path") > 0)
+            pci_addr = args.at("path");
+
+        int poll_mode = M2SDR_POLL_ADAPTIVE;
+        if (args.count("vfio_poll") > 0) {
+            const std::string &pm = args.at("vfio_poll");
+            if      (pm == "busypoll") poll_mode = M2SDR_POLL_BUSYPOLL;
+            else if (pm == "adaptive") poll_mode = M2SDR_POLL_ADAPTIVE;
+            else if (pm == "irq")      poll_mode = M2SDR_POLL_IRQ;
+        }
+
+        std::string dev_id = "vfio:" + pci_addr;
+        int rc = m2sdr_open(&_dev, dev_id.c_str());
+        if (rc != 0) {
+            throw std::runtime_error(
+                "SoapyLiteXM2SDR(VFIO): failed to open " + pci_addr +
+                " (" + std::string(m2sdr_strerror(rc)) +
+                "). Is vfio-pci bound? See doc/vfio_pmd_plan.md §Phase 0.");
+        }
+        _vfio = _dev->vfio;
+        _spi_id = spi_register_fd(0 /* unused in VFIO mode */);
+
+        SoapySDR::logf(SOAPY_SDR_INFO, "Opened VFIO device %s (poll_mode=%d)",
+                       pci_addr.c_str(), poll_mode);
+    }
     if (args.count("eth_mode") > 0)
         eth_mode = args.at("eth_mode");
     if (eth_mode == "udp")
@@ -993,6 +1023,13 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     /* Set-up the DMA. */
     checked_ioctl(_fd, LITEPCIE_IOCTL_MMAP_DMA_INFO, &_dma_mmap_info);
     _dma_buf = NULL;
+#elif USE_VFIO
+    /* Populate _dma_mmap_info from VFIO constants so shared code paths work. */
+    _dma_mmap_info.dma_rx_buf_size  = M2SDR_DMA_BUFFER_SIZE;
+    _dma_mmap_info.dma_rx_buf_count = M2SDR_DMA_BUFFER_COUNT;
+    _dma_mmap_info.dma_tx_buf_size  = M2SDR_DMA_BUFFER_SIZE;
+    _dma_mmap_info.dma_tx_buf_count = M2SDR_DMA_BUFFER_COUNT;
+    _dma_buf = NULL;
 #endif
 
     SoapySDR::log(SOAPY_SDR_INFO, "SoapyLiteXM2SDR initialization complete");
@@ -1014,6 +1051,9 @@ SoapyLiteXM2SDR::~SoapyLiteXM2SDR(void) {
         _rx_stream.buf = NULL;
 #elif USE_LITEETH
         /* nothing to stop explicitly in UDP helper */
+#elif USE_VFIO
+        if (_vfio) m2sdr_vfio_rx_stop(_vfio);
+        _rx_stream.buf = nullptr;
 #endif
         _rx_stream.opened = false;
     }
@@ -1025,6 +1065,12 @@ SoapyLiteXM2SDR::~SoapyLiteXM2SDR(void) {
             litepcie_dma_cleanup(&_tx_stream.dma);
         }
         _rx_stream.buf = NULL;
+        _tx_stream.opened = false;
+    }
+#elif USE_VFIO
+    if (_tx_stream.opened) {
+        if (_vfio) m2sdr_vfio_tx_stop(_vfio);
+        _tx_stream.buf = nullptr;
         _tx_stream.opened = false;
     }
 #endif

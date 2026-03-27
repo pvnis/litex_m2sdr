@@ -959,7 +959,7 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
         _rx_stream.dma.loopback   = 0;
         _rx_stream.dma.zero_copy  = 1;
         if (litepcie_dma_init(&_rx_stream.dma, "", _rx_stream.dma.zero_copy) < 0)
-            throw std::runtime_error("DMA Writer/RX not available (litepcie_dma_init failed).");
+            throw std::runtime_error("DMA Writer/RX not available (litepcie_dma_init failed)." + std::string(strerror(errno)));
 
         /* Get Buffer and Parameters from RX DMA Writer */
         _rx_stream.buf = _rx_stream.dma.buf_rd;
@@ -968,6 +968,16 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
 
         /* Ensure the DMA is disabled initially to avoid counters being in a bad state. */
         litepcie_dma_writer(_fd, 0, &_rx_stream.hw_count, &_rx_stream.sw_count);
+#elif USE_VFIO
+        if (!_vfio)
+            throw std::runtime_error("DMA Writer/RX: VFIO device not open.");
+        if (m2sdr_vfio_rx_start(_vfio) < 0)
+            throw std::runtime_error("DMA Writer/RX not available (m2sdr_vfio_rx_start failed).");
+        _rx_stream.buf  = _vfio->rx_virt;
+        _rx_buf_size    = M2SDR_DMA_BUFFER_SIZE - RX_DMA_HEADER_SIZE;
+        _rx_buf_count   = M2SDR_DMA_BUFFER_COUNT;
+        _rx_stream.hw_count = 0;
+        _rx_stream.sw_count = 0;
 
 #elif USE_LITEETH
     /* Lazy-init UDP helper (enable RX+TX to mirror DMA symmetry). */
@@ -1146,6 +1156,16 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
 
         /* Ensure the DMA is disabled initially to avoid counters being in a bad state. */
         litepcie_dma_reader(_fd, 0, &_tx_stream.hw_count, &_tx_stream.sw_count);
+#elif USE_VFIO
+        if (!_vfio)
+            throw std::runtime_error("DMA Reader/TX: VFIO device not open.");
+        if (m2sdr_vfio_tx_start(_vfio) < 0)
+            throw std::runtime_error("DMA Reader/TX not available (m2sdr_vfio_tx_start failed).");
+        _tx_stream.buf  = _vfio->tx_virt;
+        _tx_buf_size    = M2SDR_DMA_BUFFER_SIZE - TX_DMA_HEADER_SIZE;
+        _tx_buf_count   = M2SDR_DMA_BUFFER_COUNT;
+        _tx_stream.hw_count = 0;
+        _tx_stream.sw_count = 0;
 #elif USE_LITEETH
     if (_eth_mode == SoapyLiteXM2SDREthernetMode::VRT) {
         throw std::runtime_error("Soapy TX streaming is not supported in eth_mode=vrt");
@@ -1253,6 +1273,9 @@ void SoapyLiteXM2SDR::closeStream(SoapySDR::Stream *stream) {
 #elif USE_LITEETH
         std::free(_rx_stream.buf);
         _rx_stream.buf = NULL;
+#elif USE_VFIO
+        if (_vfio) m2sdr_vfio_rx_stop(_vfio);
+        _rx_stream.buf = nullptr;
 #endif
         _rx_stream.opened = false;
     } else if (stream == TX_STREAM) {
@@ -1265,6 +1288,9 @@ void SoapyLiteXM2SDR::closeStream(SoapySDR::Stream *stream) {
 #elif USE_LITEETH
         std::free(_tx_stream.buf);
         _tx_stream.buf = NULL;
+#elif USE_VFIO
+        if (_vfio) m2sdr_vfio_tx_stop(_vfio);
+        _tx_stream.buf = nullptr;
 #endif
         _tx_stream.opened = false;
     }
@@ -1286,6 +1312,10 @@ int SoapyLiteXM2SDR::activateStream(
         litex_m2sdr_writel(_fd, CSR_CROSSBAR_DEMUX_SEL_ADDR, 0);
         /* Configure the DMA engine for RX, but don't enable it yet. */
         litepcie_dma_writer(_fd, 0, &_rx_stream.hw_count, &_rx_stream.sw_count);
+#elif USE_VFIO
+        litex_m2sdr_writel(_dev, CSR_CROSSBAR_DEMUX_SEL_ADDR, 0);
+        _rx_stream.hw_count = 0;
+        _rx_stream.sw_count = 0;
 #elif USE_LITEETH
         /* Crossbar Demux: Select Ethernet streaming */
         litex_m2sdr_writel(_fd, CSR_CROSSBAR_DEMUX_SEL_ADDR, 1);
@@ -1364,6 +1394,11 @@ int SoapyLiteXM2SDR::activateStream(
                                     _tx_stream.dma.mmap_dma_info.dma_tx_buf_size;
             memset(_tx_stream.buf, 0, total_tx_bytes);
         }
+#elif USE_VFIO
+        litex_m2sdr_writel(_dev, CSR_CROSSBAR_MUX_SEL_ADDR, 0);
+        _tx_stream.hw_count = 0;
+        _tx_stream.sw_count = 0;
+        _tx_stream.user_count = 0;
 #elif USE_LITEETH
         /* Crossbar Mux: Select Ethernet streaming */
         litex_m2sdr_writel(_fd, CSR_CROSSBAR_MUX_SEL_ADDR, 1);
@@ -1397,6 +1432,8 @@ int SoapyLiteXM2SDR::deactivateStream(
 #if USE_LITEPCIE
         stopRxReceiveWorker();
         litepcie_dma_writer(_fd, 0, &_rx_stream.hw_count, &_rx_stream.sw_count);
+#elif USE_VFIO
+        /* Ring keeps running; counters reset on next activateStream. */
 #elif USE_LITEETH
         /* Flush/disable Ethernet RX branch when available. */
 #ifdef CSR_ETH_RX_MODE_ADDR
@@ -1420,6 +1457,8 @@ int SoapyLiteXM2SDR::deactivateStream(
         stopTxSubmitWorker();
         /* Disable the DMA engine for TX. */
         litepcie_dma_reader(_fd, 0, &_tx_stream.hw_count, &_tx_stream.sw_count);
+#elif USE_VFIO
+        /* Ring keeps running; counters reset on next activateStream. */
 #elif USE_LITEETH
         /* No-op for UDP helper. */
 #endif
@@ -1458,6 +1497,8 @@ size_t SoapyLiteXM2SDR::getNumDirectAccessBuffers(SoapySDR::Stream *stream) {
   } else if (stream == TX_STREAM) {
 #if USE_LITEETH
     return _tx_buf_count;
+#elif USE_VFIO
+    return M2SDR_DMA_BUFFER_COUNT;
 #else
     return _dma_mmap_info.dma_tx_buf_count;
 #endif
@@ -1478,11 +1519,13 @@ int SoapyLiteXM2SDR::getDirectAccessBufferAddrs(
         } else {
             buffs[0] = (char *)_rx_stream.buf + handle * _dma_mmap_info.dma_rx_buf_size + RX_DMA_HEADER_SIZE;
         }
+#elif USE_VFIO
+        buffs[0] = (char *)_rx_stream.buf + handle * _dma_mmap_info.dma_rx_buf_size + RX_DMA_HEADER_SIZE;
 #else
         buffs[0] = (char *)_rx_stream.buf + handle * _rx_buf_size;
 #endif
     } else if (stream == TX_STREAM) {
-#if USE_LITEPCIE
+#if USE_LITEPCIE || USE_VFIO
         buffs[0] = (char *)_tx_stream.buf + handle * _dma_mmap_info.dma_tx_buf_size + TX_DMA_HEADER_SIZE;
 #else
         buffs[0] = (char *)_tx_stream.buf + handle * _tx_buf_size;
@@ -1744,6 +1787,53 @@ int SoapyLiteXM2SDR::acquireReadBuffer(
         }
         return samples_per_buffer;
     }
+#elif USE_VFIO
+    /* Check if there are buffers available (no-syscall MMIO read). */
+    int buffers_available = (int)(_rx_stream.hw_count - _rx_stream.user_count);
+
+    if (buffers_available == 0 || DETECT_EVERY_OVERFLOW) {
+        _rx_stream.hw_count = m2sdr_vfio_rx_hw_count(_vfio);
+        buffers_available = (int)(_rx_stream.hw_count - _rx_stream.user_count);
+    }
+
+    if (buffers_available == 0) {
+        if (timeoutUs == 0)
+            return SOAPY_SDR_TIMEOUT;
+        int avail = m2sdr_vfio_rx_wait(_vfio, &_rx_stream.hw_count, _rx_stream.sw_count, timeoutUs);
+        buffers_available = (int)(_rx_stream.hw_count - _rx_stream.user_count);
+        if (avail <= 0 || buffers_available <= 0)
+            return SOAPY_SDR_TIMEOUT;
+    }
+
+    if ((_rx_stream.hw_count - _rx_stream.sw_count) >
+        ((int64_t)_dma_mmap_info.dma_rx_buf_count / 2)) {
+        const int64_t lost_buffers = _rx_stream.hw_count - _rx_stream.sw_count;
+        _rx_stream.user_count = _rx_stream.hw_count;
+        _rx_stream.sw_count   = _rx_stream.hw_count;
+        m2sdr_vfio_rx_sw_set(_vfio, _rx_stream.hw_count);
+        handle = -1;
+
+        flags |= SOAPY_SDR_END_ABRUPT;
+        _rx_stream.time0_ns     = this->getHardwareTime("");
+        _rx_stream.time0_count  = _rx_stream.user_count;
+        _rx_stream.time_valid   = (_rx_stream.samplerate > 0.0);
+        _rx_stream.last_time_ns = _rx_stream.time0_ns;
+        _rx_stream.time_warned  = false;
+
+        if (lost_buffers > 0) {
+            const int64_t max_count = (LITEX_OVERFLOW_COUNT_MASK >> LITEX_OVERFLOW_COUNT_SHIFT);
+            const int64_t clamped   = (lost_buffers > max_count) ? max_count : lost_buffers;
+            flags |= LITEX_HAS_OVERFLOW_COUNT;
+            flags |= ((int)clamped << LITEX_OVERFLOW_COUNT_SHIFT) & LITEX_OVERFLOW_COUNT_MASK;
+        }
+
+        return SOAPY_SDR_OVERFLOW;
+    }
+
+    handle = static_cast<size_t>(_rx_stream.user_count % _dma_mmap_info.dma_rx_buf_count);
+    getDirectAccessBufferAddrs(stream, handle, (void **)buffs);
+    _rx_stream.user_count++;
+    return getStreamMTU(stream);
 #endif
 }
 
@@ -1757,6 +1847,10 @@ void SoapyLiteXM2SDR::releaseReadBuffer(
     std::lock_guard<std::mutex> lock(_rx_stream.recv_mutex);
     _rx_stream.free_batch_handles.push_back(handle);
     _rx_stream.recv_cv.notify_all();
+#elif USE_VFIO
+    /* No kernel notification needed; just advance local sw_count. */
+    _rx_stream.sw_count = (int64_t)handle + 1;
+    m2sdr_vfio_rx_sw_set(_vfio, _rx_stream.sw_count);
 #elif USE_LITEETH
     (void)handle; /* UDP slot was advanced by next_read_buffer(). */
 #endif
@@ -1828,6 +1922,26 @@ int SoapyLiteXM2SDR::acquireWriteBuffer(
 
     /* Get the buffer. */
     int buf_offset = _tx_stream.user_count % _dma_mmap_info.dma_tx_buf_count;
+#elif USE_VFIO
+    {
+    int buffers_pending = (int)(_tx_stream.user_count - _tx_stream.hw_count);
+
+    if (buffers_pending >= (int)_dma_mmap_info.dma_tx_buf_count || DETECT_EVERY_UNDERFLOW) {
+        _tx_stream.hw_count = m2sdr_vfio_tx_hw_count(_vfio);
+        buffers_pending = (int)(_tx_stream.user_count - _tx_stream.hw_count);
+    }
+
+    if (buffers_pending >= (int)_dma_mmap_info.dma_tx_buf_count) {
+        if (timeoutUs == 0)
+            return SOAPY_SDR_TIMEOUT;
+        int free_slots = m2sdr_vfio_tx_wait(_vfio, &_tx_stream.hw_count,
+                                             _tx_stream.user_count, timeoutUs);
+        if (free_slots <= 0)
+            return SOAPY_SDR_TIMEOUT;
+        buffers_pending = (int)(_tx_stream.user_count - _tx_stream.hw_count);
+    }
+
+    int buf_offset = (int)(_tx_stream.user_count % _dma_mmap_info.dma_tx_buf_count);
     getDirectAccessBufferAddrs(stream, buf_offset, buffs);
 
     /* Update the DMA counters. */
@@ -1897,7 +2011,7 @@ void SoapyLiteXM2SDR::releaseWriteBuffer(
     const size_t mtu = this->getStreamMTU(stream);
     if (numElems < mtu) {
         uint8_t *buf = nullptr;
-#if USE_LITEPCIE
+#if USE_LITEPCIE || USE_VFIO
         const size_t buf_offset = handle % _dma_mmap_info.dma_tx_buf_count;
         buf = reinterpret_cast<uint8_t*>(_tx_stream.buf) +
               (buf_offset * _dma_mmap_info.dma_tx_buf_size) + TX_DMA_HEADER_SIZE;
@@ -1923,6 +2037,9 @@ void SoapyLiteXM2SDR::releaseWriteBuffer(
         _tx_stream.pending_submit_handles.push_back(handle);
     }
     _tx_stream.submit_cv.notify_one();
+#elif USE_VFIO
+    /* VFIO loop-mode: ring is pre-programmed; track sw_count locally only. */
+    _tx_stream.sw_count = (int64_t)handle + 1;
 #elif USE_LITEETH
     if (numElems >= mtu) {
         auto it = _tx_stream.pendingWriteBufs.find(handle);

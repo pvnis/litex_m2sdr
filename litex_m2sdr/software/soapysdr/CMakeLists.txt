@@ -4,6 +4,7 @@ project(SoapySDRLiteXM2SDR CXX C)
 set(CMAKE_CXX_STANDARD 17)
 
 option(USE_LITEETH "Uses Ethernet interface for control and streaming" OFF)
+option(USE_VFIO    "Uses VFIO user-mode driver for zero-copy low-latency streaming" OFF)
 
 ########################################################################
 ## LitePCIe discovery
@@ -105,6 +106,31 @@ find_library(LIBM2SDR_LIBRARY m2sdr
 )
 
 ########################################################################
+## VFIO library discovery (optional)
+########################################################################
+
+if(USE_VFIO)
+    find_path(LIBM2SDR_VFIO_INCLUDE_DIR m2sdr_vfio.h
+              REQUIRED
+              HINTS
+                ${CMAKE_CURRENT_SOURCE_DIR}/../..
+              PATH_SUFFIXES
+                litex_m2sdr/libm2sdr_vfio
+                software/user/libm2sdr_vfio
+    )
+    include_directories(${LIBM2SDR_VFIO_INCLUDE_DIR})
+
+    find_library(LIBM2SDR_VFIO_LIBRARY m2sdr_vfio
+                 REQUIRED
+                 HINTS
+                   ${CMAKE_CURRENT_SOURCE_DIR}/../..
+                 PATH_SUFFIXES
+                   litex_m2sdr/libm2sdr_vfio
+                   software/user/libm2sdr_vfio
+    )
+endif()
+
+########################################################################
 ## SoapySDR library
 ########################################################################
 
@@ -119,10 +145,15 @@ set(LITEXM2SDR_SOURCE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../software/user/libliteeth/liteeth_udp.c
 )
 
-if(USE_LITEETH)
+if(USE_VFIO)
+    add_definitions(-DUSE_VFIO=1 -DUSE_LITEPCIE=0 -DUSE_LITEETH=0)
+    set(VFIO_EXTRA_LIBS ${LIBM2SDR_VFIO_LIBRARY})
+elseif(USE_LITEETH)
     add_definitions(-DUSE_LITEPCIE=0 -DUSE_LITEETH=1)
+    set(VFIO_EXTRA_LIBS "")
 else()
     add_definitions(-DUSE_LITEPCIE=1 -DUSE_LITEETH=0)
+    set(VFIO_EXTRA_LIBS "")
 endif()
 
 SOAPY_SDR_MODULE_UTIL(
@@ -130,7 +161,7 @@ SOAPY_SDR_MODULE_UTIL(
     SOURCES LiteXM2SDRDevice.cpp LiteXM2SDRStreaming.cpp
     LiteXM2SDRRegistration.cpp
     ${LITEXM2SDR_SOURCE}
-    LIBRARIES ${LIBM2SDR_LIBRARY} ${LITEPCIE_LIBRARY} m
+    LIBRARIES ${LIBM2SDR_LIBRARY} ${LITEPCIE_LIBRARY} ${VFIO_EXTRA_LIBS} m
 )
 
 # Suppress specific warnings
