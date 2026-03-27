@@ -1,0 +1,40 @@
+[INFO] SoapyLiteXM2SDR initializing...
+[INFO] Received arguments:
+[INFO]   device: LiteX-M2SDR
+[INFO]   driver: LiteXM2SDR
+[INFO]   identification: LiteX-M2SDR SoC / m2 variant / built on 2026-03-22 02:00:04
+[INFO]   label: LiteX-M2SDR /dev/m2sdr0 4c75067470485c
+[INFO]   loopback: 1
+[INFO]   oversampling: 0
+[INFO]   path: /dev/m2sdr0
+[INFO]   serial: 4c75067470485c
+[INFO]   version: 1234
+[INFO] Opened devnode /dev/m2sdr0, serial 4c75067470485c
+[INFO] AD9361 1x FIR profile: legacy
+spi_write_then_read(): SPI id 189 not found, using last registered fd
+ad9361_init : AD936x Rev 2 successfully initialized
+[INFO] SoapyLiteXM2SDR initialization complete
+[INFO] RX setupStream: Selected channel 0
+[INFO] Power down and cleanup
+M2SDR Timed TX Test
+  Delay     : 0.1 s
+  Duration  : 0.5 s
+  Tone      : 500.0 kHz
+  Amplitude : 0.3
+  Rate      : 30.720 MSPS
+  Loopback  : yes
+
+Burst         : 15360000 samples  (500.0 ms)  @ 500.0 kHz
+Recording     : 49152000 samples  (1.60 s) ...
+Hardware time : 8126.126167 s
+TX scheduled  : 8126.226167 s  (+0.100 s)
+Burst written to TX FIFO.
+Recorded 49152000 samples in 1.60 s.
+
+=== Results ===
+Pre-burst power  : -120.0 dBFS  (samples 921600–2150400)
+Burst power      : -11.2 dBFS  (samples 4608000–16896000)
+Delta            : 108.8 dB
+Burst onset      : ~0.098 s  (expected 0.100 s,  error 2.5 ms)
+PASS: power delta 108.8 dB >= 20 dB
+PASS: timing error 2.5 ms <= 50 ms

@@ -54,6 +54,8 @@ m2sdr_util [options] cmd [args...]
   Write to/read from the on-board SPI Flash.
 - **flash_reload**
   Reload the FPGA image from SPI Flash.
+- **sram_load**
+  Volatile FPGA load through ICAP without touching SPI Flash. Useful for development; the image is lost on power-cycle.
 
 Example usage:
 ~~~~

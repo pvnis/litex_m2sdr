@@ -861,6 +861,148 @@ static void flash_reload(void)
 
 #endif /* CSR_FLASH_BASE */
 
+#ifdef CSR_ICAP_BITSTREAM_BASE
+
+#define ICAP_BITSTREAM_SYNC_WORD 0xaa995566u
+
+static ssize_t bitstream_find_sync_offset(const uint8_t *data, size_t size)
+{
+    if (size < 4)
+        return -1;
+
+    for (size_t i = 0; i <= (size - 4); i++) {
+        uint32_t word = ((uint32_t)data[i + 0] << 24) |
+                        ((uint32_t)data[i + 1] << 16) |
+                        ((uint32_t)data[i + 2] <<  8) |
+                        ((uint32_t)data[i + 3] <<  0);
+        if (word == ICAP_BITSTREAM_SYNC_WORD) {
+            while (i >= 4 &&
+                   data[i - 4] == 0xff &&
+                   data[i - 3] == 0xff &&
+                   data[i - 2] == 0xff &&
+                   data[i - 1] == 0xff)
+                i -= 4;
+            return (ssize_t)i;
+        }
+    }
+
+    return -1;
+}
+
+static uint32_t bitstream_read_ready(void *conn)
+{
+    return m2sdr_readl(conn, CSR_ICAP_BITSTREAM_SINK_READY_ADDR);
+}
+
+static void icap_bitstream_load(const char *filename)
+{
+    FILE *f;
+    uint8_t *data = NULL;
+    long file_size;
+    size_t payload_size, words_sent = 0;
+    ssize_t sync_offset;
+    uint64_t t_start, t_last_print;
+    void *conn = NULL;
+
+    f = fopen(filename, "rb");
+    if (!f) {
+        perror(filename);
+        exit(1);
+    }
+
+    if (fseek(f, 0L, SEEK_END) != 0) {
+        perror(filename);
+        fclose(f);
+        exit(1);
+    }
+    file_size = ftell(f);
+    if (file_size < 0) {
+        perror(filename);
+        fclose(f);
+        exit(1);
+    }
+    rewind(f);
+
+    data = malloc(file_size);
+    if (!data) {
+        fprintf(stderr, "%d: malloc failed\n", __LINE__);
+        fclose(f);
+        exit(1);
+    }
+    if (fread(data, 1, file_size, f) != (size_t)file_size) {
+        perror(filename);
+        free(data);
+        fclose(f);
+        exit(1);
+    }
+    fclose(f);
+
+    sync_offset = bitstream_find_sync_offset(data, file_size);
+    if (sync_offset < 0) {
+        fprintf(stderr, "Could not find Xilinx sync word in %s.\n", filename);
+        free(data);
+        exit(1);
+    }
+    if ((sync_offset & 0x3) != 0) {
+        fprintf(stderr, "Bitstream payload is not 32-bit aligned (offset=0x%zx).\n", (size_t)sync_offset);
+        free(data);
+        exit(1);
+    }
+
+    payload_size = (size_t)file_size - (size_t)sync_offset;
+    if ((payload_size & 0x3) != 0) {
+        fprintf(stderr, "Warning: payload size is not a multiple of 4 bytes, padding final word with 0xff.\n");
+        payload_size = (payload_size + 3) & ~0x3;
+    }
+
+    conn = m2sdr_open();
+
+    printf("Streaming volatile FPGA image from %s...\n", filename);
+    printf("  Start offset : 0x%08zx\n", (size_t)sync_offset);
+    printf("  Payload size : %zu bytes\n", payload_size);
+    printf("  Note         : PCIe/Etherbone access will drop when reconfiguration starts.\n");
+
+    t_start = get_time_ms();
+    t_last_print = t_start;
+
+    for (size_t i = 0; i < payload_size; i += 4) {
+        uint8_t b0 = ((size_t)sync_offset + i + 0 < (size_t)file_size) ? data[sync_offset + i + 0] : 0xff;
+        uint8_t b1 = ((size_t)sync_offset + i + 1 < (size_t)file_size) ? data[sync_offset + i + 1] : 0xff;
+        uint8_t b2 = ((size_t)sync_offset + i + 2 < (size_t)file_size) ? data[sync_offset + i + 2] : 0xff;
+        uint8_t b3 = ((size_t)sync_offset + i + 3 < (size_t)file_size) ? data[sync_offset + i + 3] : 0xff;
+        uint32_t word = ((uint32_t)b0 << 24) |
+                        ((uint32_t)b1 << 16) |
+                        ((uint32_t)b2 <<  8) |
+                        ((uint32_t)b3 <<  0);
+
+        while (bitstream_read_ready(conn) == 0)
+            usleep(50);
+
+        m2sdr_writel(conn, CSR_ICAP_BITSTREAM_SINK_DATA_ADDR, word);
+        words_sent++;
+
+        if (((words_sent & 0x3fff) == 0) || ((i + 4) >= payload_size)) {
+            uint64_t now = get_time_ms();
+            if ((now - t_last_print) >= 250 || ((i + 4) >= payload_size)) {
+                double done = (double)(i + 4 > payload_size ? payload_size : i + 4);
+                double total = (double)payload_size;
+                printf("  Progress     : %6.2f%% (%zu / %zu bytes)\r", 100.0 * done / total, (size_t)done, payload_size);
+                fflush(stdout);
+                t_last_print = now;
+            }
+        }
+    }
+
+    printf("\nBitstream queued in %.2fs. FPGA should reconfigure immediately.\n",
+           (double)(get_time_ms() - t_start) / 1000.0);
+    printf("Rescan PCIe or reconnect after the new image boots.\n");
+
+    free(data);
+    m2sdr_close(conn);
+}
+
+#endif /* CSR_ICAP_BITSTREAM_BASE */
+
 /* DMA */
 /*-----*/
 
@@ -1532,6 +1674,9 @@ static void help(void)
            "flash_read filename size [offset] Read from SPI Flash to file.\n"
            "flash_reload                      Reload FPGA Image.\n"
 #endif
+#ifdef CSR_ICAP_BITSTREAM_BASE
+           "sram_load filename                Volatile FPGA load through ICAP (no flash write).\n"
+#endif
            );
     exit(1);
 }
@@ -1730,6 +1875,16 @@ int main(int argc, char **argv)
     }
     else if (!strcmp(cmd, "flash_reload"))
         flash_reload();
+#endif
+
+#ifdef CSR_ICAP_BITSTREAM_BASE
+    else if (!strcmp(cmd, "sram_load")) {
+        const char *filename;
+        if (optind + 1 > argc)
+            goto show_help;
+        filename = argv[optind++];
+        icap_bitstream_load(filename);
+    }
 #endif
 
 #ifdef USE_LITEPCIE

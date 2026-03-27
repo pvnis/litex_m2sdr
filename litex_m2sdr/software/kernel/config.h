@@ -30,7 +30,7 @@
 #define DMA_LAST_DISABLE (1<<25)
 
 #define DMA_CHANNEL_COUNT      DMA_CHANNELS
-#define DMA_BUFFER_PER_IRQ     8
+#define DMA_BUFFER_PER_IRQ     1
 //#define DMA_BUFFER_COUNT       256
 #define DMA_BUFFER_COUNT       512
 #define DMA_BUFFER_SIZE        8192

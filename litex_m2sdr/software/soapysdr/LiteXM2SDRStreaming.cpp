@@ -68,6 +68,13 @@ static std::vector<size_t> parse_channel_list(const std::string &channels_str)
     return chans;
 }
 
+static inline long long steady_now_ns()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 #if USE_LITEETH
 static constexpr size_t VRT_SIGNAL_HEADER_BYTES = 20;
 static constexpr size_t VRT_RX_DATA_WORDS_DEFAULT = 256;
@@ -264,8 +271,16 @@ void SoapyLiteXM2SDR::rxReceiveLoop()
         }
 
         litepcie_dma_writer(_fd, 1, &_rx_stream.hw_count, &_rx_stream.sw_count);
+        {
+            struct litepcie_ioctl_mmap_dma_update mmap_dma_update;
+            mmap_dma_update.sw_count = _rx_stream.hw_count;
+            checked_ioctl(_fd, LITEPCIE_IOCTL_MMAP_DMA_WRITER_UPDATE, &mmap_dma_update);
+        }
+        _rx_stream.sw_count = _rx_stream.hw_count;
+        _rx_stream.enqueue_count = _rx_stream.hw_count;
+        _rx_stream.user_count = _rx_stream.hw_count;
         _rx_stream.time0_ns = _rx_stream.timed_start_pending ? _rx_stream.start_time_ns : this->getHardwareTime("");
-        _rx_stream.time0_count = 0;
+        _rx_stream.time0_count = _rx_stream.hw_count;
         _rx_stream.last_time_ns = _rx_stream.time0_ns;
         _rx_stream.dma_writer_started = true;
         _rx_stream.timed_start_pending = false;
@@ -357,18 +372,23 @@ void SoapyLiteXM2SDR::rxReceiveLoop()
                 }
 
                 const size_t batch_buffers = std::max<size_t>(1, _rx_stream.batch_buffers);
+                const size_t total_batch_elems = batch_buffers * dma_mtu;
+                const size_t slice_elems = std::max<size_t>(
+                    1, std::min(total_batch_elems, _rx_stream.slice_elems ? _rx_stream.slice_elems : total_batch_elems));
+                const size_t slice_count = (total_batch_elems + slice_elems - 1) / slice_elems;
+                const size_t bytes_per_elem = _nChannels * _bytesPerComplex;
                 while (_rx_stream.pending_dma_handles.size() >= batch_buffers &&
-                       !_rx_stream.free_batch_handles.empty()) {
-                    RXStream::ReadyBuffer ready;
-                    ready.handle = static_cast<int64_t>(_rx_stream.free_batch_handles.front());
-                    _rx_stream.free_batch_handles.pop_front();
-                    ready.flags = 0;
-                    ready.numElems = batch_buffers * dma_mtu;
-
-                    uint8_t *dst = reinterpret_cast<uint8_t *>(_rx_stream.batch_buf) +
-                                   ready.handle * _rx_stream.batch_buf_size;
+                       _rx_stream.free_batch_handles.size() >= slice_count) {
                     const int64_t first_dma_handle = _rx_stream.pending_dma_handles.front();
+                    std::vector<int64_t> dma_handles;
+                    dma_handles.reserve(batch_buffers);
+                    for (size_t i = 0; i < batch_buffers; ++i) {
+                        dma_handles.push_back(_rx_stream.pending_dma_handles.front());
+                        _rx_stream.pending_dma_handles.pop_front();
+                    }
 
+                    int ready_flags = 0;
+                    long long ready_time_ns = 0;
 #if defined(_RX_DMA_HEADER_TEST)
                     {
                         const int first_offset = first_dma_handle % _dma_mmap_info.dma_rx_buf_count;
@@ -376,38 +396,65 @@ void SoapyLiteXM2SDR::rxReceiveLoop()
                                                     first_offset * _dma_mmap_info.dma_rx_buf_size;
                         uint64_t header = *reinterpret_cast<const uint64_t*>(header_ptr);
                         if (header == DMA_HEADER_SYNC_WORD) {
-                            ready.timeNs = static_cast<long long>(*reinterpret_cast<const uint64_t*>(header_ptr + 8));
-                            ready.flags |= SOAPY_SDR_HAS_TIME;
+                            ready_time_ns = static_cast<long long>(*reinterpret_cast<const uint64_t*>(header_ptr + 8));
+                            ready_flags |= SOAPY_SDR_HAS_TIME;
                         }
                     }
 #endif
-                    if (!(ready.flags & SOAPY_SDR_HAS_TIME) && _rx_stream.time_valid) {
+                    if (!(ready_flags & SOAPY_SDR_HAS_TIME) && _rx_stream.time_valid) {
                         const double ns = (static_cast<double>(
                                                static_cast<long long>(first_dma_handle - _rx_stream.time0_count) *
                                                static_cast<long long>(dma_mtu)) * 1e9) / _rx_stream.samplerate;
-                        ready.timeNs = _rx_stream.time0_ns + static_cast<long long>(std::llround(ns));
-                        ready.flags |= SOAPY_SDR_HAS_TIME;
+                        ready_time_ns = _rx_stream.time0_ns + static_cast<long long>(std::llround(ns));
+                        ready_flags |= SOAPY_SDR_HAS_TIME;
                     }
 
-                    int64_t last_dma_handle = first_dma_handle;
-                    for (size_t i = 0; i < batch_buffers; ++i) {
-                        const int64_t dma_handle = _rx_stream.pending_dma_handles.front();
-                        _rx_stream.pending_dma_handles.pop_front();
-                        last_dma_handle = dma_handle;
-                        const int buf_offset = dma_handle % _dma_mmap_info.dma_rx_buf_count;
-                        const uint8_t *src = reinterpret_cast<const uint8_t *>(_rx_stream.buf) +
-                                             buf_offset * _dma_mmap_info.dma_rx_buf_size + RX_DMA_HEADER_SIZE;
-                        std::memcpy(dst + i * _rx_buf_size, src, _rx_buf_size);
+                    size_t elems_copied = 0;
+                    size_t dma_index = 0;
+                    size_t dma_elem_offset = 0;
+                    while (elems_copied < total_batch_elems) {
+                        RXStream::ReadyBuffer ready;
+                        ready.handle = static_cast<int64_t>(_rx_stream.free_batch_handles.front());
+                        _rx_stream.free_batch_handles.pop_front();
+                        ready.flags = ready_flags;
+                        ready.numElems = std::min(slice_elems, total_batch_elems - elems_copied);
+                        if (ready_flags & SOAPY_SDR_HAS_TIME) {
+                            const double ns =
+                                (static_cast<double>(elems_copied) * 1e9) / _rx_stream.samplerate;
+                            ready.timeNs = ready_time_ns + static_cast<long long>(std::llround(ns));
+                        }
+
+                        uint8_t *dst = reinterpret_cast<uint8_t *>(_rx_stream.batch_buf) +
+                                       ready.handle * _rx_stream.batch_buf_size;
+                        size_t dst_elems = 0;
+                        while (dst_elems < ready.numElems) {
+                            const int64_t dma_handle = dma_handles[dma_index];
+                            const int buf_offset = dma_handle % _dma_mmap_info.dma_rx_buf_count;
+                            const uint8_t *src_base = reinterpret_cast<const uint8_t *>(_rx_stream.buf) +
+                                                     buf_offset * _dma_mmap_info.dma_rx_buf_size +
+                                                     RX_DMA_HEADER_SIZE;
+                            const size_t take_elems = std::min(ready.numElems - dst_elems, dma_mtu - dma_elem_offset);
+                            const uint8_t *src = src_base + dma_elem_offset * bytes_per_elem;
+                            std::memcpy(dst + dst_elems * bytes_per_elem, src, take_elems * bytes_per_elem);
+                            dst_elems += take_elems;
+                            dma_elem_offset += take_elems;
+                            if (dma_elem_offset == dma_mtu) {
+                                dma_elem_offset = 0;
+                                dma_index++;
+                            }
+                        }
+
+                        _rx_stream.pending_ready_buffs.push_back(ready);
+                        elems_copied += ready.numElems;
                     }
 
+                    const int64_t last_dma_handle = dma_handles.back();
                     if (last_dma_handle + 1 > _rx_stream.sw_count) {
                         struct litepcie_ioctl_mmap_dma_update mmap_dma_update;
                         mmap_dma_update.sw_count = last_dma_handle + 1;
                         checked_ioctl(_fd, LITEPCIE_IOCTL_MMAP_DMA_WRITER_UPDATE, &mmap_dma_update);
                         _rx_stream.sw_count = last_dma_handle + 1;
                     }
-
-                    _rx_stream.pending_ready_buffs.push_back(ready);
                 }
                 if (_rx_stream.rx_debug) {
                     const auto poll_us = std::chrono::duration_cast<std::chrono::microseconds>(poll_end - poll_start).count();
@@ -721,6 +768,7 @@ void SoapyLiteXM2SDR::txWriteLoop()
                     debug_log_allowed(_tx_stream.tx_queue_debug,
                                       _tx_stream.tx_queue_debug_seq,
                                       _tx_stream.tx_queue_debug_limit)) {
+                    const long long now_ns = steady_now_ns();
                     long long hw_now_ns = 0;
                     long long lead_us = 0;
                     bool hw_ok = false;
@@ -731,8 +779,9 @@ void SoapyLiteXM2SDR::txWriteLoop()
                     } catch (...) {
                     }
                     std::fprintf(stderr,
-                        "TXQDBG submit queued_us=%ld acq_us=%ld handle=%zu numElems=%zu chunk=%zu "
+                        "TXQDBG submit mono_ns=%lld queued_us=%ld acq_us=%ld handle=%zu numElems=%zu chunk=%zu "
                         "flags=0x%x lead_us=%lld hw_now_ns=%lld ts_ns=%lld q=%zu hw=%lld sw=%lld user=%lld pending=%lld\n",
+                        now_ns,
                         queued_us,
                         acq_us,
                         handle,
@@ -989,43 +1038,52 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
 #if USE_LITEPCIE
         {
             size_t batch_buffers = std::max<size_t>(1, _rx_stream.batch_buffers);
-            const double dma_mtu = static_cast<double>(_rx_buf_size) /
-                                   static_cast<double>(_nChannels * _bytesPerComplex);
+            const size_t dma_mtu = _rx_buf_size / (_nChannels * _bytesPerComplex);
+            size_t slice_elems = _rx_stream.slice_elems;
             if (!_rx_stream.batch_buffers_explicit && _rx_stream.samplerate > 0.0 && dma_mtu > 0.0) {
                 const double target_samples = 0.0001 * _rx_stream.samplerate; /* ~100 us like LimeSuiteNG */
                 const size_t auto_buffers = std::max<size_t>(
-                    1, static_cast<size_t>(std::floor(target_samples / dma_mtu)));
+                    1, static_cast<size_t>(std::floor(target_samples / static_cast<double>(dma_mtu))));
                 batch_buffers = std::clamp<size_t>(auto_buffers, 1, 4);
                 _rx_stream.batch_buffers = batch_buffers;
             }
-            const size_t batch_stride = batch_buffers * _rx_buf_size;
-            size_t batch_count = std::max<size_t>(8, _rx_buf_count / batch_buffers);
+            if (!_rx_stream.slice_elems_explicit) {
+                slice_elems = std::max<size_t>(1, std::min<size_t>(dma_mtu, 480));
+                _rx_stream.slice_elems = slice_elems;
+            } else {
+                slice_elems = std::max<size_t>(1, std::min<size_t>(slice_elems, batch_buffers * dma_mtu));
+            }
+            const size_t slice_stride = slice_elems * _nChannels * _bytesPerComplex;
+            const size_t slice_count = std::max<size_t>(1, (batch_buffers * dma_mtu + slice_elems - 1) / slice_elems);
+            // Size the staged queue from the requested latency budget rather than mirroring the full DMA ring.
+            // Mirroring the ring creates tens of milliseconds of elasticity, which lets the consumer fall behind
+            // and then catch up in bursts. Keep enough buffers for at least two full batches plus a small floor.
+            size_t batch_count = std::max<size_t>(32, slice_count * 2);
             if (_rx_stream.samplerate > 0.0) {
-                const double batch_ms = (1000.0 * dma_mtu * static_cast<double>(batch_buffers)) /
+                const double batch_ms = (1000.0 * static_cast<double>(slice_elems)) /
                                         _rx_stream.samplerate;
                 if (batch_ms > 0.0) {
                     const size_t queue_batches = static_cast<size_t>(
                         std::ceil(_rx_stream.batch_queue_ms / batch_ms));
-                    batch_count = std::max(batch_count, std::max<size_t>(8, queue_batches));
+                    batch_count = std::max(batch_count, std::max<size_t>(32, queue_batches));
                 }
             }
-            _rx_stream.batch_buf = std::malloc(batch_stride * batch_count);
+            _rx_stream.batch_buf = std::malloc(slice_stride * batch_count);
             if (!_rx_stream.batch_buf) {
                 throw std::runtime_error("malloc() failed for RX batch staging buffer.");
             }
-            _rx_stream.batch_buf_size = batch_stride;
+            _rx_stream.batch_buf_size = slice_stride;
             _rx_stream.batch_buf_count = batch_count;
             _rx_stream.free_batch_handles.clear();
             for (size_t i = 0; i < batch_count; ++i)
                 _rx_stream.free_batch_handles.push_back(i);
             SoapySDR_logf(SOAPY_SDR_INFO,
-                          "RX staging batches=%zu batch_stride=%zu bytes (~%.1f ms total)",
+                          "RX staging batches=%zu slice_stride=%zu bytes slice_elems=%zu (~%.1f ms total)",
                           batch_count,
-                          batch_stride,
+                          slice_stride,
+                          slice_elems,
                           (_rx_stream.samplerate > 0.0)
-                              ? (1000.0 * (static_cast<double>(batch_count * batch_buffers) *
-                                           static_cast<double>(_rx_buf_size) /
-                                           static_cast<double>(_nChannels * _bytesPerComplex)) /
+                              ? (1000.0 * (static_cast<double>(batch_count * slice_elems)) /
                                  _rx_stream.samplerate)
                               : 0.0);
         }
@@ -1382,6 +1440,9 @@ int SoapyLiteXM2SDR::deactivateStream(
 size_t SoapyLiteXM2SDR::getStreamMTU(SoapySDR::Stream *stream) const {
     if (stream == RX_STREAM) {
         /* Each sample is 2 * Complex{Int16}. */
+        if (_rx_stream.slice_elems != 0) {
+            return _rx_stream.slice_elems;
+        }
         return (_rx_stream.batch_buffers * _rx_buf_size) / (_nChannels * _bytesPerComplex);
     } else if (stream == TX_STREAM) {
         return _tx_buf_size / (_nChannels * _bytesPerComplex);
@@ -2249,8 +2310,10 @@ int SoapyLiteXM2SDR::writeStream(
         debug_log_allowed(_tx_stream.tx_queue_debug,
                           _tx_stream.tx_queue_debug_seq,
                           _tx_stream.tx_queue_debug_limit)) {
+        const long long now_ns = steady_now_ns();
         std::fprintf(stderr,
-            "TXQDBG enqueue numElems=%zu flags=0x%x q=%zu depth=%zu hw=%lld sw=%lld user=%lld pending=%lld\n",
+            "TXQDBG enqueue mono_ns=%lld numElems=%zu flags=0x%x q=%zu depth=%zu hw=%lld sw=%lld user=%lld pending=%lld\n",
+            now_ns,
             numElems,
             flags,
             _tx_stream.pending_write_jobs.size(),

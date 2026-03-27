@@ -458,7 +458,9 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         long long pacing_margin_ns = 50000;
         size_t batch_buffers = 1;
         bool batch_buffers_explicit = false;
-        double batch_queue_ms = 250.0;
+        size_t slice_elems = 0;
+        bool slice_elems_explicit = false;
+        double batch_queue_ms = 2.0;
         int worker_rt_prio = -1;
         int worker_cpu = -1;
         size_t batch_buf_size = 0;

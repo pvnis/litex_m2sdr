@@ -485,6 +485,7 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
         const char *env_limit = std::getenv("M2SDR_SOAPY_RX_DEBUG_LIMIT");
         const char *env_threshold = std::getenv("M2SDR_SOAPY_RX_DEBUG_US");
         const char *env_batch = std::getenv("M2SDR_SOAPY_RX_BATCH_BUFFERS");
+        const char *env_slice = std::getenv("M2SDR_SOAPY_RX_SLICE_ELEMS");
         const char *env_queue_ms = std::getenv("M2SDR_SOAPY_RX_BATCH_QUEUE_MS");
         const char *env_pacing = std::getenv("M2SDR_SOAPY_RX_WALLCLOCK_PACING");
         const char *env_pacing_margin = std::getenv("M2SDR_SOAPY_RX_PACING_MARGIN_US");
@@ -513,6 +514,16 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
         {
             _rx_stream.batch_buffers = std::max<size_t>(1, std::strtoull(env_batch, nullptr, 0));
             _rx_stream.batch_buffers_explicit = true;
+        }
+        if (args.count("rx_slice_elems"))
+        {
+            _rx_stream.slice_elems = std::max<size_t>(1, std::strtoull(args.at("rx_slice_elems").c_str(), nullptr, 0));
+            _rx_stream.slice_elems_explicit = true;
+        }
+        else if (env_slice)
+        {
+            _rx_stream.slice_elems = std::max<size_t>(1, std::strtoull(env_slice, nullptr, 0));
+            _rx_stream.slice_elems_explicit = true;
         }
         if (args.count("rx_batch_queue_ms"))
             _rx_stream.batch_queue_ms = std::max(1.0, std::strtod(args.at("rx_batch_queue_ms").c_str(), nullptr));
@@ -552,9 +563,11 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
             }
         }
         SoapySDR::logf(SOAPY_SDR_INFO,
-            "RX batch buffers=%zu%s queue_ms=%.1f pacing=%d margin_us=%.1f worker_rt_prio=%d worker_cpu=%d sync_bypass=%d",
+            "RX batch buffers=%zu%s slice_elems=%zu%s queue_ms=%.1f pacing=%d margin_us=%.1f worker_rt_prio=%d worker_cpu=%d sync_bypass=%d",
             _rx_stream.batch_buffers,
             _rx_stream.batch_buffers_explicit ? "" : " (auto)",
+            _rx_stream.slice_elems,
+            _rx_stream.slice_elems_explicit ? "" : " (auto)",
             _rx_stream.batch_queue_ms,
             _rx_stream.wallclock_pacing ? 1 : 0,
             static_cast<double>(_rx_stream.pacing_margin_ns) / 1000.0,
@@ -658,8 +671,8 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     /* Default to bypassing the PCIe DMA synchronizer for normal streaming.
      * The standalone record/gen tools do the same so RX/TX can flow without
      * waiting on PPS-style sync. Keep this configurable for experiments. */
-    litex_m2sdr_writel(_fd, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR,
-                       _pcie_dma_synchronizer_bypass ? 1 : 0);
+    // litex_m2sdr_writel(_fd, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR,
+    //                    _pcie_dma_synchronizer_bypass ? 1 : 0);
 
     /* DMA RX Header */
     #if defined(_RX_DMA_HEADER_TEST)
