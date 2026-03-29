@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <mutex>
 #include <thread>
 #include <deque>
@@ -24,7 +25,6 @@
 #include <atomic>
 
 #include "liblitepcie.h"
-#include "etherbone.h"
 #include "libm2sdr.h"
 
 #include <SoapySDR/Constants.h>
@@ -34,33 +34,91 @@
 #include <SoapySDR/Formats.hpp>
 #include <SoapySDR/Types.hpp>
 
-#if USE_LITEETH
-extern "C" {
-#include "liteeth_udp.h"
-}
-
-enum class SoapyLiteXM2SDREthernetMode {
-    UDP = 0,
-    VRT = 1,
-};
-#endif
-
 #if USE_VFIO
 extern "C" {
-#include "../user/libm2sdr_vfio/m2sdr_vfio.h"
+#include "../user/libm2sdr_vfio/vfio_priv.h"
+struct m2sdr_dev;
+int m2sdr_open(struct m2sdr_dev **dev_out, const char *device_identifier);
+void m2sdr_close(struct m2sdr_dev *dev);
+const char *m2sdr_strerror(int err);
+int m2sdr_reg_read(struct m2sdr_dev *dev, uint32_t addr, uint32_t *val);
+int m2sdr_reg_write(struct m2sdr_dev *dev, uint32_t addr, uint32_t val);
+struct m2sdr_vfio *m2sdr_get_vfio(struct m2sdr_dev *dev);
 }
 #endif
 
 #define DEBUG
 
-//#define _RX_DMA_HEADER_TEST
 //#define _TX_DMA_HEADER_TEST
 
 /* Thresholds above which we switch to 8-bit mode: */
 #define LITEPCIE_8BIT_THRESHOLD  61.44e6
-#define LITEETH_8BIT_THRESHOLD   20.0e6
 
 #define DLL_EXPORT __attribute__ ((visibility ("default")))
+
+template<typename T>
+class SPSCQueue {
+  public:
+    void reset(size_t capacity)
+    {
+        ring_size_ = capacity + 1;
+        buffer_.assign(ring_size_, T{});
+        read_pos_.store(0, std::memory_order_relaxed);
+        write_pos_.store(0, std::memory_order_relaxed);
+    }
+
+    void clear()
+    {
+        const size_t write = write_pos_.load(std::memory_order_acquire);
+        read_pos_.store(write, std::memory_order_release);
+    }
+
+    bool push(const T &value)
+    {
+        const size_t write = write_pos_.load(std::memory_order_relaxed);
+        const size_t next = advance(write);
+        if (next == read_pos_.load(std::memory_order_acquire))
+            return false;
+        buffer_[write] = value;
+        write_pos_.store(next, std::memory_order_release);
+        return true;
+    }
+
+    bool pop(T &value)
+    {
+        const size_t read = read_pos_.load(std::memory_order_relaxed);
+        if (read == write_pos_.load(std::memory_order_acquire))
+            return false;
+        value = buffer_[read];
+        read_pos_.store(advance(read), std::memory_order_release);
+        return true;
+    }
+
+    bool empty() const
+    {
+        return read_pos_.load(std::memory_order_acquire) == write_pos_.load(std::memory_order_acquire);
+    }
+
+    size_t size() const
+    {
+        const size_t read = read_pos_.load(std::memory_order_acquire);
+        const size_t write = write_pos_.load(std::memory_order_acquire);
+        if (write >= read)
+            return write - read;
+        return ring_size_ - read + write;
+    }
+
+  private:
+    size_t advance(size_t pos) const
+    {
+        return (pos + 1 == ring_size_) ? 0 : pos + 1;
+    }
+
+    size_t ring_size_ = 0;
+    std::vector<T> buffer_;
+    std::atomic<size_t> read_pos_{0};
+    std::atomic<size_t> write_pos_{0};
+};
 
 /*
  * LiteX M2SDR specific flags for RX overflow buffer count reporting.
@@ -94,14 +152,19 @@ extern "C" {
 #define litex_m2sdr_writel(_fd, _addr, _val) litepcie_writel(_fd, _addr, _val)
 #define litex_m2sdr_readl(_fd, _addr) litepcie_readl(_fd, _addr)
 typedef int litex_m2sdr_device_desc_t;
-#elif USE_LITEETH
-#define FD_INIT NULL
-#define litex_m2sdr_writel(_fd, _addr, _val) eb_write32(_fd, _val, _addr)
-#define litex_m2sdr_readl(_fd, _addr) eb_read32(_fd, _addr)
-typedef struct eb_connection *litex_m2sdr_device_desc_t;
 #elif USE_VFIO
-#define FD_INIT -1
-typedef int litex_m2sdr_device_desc_t;
+#define FD_INIT nullptr
+typedef struct m2sdr_dev *litex_m2sdr_device_desc_t;
+static inline uint32_t litex_m2sdr_readl(litex_m2sdr_device_desc_t dev, uint32_t addr)
+{
+    uint32_t val = 0;
+    (void)m2sdr_reg_read(dev, addr, &val);
+    return val;
+}
+static inline void litex_m2sdr_writel(litex_m2sdr_device_desc_t dev, uint32_t addr, uint32_t val)
+{
+    (void)m2sdr_reg_write(dev, addr, val);
+}
 #endif
 
 class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
@@ -109,6 +172,14 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
  *                                        PUBLIC
  **************************************************************************************************/
   public:
+    enum class LoopbackMode {
+        None,
+        Phy,
+        RficBist,
+        TxRxCrossbar,
+        Dma,
+    };
+
     SoapyLiteXM2SDR(const SoapySDR::Kwargs &args);
     ~SoapyLiteXM2SDR(void);
 
@@ -389,6 +460,14 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
  *                                        PRIVATE
  **************************************************************************************************/
   private:
+    static constexpr const char *kLoopbackArg              = "loopback";
+    static constexpr const char *kLoopbackModeArg          = "loopback_mode";
+    static constexpr const char *kLoopbackModeNone         = "none";
+    static constexpr const char *kLoopbackModePhy          = "phy";
+    static constexpr const char *kLoopbackModeRficBist     = "rfic_bist";
+    static constexpr const char *kLoopbackModeTxRxCrossbar = "txrx_crossbar";
+    static constexpr const char *kLoopbackModeDma          = "dma";
+
     SoapySDR::Kwargs _deviceArgs;
     SoapySDR::Stream *const TX_STREAM = (SoapySDR::Stream *)0x1;
     SoapySDR::Stream *const RX_STREAM = (SoapySDR::Stream *)0x2;
@@ -405,30 +484,17 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     size_t _rx_buf_count = 0;
     size_t _tx_buf_count = 0;
 
-#if USE_LITEETH
-    struct liteeth_udp_ctrl _udp;
-    bool _udp_inited = false;
-    SoapyLiteXM2SDREthernetMode _eth_mode = SoapyLiteXM2SDREthernetMode::UDP;
-#endif
-
     struct Stream {
         Stream() :
             opened(false),
             buf(nullptr),
             hw_count(0), sw_count(0), user_count(0),
-            remainderHandle(-1), remainderSamps(0),
-            remainderOffset(0), remainderBuff(nullptr),
             format() {}
 
         bool opened;
         void *buf;
         struct pollfd fds{};
         int64_t hw_count, sw_count, user_count;
-
-        int32_t remainderHandle;
-        size_t remainderSamps;
-        size_t remainderOffset;
-        int8_t* remainderBuff;
         std::string format;
         std::vector<size_t> channels;
 #if USE_LITEPCIE
@@ -437,10 +503,11 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     };
 
     struct RXStream: Stream {
-        struct ReadyBuffer {
-            int64_t handle = 0;
+        struct Packet {
+            std::vector<uint8_t> data;
             int flags = 0;
             long long timeNs = 0;
+            int64_t sampleIndex = 0;
             size_t numElems = 0;
         };
 
@@ -457,41 +524,50 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         bool time_valid = false;
         bool timed_start_pending = false;
         long long time0_ns = 0;
+        std::chrono::steady_clock::time_point time0_steady = std::chrono::steady_clock::now();
         long long start_time_ns = 0;
         int64_t time0_count = 0;
-        long long remainderTimeNs = 0;
+        bool time_base_locked = false;
         long long last_time_ns = 0;
         bool time_warned = false;
-        bool dma_writer_started = false; /* re-snap time0_ns when DMA actually starts */
+        int32_t active_handle = -1;
+        size_t active_num_elems = 0;
+        size_t active_offset = 0;
+        int8_t *active_buff = nullptr;
+        long long active_time_ns = 0;
         bool rx_debug = false;
         uint64_t rx_debug_limit = 0;
         long rx_debug_threshold_us = 0;
         std::atomic<uint64_t> rx_debug_seq{0};
-        bool wallclock_pacing = true;
-        long long pacing_margin_ns = 50000;
+        uint64_t continuity_resyncs = 0;
+        long long max_lag_ns = 2000000;
+        size_t packet_words = 128;
+        bool packet_words_explicit = false;
+        size_t frame_cycles = 0;
+        size_t packet_elems = 0;
+        size_t packets_per_dma = 0;
+        size_t dma_payload_elems = 0;
         size_t batch_buffers = 1;
         bool batch_buffers_explicit = false;
         size_t slice_elems = 0;
         bool slice_elems_explicit = false;
-        double batch_queue_ms = 2.0;
+        double batch_queue_ms = 0.20;
         int worker_rt_prio = -1;
         int worker_cpu = -1;
         size_t batch_buf_size = 0;
         size_t batch_buf_count = 0;
-        void *batch_buf = nullptr;
+        size_t soapy_bytes_per_complex = 0;
+        std::vector<Packet> packet_pool;
 
-#if USE_LITEPCIE
+#if USE_LITEPCIE || USE_VFIO
         std::mutex recv_mutex;
         std::condition_variable recv_cv;
-        std::deque<ReadyBuffer> ready_buffs;
-        std::deque<ReadyBuffer> pending_ready_buffs;
+        SPSCQueue<size_t> ready_buffs;
         std::deque<int64_t> pending_dma_handles;
-        std::deque<size_t> free_batch_handles;
+        SPSCQueue<size_t> free_batch_handles;
         std::thread recv_thread;
-        std::thread deliver_thread;
         bool recv_thread_stop = false;
         bool recv_thread_running = false;
-        bool deliver_thread_running = false;
         std::string recv_error;
         int64_t enqueue_count = 0;
         int64_t overflow_lost_buffers = 0;
@@ -518,7 +594,11 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
 
         bool   burst_end   = false;
         int32_t burst_samps = 0;
-        std::map<size_t, uint8_t*> pendingWriteBufs;
+        size_t soapy_bytes_per_complex = 0;
+        size_t staging_num_elems = 0;
+        int staging_flags = 0;
+        long long staging_time_ns = 0;
+        std::vector<uint8_t> staging_data;
 
         /* Tracks the last-seen late/underrun counts from TimedTXArbiter CSRs. */
         uint32_t last_late_count    = 0;
@@ -542,15 +622,7 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         uint64_t tx_queue_debug_limit = 0;
         std::atomic<uint64_t> tx_queue_debug_seq{0};
 
-#if USE_LITEPCIE
-        std::mutex submit_mutex;
-        std::condition_variable submit_cv;
-        std::deque<size_t> pending_submit_handles;
-        std::thread submit_thread;
-        bool submit_thread_stop = false;
-        bool submit_thread_running = false;
-        std::string submit_error;
-
+#if USE_LITEPCIE || USE_VFIO
         std::mutex write_mutex;
         std::condition_variable write_cv;
         std::deque<WriteJob> pending_write_jobs;
@@ -607,23 +679,29 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         size_t offset);
 
     void setSampleMode();
-    void startTxSubmitWorker();
-    void stopTxSubmitWorker();
-    void txSubmitLoop();
-    void checkTxSubmitError();
     void startTxWriteWorker();
     void stopTxWriteWorker();
     void txWriteLoop();
     void checkTxWriteError();
     void startRxReceiveWorker();
     void stopRxReceiveWorker();
-    void rxDeliverLoop();
     void rxReceiveLoop();
     void checkRxReceiveError();
+
+    static constexpr const char *kTransportName =
+#if USE_VFIO
+        "vfio";
+#else
+        "litepcie";
+#endif
 
     const char *dir2Str(const int direction) const {
         return (direction == SOAPY_SDR_RX) ? "RX" : "TX";
     }
+
+    size_t getSoapyBytesPerComplex(const std::string &format) const;
+    static LoopbackMode parseLoopbackMode(const SoapySDR::Kwargs &args);
+    static const char *loopbackModeToString(LoopbackMode mode);
 
     litex_m2sdr_device_desc_t _fd;
     struct ad9361_rf_phy *ad9361_phy;

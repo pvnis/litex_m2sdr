@@ -3,7 +3,6 @@ project(SoapySDRLiteXM2SDR CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 
-option(USE_LITEETH "Uses Ethernet interface for control and streaming" OFF)
 option(USE_VFIO    "Uses VFIO user-mode driver for zero-copy low-latency streaming" OFF)
 
 ########################################################################
@@ -35,21 +34,6 @@ find_library(LITEPCIE_LIBRARY litepcie
                software/user/liblitepcie)
 
 include_directories(${LITEPCIE_INCLUDE_DIR})
-
-########################################################################
-## LiteEth discovery (added)
-########################################################################
-
-find_path(LITEETH_INCLUDE_DIR etherbone.h
-          REQUIRED
-          HINTS
-            ${CMAKE_CURRENT_SOURCE_DIR}/../..
-          PATH_SUFFIXES
-            litex_m2sdr/libliteeth
-            software/user/libliteeth
-)
-
-include_directories(${LITEETH_INCLUDE_DIR})
 
 ########################################################################
 ## USER discovery
@@ -141,18 +125,20 @@ set(LITEXM2SDR_SOURCE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../software/user/ad9361/ad9361.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../software/user/ad9361/ad9361_conv.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../software/user/ad9361/util.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../software/user/libliteeth/etherbone.c
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../software/user/libliteeth/liteeth_udp.c
 )
 
 if(USE_VFIO)
-    add_definitions(-DUSE_VFIO=1 -DUSE_LITEPCIE=0 -DUSE_LITEETH=0)
+    list(APPEND LITEXM2SDR_SOURCE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../software/user/libm2sdr/m2sdr_device.c
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../software/user/libm2sdr/m2sdr_hal_vfio.c
+    )
+endif()
+
+if(USE_VFIO)
+    add_definitions(-DUSE_VFIO=1 -DUSE_LITEPCIE=0)
     set(VFIO_EXTRA_LIBS ${LIBM2SDR_VFIO_LIBRARY})
-elseif(USE_LITEETH)
-    add_definitions(-DUSE_LITEPCIE=0 -DUSE_LITEETH=1)
-    set(VFIO_EXTRA_LIBS "")
 else()
-    add_definitions(-DUSE_LITEPCIE=1 -DUSE_LITEETH=0)
+    add_definitions(-DUSE_VFIO=0 -DUSE_LITEPCIE=1)
     set(VFIO_EXTRA_LIBS "")
 endif()
 

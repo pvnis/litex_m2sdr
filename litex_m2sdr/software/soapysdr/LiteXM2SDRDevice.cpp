@@ -27,7 +27,6 @@
 
 #include "liblitepcie.h"
 #include "libm2sdr.h"
-#include "etherbone.h"
 
 #include "LiteXM2SDRDevice.hpp"
 
@@ -51,7 +50,7 @@ litex_m2sdr_device_desc_t spi_last_fd =
 #if USE_LITEPCIE
     FD_INIT;
 #else
-    nullptr;
+    FD_INIT;
 #endif
 bool spi_warned_fallback = false;
 
@@ -79,7 +78,7 @@ void spi_unregister_fd(uint8_t id)
 #if USE_LITEPCIE
         spi_last_fd = FD_INIT;
 #else
-        spi_last_fd = nullptr;
+        spi_last_fd = FD_INIT;
 #endif
     } else {
         spi_last_fd = spi_fd_map.begin()->second;
@@ -94,7 +93,7 @@ litex_m2sdr_device_desc_t spi_get_fd(const struct spi_device *spi)
 #if USE_LITEPCIE
         if (spi_last_fd >= 0) {
 #else
-        if (spi_last_fd) {
+        if (spi_last_fd != FD_INIT) {
 #endif
             if (!spi_warned_fallback) {
                 spi_warned_fallback = true;
@@ -108,7 +107,7 @@ litex_m2sdr_device_desc_t spi_get_fd(const struct spi_device *spi)
 #if USE_LITEPCIE
         return FD_INIT;
 #else
-        return nullptr;
+        return FD_INIT;
 #endif
     }
     return it->second;
@@ -347,47 +346,19 @@ bool gpio_is_valid(int number)
     }
 }
 
+std::string to_lower_copy(const std::string &value)
+{
+    std::string out = value;
+    std::transform(out.begin(), out.end(), out.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return out;
+}
+
 void gpio_set_value(unsigned /*gpio*/, int /*value*/){}
 
 /***************************************************************************************************
  *                                     Constructor
  **************************************************************************************************/
-
-#if USE_LITEETH
-static std::string getLocalIPAddressToReach(const std::string &remote_ip, uint16_t remote_port)
-{
-    struct sockaddr_in remote_addr;
-    memset(&remote_addr, 0, sizeof(remote_addr));
-    remote_addr.sin_family = AF_INET;
-    remote_addr.sin_port = htons(remote_port);
-    if (inet_pton(AF_INET, remote_ip.c_str(), &remote_addr.sin_addr) != 1)
-        throw std::runtime_error("Invalid remote IP address");
-
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0)
-        throw std::runtime_error("Failed to create socket");
-
-    if (connect(sock, (struct sockaddr*)&remote_addr, sizeof(remote_addr)) < 0) {
-        close(sock);
-        throw std::runtime_error("Failed to connect socket");
-    }
-
-    struct sockaddr_in local_addr;
-    socklen_t addr_len = sizeof(local_addr);
-    if (getsockname(sock, (struct sockaddr*)&local_addr, &addr_len) < 0) {
-        close(sock);
-        throw std::runtime_error("getsockname() failed");
-    }
-
-    close(sock);
-
-    char buf[INET_ADDRSTRLEN];
-    if (!inet_ntop(AF_INET, &local_addr.sin_addr, buf, sizeof(buf)))
-        throw std::runtime_error("inet_ntop failed");
-
-    return std::string(buf);
-}
-#endif
 
 std::string getLiteXM2SDRSerial(litex_m2sdr_device_desc_t fd);
 std::string getLiteXM2SDRIdentification(litex_m2sdr_device_desc_t fd);
@@ -402,12 +373,16 @@ void dma_set_loopback(int fd, bool loopback_enable) {
 
 SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     : _deviceArgs(args), _rx_buf_size(0), _tx_buf_size(0), _rx_buf_count(0), _tx_buf_count(0),
-#if USE_LITEETH
-      _udp_inited(false),
-#endif
       _fd(FD_INIT), ad9361_phy(NULL) {
+    const LoopbackMode loopback_mode = parseLoopbackMode(args);
+    if (loopback_mode != LoopbackMode::None && loopback_mode != LoopbackMode::Phy) {
+        throw std::runtime_error(
+            "Soapy loopback mode '" + std::string(loopbackModeToString(loopback_mode)) +
+            "' is not supported. Supported Soapy modes are: none, phy.");
+    }
 
-    SoapySDR::logf(SOAPY_SDR_INFO, "SoapyLiteXM2SDR initializing...");
+    SoapySDR::logf(SOAPY_SDR_INFO, "SoapyLiteXM2SDR initializing (%s build)...", kTransportName);
+    SoapySDR::logf(SOAPY_SDR_INFO, "Selected Soapy loopback mode: %s", loopbackModeToString(loopback_mode));
     setvbuf(stdout, NULL, _IOLBF, 0);
 
 #ifdef DEBUG
@@ -487,8 +462,8 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
         const char *env_batch = std::getenv("M2SDR_SOAPY_RX_BATCH_BUFFERS");
         const char *env_slice = std::getenv("M2SDR_SOAPY_RX_SLICE_ELEMS");
         const char *env_queue_ms = std::getenv("M2SDR_SOAPY_RX_BATCH_QUEUE_MS");
-        const char *env_pacing = std::getenv("M2SDR_SOAPY_RX_WALLCLOCK_PACING");
-        const char *env_pacing_margin = std::getenv("M2SDR_SOAPY_RX_PACING_MARGIN_US");
+        const char *env_packet_words = std::getenv("M2SDR_SOAPY_RX_PACKET_WORDS");
+        const char *env_max_lag = std::getenv("M2SDR_SOAPY_RX_MAX_LAG_US");
         const char *env_rt_prio = std::getenv("M2SDR_SOAPY_RX_WORKER_RT_PRIO");
         const char *env_cpu = std::getenv("M2SDR_SOAPY_RX_WORKER_CPU");
         const char *env_sync_bypass = std::getenv("M2SDR_SOAPY_PCIE_DMA_SYNCHRONIZER_BYPASS");
@@ -526,19 +501,25 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
             _rx_stream.slice_elems_explicit = true;
         }
         if (args.count("rx_batch_queue_ms"))
-            _rx_stream.batch_queue_ms = std::max(1.0, std::strtod(args.at("rx_batch_queue_ms").c_str(), nullptr));
+            _rx_stream.batch_queue_ms = std::max(0.05, std::strtod(args.at("rx_batch_queue_ms").c_str(), nullptr));
         else if (env_queue_ms)
-            _rx_stream.batch_queue_ms = std::max(1.0, std::strtod(env_queue_ms, nullptr));
-        if (args.count("rx_wallclock_pacing"))
-            _rx_stream.wallclock_pacing = (args.at("rx_wallclock_pacing") != "0");
-        else if (env_pacing)
-            _rx_stream.wallclock_pacing = (std::string(env_pacing) != "0");
-        if (args.count("rx_pacing_margin_us"))
-            _rx_stream.pacing_margin_ns = std::max<long long>(
-                0, static_cast<long long>(std::llround(std::strtod(args.at("rx_pacing_margin_us").c_str(), nullptr) * 1000.0)));
-        else if (env_pacing_margin)
-            _rx_stream.pacing_margin_ns = std::max<long long>(
-                0, static_cast<long long>(std::llround(std::strtod(env_pacing_margin, nullptr) * 1000.0)));
+            _rx_stream.batch_queue_ms = std::max(0.05, std::strtod(env_queue_ms, nullptr));
+        if (args.count("rx_packet_words"))
+        {
+            _rx_stream.packet_words = std::max<size_t>(3, std::strtoull(args.at("rx_packet_words").c_str(), nullptr, 0));
+            _rx_stream.packet_words_explicit = true;
+        }
+        else if (env_packet_words)
+        {
+            _rx_stream.packet_words = std::max<size_t>(3, std::strtoull(env_packet_words, nullptr, 0));
+            _rx_stream.packet_words_explicit = true;
+        }
+        if (args.count("rx_max_lag_us"))
+            _rx_stream.max_lag_ns = std::max<long long>(
+                0, static_cast<long long>(std::llround(std::strtod(args.at("rx_max_lag_us").c_str(), nullptr) * 1000.0)));
+        else if (env_max_lag)
+            _rx_stream.max_lag_ns = std::max<long long>(
+                0, static_cast<long long>(std::llround(std::strtod(env_max_lag, nullptr) * 1000.0)));
         if (args.count("rx_worker_rt_prio"))
             _rx_stream.worker_rt_prio = std::strtol(args.at("rx_worker_rt_prio").c_str(), nullptr, 0);
         else if (env_rt_prio)
@@ -563,14 +544,15 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
             }
         }
         SoapySDR::logf(SOAPY_SDR_INFO,
-            "RX batch buffers=%zu%s slice_elems=%zu%s queue_ms=%.1f pacing=%d margin_us=%.1f worker_rt_prio=%d worker_cpu=%d sync_bypass=%d",
+            "RX batch buffers=%zu%s slice_elems=%zu%s packet_words=%zu%s queue_ms=%.1f max_lag_us=%.1f worker_rt_prio=%d worker_cpu=%d sync_bypass=%d",
             _rx_stream.batch_buffers,
             _rx_stream.batch_buffers_explicit ? "" : " (auto)",
             _rx_stream.slice_elems,
             _rx_stream.slice_elems_explicit ? "" : " (auto)",
+            _rx_stream.packet_words,
+            _rx_stream.packet_words_explicit ? "" : " (auto)",
             _rx_stream.batch_queue_ms,
-            _rx_stream.wallclock_pacing ? 1 : 0,
-            static_cast<double>(_rx_stream.pacing_margin_ns) / 1000.0,
+            static_cast<double>(_rx_stream.max_lag_ns) / 1000.0,
             _rx_stream.worker_rt_prio,
             _rx_stream.worker_cpu,
             _pcie_dma_synchronizer_bypass ? 1 : 0);
@@ -590,25 +572,6 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     _spi_id = spi_register_fd(_fd);
 
     SoapySDR::logf(SOAPY_SDR_INFO, "Opened devnode %s, serial %s", path.c_str(), getLiteXM2SDRSerial(_fd).c_str());
-#elif USE_LITEETH
-    /* Prepare EtherBone / Ethernet streamer */
-    std::string eth_ip;
-    if (args.count("eth_ip") == 0)
-        eth_ip = "192.168.1.50";
-    else
-        eth_ip = args.at("eth_ip");
-
-    /* EtherBone */
-    _fd = eb_connect(eth_ip.c_str(), "1234", 1);
-    if (!_fd)
-        throw std::runtime_error(
-            "Can't connect to EtherBone at " + eth_ip +
-            ":1234 (hint: set eth_ip=... for the board IP)");
-    _spi_id = spi_register_fd(_fd);
-
-    SoapySDR::logf(SOAPY_SDR_INFO, "Opened devnode %s, serial %s", eth_ip.c_str(), getLiteXM2SDRSerial(_fd).c_str());
-
-    std::string eth_mode = "udp";
 #elif USE_VFIO
     {
         std::string pci_addr = "0000:01:00.0";
@@ -626,65 +589,18 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
         }
 
         std::string dev_id = "vfio:" + pci_addr;
-        int rc = m2sdr_open(&_dev, dev_id.c_str());
+        int rc = m2sdr_open(&_fd, dev_id.c_str());
         if (rc != 0) {
             throw std::runtime_error(
                 "SoapyLiteXM2SDR(VFIO): failed to open " + pci_addr +
                 " (" + std::string(m2sdr_strerror(rc)) +
                 "). Is vfio-pci bound? See doc/vfio_pmd_plan.md §Phase 0.");
         }
-        _vfio = _dev->vfio;
-        _spi_id = spi_register_fd(0 /* unused in VFIO mode */);
+        _vfio = m2sdr_get_vfio(_fd);
+        _spi_id = spi_register_fd(_fd);
 
         SoapySDR::logf(SOAPY_SDR_INFO, "Opened VFIO device %s (poll_mode=%d)",
                        pci_addr.c_str(), poll_mode);
-    }
-    if (args.count("eth_mode") > 0)
-        eth_mode = args.at("eth_mode");
-    if (eth_mode == "udp")
-        _eth_mode = SoapyLiteXM2SDREthernetMode::UDP;
-    else if (eth_mode == "vrt")
-        _eth_mode = SoapyLiteXM2SDREthernetMode::VRT;
-    else
-        throw std::runtime_error("Invalid eth_mode: " + eth_mode + " (supported: udp, vrt)");
-
-    /* Ethernet FPGA streamer configuration */
-
-    /* Determine the local IP that the board sees */
-    std::string local_ip = getLocalIPAddressToReach(eth_ip, 1234);
-
-    struct in_addr ip_addr_struct;
-    if (inet_pton(AF_INET, local_ip.c_str(), &ip_addr_struct) != 1) {
-        throw std::runtime_error("Invalid local IP address determined");
-    }
-
-    uint32_t ip_addr_val = ntohl(ip_addr_struct.s_addr);
-
-    /* Write the PC's IP to the FPGA's ETH_STREAMER IP register */
-    litex_m2sdr_writel(_fd, CSR_ETH_RX_STREAMER_IP_ADDRESS_ADDR, ip_addr_val);
-
-    SoapySDR::logf(SOAPY_SDR_INFO, "Using local IP: %s for streaming", local_ip.c_str());
-
-    if (_eth_mode == SoapyLiteXM2SDREthernetMode::VRT) {
-        /* Route RX to Ethernet on the main crossbar. */
-        litex_m2sdr_writel(_fd, CSR_CROSSBAR_DEMUX_SEL_ADDR, 1);
-#ifdef CSR_ETH_RX_MODE_ADDR
-        litex_m2sdr_writel(_fd, CSR_ETH_RX_MODE_ADDR, 2); /* Ethernet RX branch -> VRT */
-#else
-        throw std::runtime_error("eth_mode=vrt requested, but FPGA bitstream lacks eth_rx_mode CSR (rebuild with --with-eth-vrt)");
-#endif
-#ifdef CSR_VRT_STREAMER_VRT_STREAMER_ENABLE_ADDR
-        litex_m2sdr_writel(_fd, CSR_VRT_STREAMER_VRT_STREAMER_ENABLE_ADDR, 0);
-        litex_m2sdr_writel(_fd, CSR_VRT_STREAMER_VRT_STREAMER_IP_ADDRESS_ADDR, ip_addr_val);
-        if (args.count("vrt_port") > 0) {
-            litex_m2sdr_writel(_fd, CSR_VRT_STREAMER_VRT_STREAMER_UDP_PORT_ADDR,
-                static_cast<uint32_t>(std::stoul(args.at("vrt_port"))));
-        }
-        litex_m2sdr_writel(_fd, CSR_VRT_STREAMER_VRT_STREAMER_ENABLE_ADDR, 1);
-#else
-        throw std::runtime_error("eth_mode=vrt requested, but FPGA bitstream lacks vrt_streamer CSR (rebuild with --with-eth-vrt)");
-#endif
-        SoapySDR::logf(SOAPY_SDR_INFO, "Enabled FPGA VRT RX streaming");
     }
 #endif
 
@@ -704,20 +620,11 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     // litex_m2sdr_writel(_fd, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR,
     //                    _pcie_dma_synchronizer_bypass ? 1 : 0);
 
-    /* DMA RX Header */
-    #if defined(_RX_DMA_HEADER_TEST)
-        /* Enable */
-        litex_m2sdr_writel(_fd, CSR_HEADER_RX_CONTROL_ADDR,
-           (1 << CSR_HEADER_RX_CONTROL_ENABLE_OFFSET) |
-           (1 << CSR_HEADER_RX_CONTROL_HEADER_ENABLE_OFFSET)
-        );
-    #else
-        /* Disable */
-        litex_m2sdr_writel(_fd, CSR_HEADER_RX_CONTROL_ADDR,
-           (1 << CSR_HEADER_RX_CONTROL_ENABLE_OFFSET) |
-           (0 << CSR_HEADER_RX_CONTROL_HEADER_ENABLE_OFFSET)
-        );
-    #endif
+    /* DMA RX Header - always enabled so RX timestamps come from hardware headers. */
+    litex_m2sdr_writel(_fd, CSR_HEADER_RX_CONTROL_ADDR,
+       (1 << CSR_HEADER_RX_CONTROL_ENABLE_OFFSET) |
+       (1 << CSR_HEADER_RX_CONTROL_HEADER_ENABLE_OFFSET)
+    );
 
     /* DMA TX Header - always enabled for TimedTXArbiter timestamp gating. */
     litex_m2sdr_writel(_fd, CSR_HEADER_TX_CONTROL_ADDR,
@@ -745,7 +652,7 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
      * source → RX DSP → DMA), so timed TX scheduling is exercised.
      * TXRXLoopback crossbar and PCIe DMA loopback are always disabled. */
     {
-        const bool phy_loopback = (args.count("loopback") > 0 && args.at("loopback") == "1");
+        const bool phy_loopback = (loopback_mode == LoopbackMode::Phy);
 #if defined(CSR_AD9361_PHY_CONTROL_ADDR) && defined(CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET)
         uint32_t phy_ctrl = litex_m2sdr_readl(_fd, CSR_AD9361_PHY_CONTROL_ADDR);
         if (phy_loopback)
@@ -957,9 +864,9 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
             ", phy=" + std::string(ad9361_phy == NULL ? "null" : "ok") + ")");
     }
 
-    /* AD9361 BIST loopback is not used; loopback is handled at the FPGA level
-     * via TXRXLoopback (CSR_PCIE_DMA0_LOOPBACK_ENABLE_ADDR), which sits after
-     * the TimedTXArbiter so timed TX scheduling is preserved in loopback mode. */
+    /* Soapy loopback uses the FPGA AD9361 PHY TX->RX path selected above.
+     * AD9361 BIST, TXRX crossbar, and PCIe DMA loopback modes are intentionally
+     * left to their dedicated test/configuration tools. */
 
     if (do_init) {
         /* Configure AD9361 TX/RX FIRs. */
@@ -973,8 +880,8 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
         /* Common for TX1/TX2 and RX1/RX2 */
         _rx_stream.samplerate   = 30.72e6;
         _tx_stream.samplerate   = 30.72e6;
-        _rx_stream.frequency    = 1e6;
-        _tx_stream.frequency    = 1e6;
+        _rx_stream.frequency    = 2.4e9;
+        _tx_stream.frequency    = 2.4e9;
         _rx_stream.bandwidth    = 30.72e6;
         _tx_stream.bandwidth    = 30.72e6;
 
@@ -1049,8 +956,6 @@ SoapyLiteXM2SDR::~SoapyLiteXM2SDR(void) {
             litepcie_dma_cleanup(&_rx_stream.dma);
         }
         _rx_stream.buf = NULL;
-#elif USE_LITEETH
-        /* nothing to stop explicitly in UDP helper */
 #elif USE_VFIO
         if (_vfio) m2sdr_vfio_rx_stop(_vfio);
         _rx_stream.buf = nullptr;
@@ -1064,7 +969,7 @@ SoapyLiteXM2SDR::~SoapyLiteXM2SDR(void) {
         if (_tx_stream.dma.buf_wr) {
             litepcie_dma_cleanup(&_tx_stream.dma);
         }
-        _rx_stream.buf = NULL;
+        _tx_stream.buf = NULL;
         _tx_stream.opened = false;
     }
 #elif USE_VFIO
@@ -1093,19 +998,10 @@ SoapyLiteXM2SDR::~SoapyLiteXM2SDR(void) {
 
 #if USE_LITEPCIE
     close(_fd);
-#elif USE_LITEETH
-    if (_udp_inited) {
-        liteeth_udp_cleanup(&_udp);
-        _udp_inited = false;
-    }
-#ifdef CSR_VRT_STREAMER_VRT_STREAMER_ENABLE_ADDR
-    if (_eth_mode == SoapyLiteXM2SDREthernetMode::VRT) {
-        litex_m2sdr_writel(_fd, CSR_VRT_STREAMER_VRT_STREAMER_ENABLE_ADDR, 0);
-    }
-#endif
+#elif USE_VFIO
     if (_fd) {
-        eb_disconnect(&_fd);
-        _fd = NULL;
+        m2sdr_close(_fd);
+        _fd = nullptr;
     }
 #endif
 }
@@ -1167,8 +1063,8 @@ std::string SoapyLiteXM2SDR::getHardwareKey(void) const {
 
 #if USE_LITEPCIE
     key += "-pcie";
-#elif USE_LITEETH
-    key += "-eth";
+#elif USE_VFIO
+    key += "-vfio";
 #endif
 
     return key;
@@ -1634,15 +1530,8 @@ void SoapyLiteXM2SDR::setSampleRate(
     } else {
         _oversampling = 0;
     }
-#elif USE_LITEETH
-    /* For Ethernet, if the sample rate is above 20 MSPS, switch to 8-bit mode. */
-    if (rate > LITEETH_8BIT_THRESHOLD) {
-        _bitMode      = 8;
-        _oversampling = 0;
-    } else {
-        _bitMode      = 16;
-        _oversampling = 0;
-    }
+#elif USE_VFIO
+    _oversampling = 0;
 #endif
 
     /* If oversampling is enabled, double the rate multiplier. */
@@ -1722,27 +1611,13 @@ void SoapyLiteXM2SDR::setSampleRate(
 
     if (direction == SOAPY_SDR_RX && _rx_stream.opened) {
         _rx_stream.time0_ns = this->getHardwareTime("");
+        _rx_stream.time0_steady = std::chrono::steady_clock::now();
         _rx_stream.time0_count = _rx_stream.user_count;
         _rx_stream.time_valid = (_rx_stream.samplerate > 0.0);
         _rx_stream.last_time_ns = _rx_stream.time0_ns;
         _rx_stream.time_warned = false;
     }
 
-#if USE_LITEPCIE
-    /* Set NR slot-aligned DMA frame size (one 0.5 ms NR slot minus 2 header words).
-     * This aligns DMA boundaries to slot boundaries for srsRAN/OAI frame scheduling. */
-    {
-        const uint32_t slot_samples = static_cast<uint32_t>(rate * 500e-6);
-        if (slot_samples > 2) {
-            const uint32_t frame_cycles = slot_samples - 2;
-            litex_m2sdr_writel(_fd, CSR_HEADER_TX_FRAME_CYCLES_ADDR, frame_cycles);
-            litex_m2sdr_writel(_fd, CSR_HEADER_RX_FRAME_CYCLES_ADDR, frame_cycles);
-            SoapySDR::logf(SOAPY_SDR_DEBUG,
-                "setSampleRate: NR slot-aligned frame_cycles=%u (%.3f MSPS, slot=%.0f samples)",
-                frame_cycles, rate / 1e6, (double)slot_samples);
-        }
-    }
-#endif
 }
 
 
@@ -1805,6 +1680,56 @@ std::vector<std::string> SoapyLiteXM2SDR::getStreamFormats(
     formats.push_back(SOAPY_SDR_CF32);
     formats.push_back(SOAPY_SDR_CS16);
     return formats;
+}
+
+size_t SoapyLiteXM2SDR::getSoapyBytesPerComplex(const std::string &format) const {
+    if (format == SOAPY_SDR_CF32)
+        return sizeof(float) * 2;
+    if (format == SOAPY_SDR_CS16)
+        return sizeof(int16_t) * 2;
+    throw std::runtime_error("Unsupported stream format: " + format);
+}
+
+SoapyLiteXM2SDR::LoopbackMode SoapyLiteXM2SDR::parseLoopbackMode(const SoapySDR::Kwargs &args)
+{
+    const auto it_mode = args.find(kLoopbackModeArg);
+    const auto it_legacy = args.find(kLoopbackArg);
+    const std::string raw = (it_mode != args.end()) ? it_mode->second :
+        (it_legacy != args.end() ? it_legacy->second : kLoopbackModeNone);
+    const std::string mode = to_lower_copy(raw);
+
+    if (mode == "0" || mode == "false" || mode == "off" || mode == kLoopbackModeNone)
+        return LoopbackMode::None;
+    if (mode == "1" || mode == "true" || mode == "on" || mode == kLoopbackModePhy)
+        return LoopbackMode::Phy;
+    if (mode == "bist" || mode == kLoopbackModeRficBist)
+        return LoopbackMode::RficBist;
+    if (mode == "crossbar" || mode == kLoopbackModeTxRxCrossbar)
+        return LoopbackMode::TxRxCrossbar;
+    if (mode == kLoopbackModeDma)
+        return LoopbackMode::Dma;
+
+    throw std::runtime_error(
+        "Unsupported Soapy loopback mode '" + raw + "'. "
+        "Valid modes are: none, phy. "
+        "Recognized but unsupported in Soapy are: rfic_bist, txrx_crossbar, dma.");
+}
+
+const char *SoapyLiteXM2SDR::loopbackModeToString(LoopbackMode mode)
+{
+    switch (mode) {
+    case LoopbackMode::None:
+        return kLoopbackModeNone;
+    case LoopbackMode::Phy:
+        return kLoopbackModePhy;
+    case LoopbackMode::RficBist:
+        return kLoopbackModeRficBist;
+    case LoopbackMode::TxRxCrossbar:
+        return kLoopbackModeTxRxCrossbar;
+    case LoopbackMode::Dma:
+        return kLoopbackModeDma;
+    }
+    return "unknown";
 }
 
 /***************************************************************************************************

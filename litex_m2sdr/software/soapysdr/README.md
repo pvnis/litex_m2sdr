@@ -44,6 +44,10 @@ You can pass device arguments to configure the driver. These are most useful whe
 - **Oversampling**: `oversampling=0|1`
 - **AD9361 1x FIR profile**: `ad9361_fir_profile=legacy|bypass|match|wide`
   - Useful for `122.88 MSPS` oversampling experiments (these profiles affect the AD9361 `1x` FIR path used above `61.44 MSPS`).
+- **Loopback mode**: `loopback_mode=none|phy`
+  - `phy` enables the Soapy TX->RX PHY loopback path in the RFIC sample-clock domain.
+  - Legacy aliases `loopback=0|1` still map to `none|phy`, but the named `loopback_mode` form is preferred.
+  - Other loopback identifiers used elsewhere in the repo, such as `rfic_bist`, `txrx_crossbar`, and `dma`, are not Soapy modes.
 - **Ethernet RX mode** (Etherbone builds): `eth_mode=udp|vrt`
   - `vrt` enables FPGA VRT RX streaming and Soapy RX will parse/strip VRT signal headers.
   - TX streaming remains raw-UDP only; `eth_mode=vrt` is RX-focused.
@@ -62,6 +66,11 @@ SoapySDRUtil --probe="driver=LiteXM2SDR,bitmode=8,oversampling=1,ad9361_fir_prof
 Example (Etherbone control + Soapy RX over FPGA VRT):
 ```bash
 SoapySDRUtil --probe="driver=LiteXM2SDR,eth_ip=192.168.1.50,eth_mode=vrt,vrt_port=4991"
+```
+
+Example (Soapy PHY TX->RX loopback):
+```bash
+SoapySDRUtil --probe="driver=LiteXM2SDR,loopback_mode=phy"
 ```
 
 ---
