@@ -457,12 +457,12 @@ class BaseSoC(SoCMini):
             self.add_pcie(phy=self.pcie_phy, address_width=64, ndmas=pcie_dmas, data_width=64,
                 with_dma_buffering    = True, dma_buffering_depth=8192,
                 with_dma_loopback     = True,
-                with_dma_synchronizer = False,
+                with_dma_synchronizer = True,
                 with_msi              = True, msis = pcie_msis,
                 with_ptm              = with_pcie_ptm,
             )
             self.pcie_phy.use_external_qpll(qpll_channel=self.qpll.get_channel("pcie"))
-            #self.comb += self.pcie_dma0.synchronizer.pps.eq(self.pps_gen.pps_pulse)
+            self.comb += self.pcie_dma0.synchronizer.pps.eq(self.pps_gen.pps_pulse)
 
             # Host <-> SoC DMA Bus.
             # ---------------------
@@ -674,8 +674,8 @@ class BaseSoC(SoCMini):
             tx_source = self.timed_tx_buffer.source
             # Reset data_fifo/ts_fifo when PCIe synchronizer loses sync (DMA stopped).
             # This clears stale data from killed runs so the arbiter starts fresh.
-            #if with_pcie:
-            #    self.comb += self.timed_tx.reset.eq(~self.pcie_dma0.synchronizer.synced)
+            if with_pcie:
+               self.comb += self.timed_tx.reset.eq(~self.pcie_dma0.synchronizer.synced)
         else:
             tx_source = self.header.tx.source
 
@@ -729,10 +729,10 @@ class BaseSoC(SoCMini):
         # --------------------------------
         if with_pcie:
             self.comb += self.pcie_dma0.source.connect(self.crossbar.mux.sink0)
-            #if with_pcie:
-            #    self.comb += If(self.crossbar.mux.sel == 0,
-            #        self.header.tx.reset.eq(~self.pcie_dma0.synchronizer.synced)
-            #    )
+            if with_pcie:
+               self.comb += If(self.crossbar.mux.sel == 0,
+                   self.header.tx.reset.eq(~self.pcie_dma0.synchronizer.synced)
+               )
         if with_eth:
             self.comb += self.eth_tx_streamer.source.connect(self.crossbar.mux.sink1, omit={"error"})
         if with_sata:
@@ -744,10 +744,10 @@ class BaseSoC(SoCMini):
         self.comb += self.header.rx.source.connect(self.crossbar.demux.sink)
         if with_pcie:
             self.comb += self.crossbar.demux.source0.connect(self.pcie_dma0.sink)
-            #if with_pcie:
-            #    self.comb += If(self.crossbar.demux.sel == 0,
-            #        self.header.rx.reset.eq(~self.pcie_dma0.synchronizer.synced)
-            #    )
+            if with_pcie:
+               self.comb += If(self.crossbar.demux.sel == 0,
+                   self.header.rx.reset.eq(~self.pcie_dma0.synchronizer.synced)
+               )
         if with_eth:
             if with_eth_vrt:
                 self.comb += [
@@ -1033,7 +1033,7 @@ class BaseSoC(SoCMini):
             self.pps_gen.pps,      # PPS.
             self.pcie_dma0.sink,   # RX.
             self.pcie_dma0.source, # TX.
-            #self.pcie_dma0.synchronizer.synced,
+            self.pcie_dma0.synchronizer.synced,
             self.header.rx.reset,
             self.header.tx.reset,
         ]

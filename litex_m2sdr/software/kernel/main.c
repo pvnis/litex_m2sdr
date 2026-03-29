@@ -339,12 +339,18 @@ static void litepcie_dma_writer_start(struct litepcie_device *s, int chan_num)
 	litepcie_writel(s, dmachan->base + PCIE_DMA_WRITER_ENABLE_OFFSET, 1);
 
 	/* Start DMA Synchronizer (RX only).
-	 * Only reset synced if the Reader is not already active.  The Migen
-	 * synced register stays high through mode transitions; only a 0b0
-	 * write resets it.  Skipping the reset when the Reader is running
-	 * preserves the existing sync state so RX data keeps flowing. */
-	if (!dmachan->reader_enable)
+	 * Two cases:
+	 *  - Reader (TX) already active: synced may already be 1 (PPS fired or
+	 *    bypass set).  Skip the 0b0 reset to preserve that state; just
+	 *    switch to 0b10 so both sides are enabled.
+	 *  - Reader (TX) not active (RX-only): bypass the PPS synchronizer so
+	 *    RX data flows immediately without waiting for a PPS edge.  Without
+	 *    bypass, synced=0 keeps the synchronizer idle and hw_count stays 0
+	 *    on a cold start (no prior TX session to have set BYPASS=1). */
+	if (!dmachan->reader_enable) {
+		litepcie_writel(s, dmachan->base + PCIE_DMA_SYNCHRONIZER_BYPASS_OFFSET, 0b1);
 		litepcie_writel(s, dmachan->base + PCIE_DMA_SYNCHRONIZER_ENABLE_OFFSET, 0b0);
+	}
 	litepcie_writel(s, dmachan->base + PCIE_DMA_SYNCHRONIZER_ENABLE_OFFSET, 0b10);
 }
 
