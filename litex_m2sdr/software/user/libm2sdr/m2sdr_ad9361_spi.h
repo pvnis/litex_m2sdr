@@ -15,8 +15,6 @@
 #include "csr.h"
 #include "soc.h"
 
-#include "etherbone.h"
-
 /* SPI Constants */
 /*---------------*/
 

@@ -10,9 +10,6 @@
 #ifndef M2SDR_LIB_H
 #define M2SDR_LIB_H
 
-#include "liblitepcie.h"
-#include "etherbone.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -33,6 +30,8 @@ extern "C" {
 
 #ifdef USE_LITEPCIE
 
+#include "liblitepcie.h"
+
 #define m2sdr_conn_type int
 #define m2sdr_conn_cast(conn) ((m2sdr_conn_type)(intptr_t)(conn))
 #define m2sdr_writel(conn, addr, val) litepcie_writel(m2sdr_conn_cast(conn), addr, val)
@@ -40,14 +39,27 @@ extern "C" {
 
 #elif USE_LITEETH
 
+#include "etherbone.h"
+
 #define m2sdr_conn_type struct eb_connection *
 #define m2sdr_conn_cast(conn) ((m2sdr_conn_type)(conn))
 #define m2sdr_writel(conn, addr, val) eb_write32(m2sdr_conn_cast(conn), val, addr)
 #define m2sdr_readl(conn, addr)       eb_read32(m2sdr_conn_cast(conn), addr)
 
+#elif USE_VFIO
+
+struct m2sdr_dev;
+int m2sdr_reg_read(struct m2sdr_dev *dev, uint32_t addr, uint32_t *val);
+int m2sdr_reg_write(struct m2sdr_dev *dev, uint32_t addr, uint32_t val);
+
+#define m2sdr_conn_type struct m2sdr_dev *
+#define m2sdr_conn_cast(conn) ((m2sdr_conn_type)(conn))
+#define m2sdr_writel(conn, addr, val) do { (void)m2sdr_reg_write(m2sdr_conn_cast(conn), addr, val); } while (0)
+#define m2sdr_readl(conn, addr) ({ uint32_t _v = 0; (void)m2sdr_reg_read(m2sdr_conn_cast(conn), addr, &_v); _v; })
+
 #else
 
-#error "Define USE_LITEPCIE or USE_LITEETH for build configuration"
+#error "Define USE_LITEPCIE, USE_LITEETH, or USE_VFIO for build configuration"
 
 #endif
 

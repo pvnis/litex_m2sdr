@@ -19,6 +19,7 @@
 #include <stdbool.h>
 #include <getopt.h>
 #include <stdint.h>
+#include <errno.h>
 
 #include "ad9361/platform.h"
 #include "ad9361/ad9361.h"
@@ -28,6 +29,7 @@
 
 #include "liblitepcie.h"
 #include "libm2sdr.h"
+#include "csr.h"
 #include "etherbone.h"
 
 /* Variables */
@@ -42,6 +44,75 @@ static char m2sdr_port[16] = "1234";
 #endif
 
 sig_atomic_t keep_running = 1;
+
+static void m2sdr_close(void *conn);
+
+static const char *rf_loopback_mode_to_string(uint8_t mode)
+{
+    switch (mode) {
+    case 0:
+        return "none";
+    case 1:
+        return "rfic_bist";
+    case 2:
+        return "fpga_hdl";
+    case 3:
+        return "txrx_crossbar";
+    default:
+        return "unknown";
+    }
+}
+
+static int parse_rf_loopback_mode(const char *value, uint8_t *mode_out)
+{
+    if (!value || !mode_out)
+        return -1;
+    if (!strcmp(value, "0") || !strcmp(value, "none") || !strcmp(value, "off")) {
+        *mode_out = 0;
+        return 0;
+    }
+    if (!strcmp(value, "1") || !strcmp(value, "rfic_bist") || !strcmp(value, "bist")) {
+        *mode_out = 1;
+        return 0;
+    }
+    if (!strcmp(value, "2") || !strcmp(value, "fpga_hdl") || !strcmp(value, "hdl")) {
+        *mode_out = 2;
+        return 0;
+    }
+    if (!strcmp(value, "3") || !strcmp(value, "txrx_crossbar") || !strcmp(value, "crossbar") || !strcmp(value, "txrx")) {
+        *mode_out = 3;
+        return 0;
+    }
+    return -1;
+}
+
+static void require_loopback_ok(int ret, uint8_t mode, void *conn)
+{
+    if (ret == 0)
+        return;
+
+    fprintf(stderr, "Failed to configure loopback mode '%s' (ret=%d)", rf_loopback_mode_to_string(mode), ret);
+    if (ret == -ENODEV && mode == 2)
+        fprintf(stderr, ": fpga_hdl requires AXI ADC support, but this userspace build has it disabled");
+    fprintf(stderr, ".\n");
+    m2sdr_close(conn);
+    exit(1);
+}
+
+static void txrx_loopback_set(void *conn, int enable)
+{
+#ifdef CSR_TXRX_LOOPBACK_CONTROL_ADDR
+    uint32_t v = 0;
+    v |= (enable ? 1u : 0u) << CSR_TXRX_LOOPBACK_CONTROL_ENABLE_OFFSET;
+    m2sdr_writel(conn, CSR_TXRX_LOOPBACK_CONTROL_ADDR, v);
+#else
+    if (enable) {
+        fprintf(stderr, "TXRX crossbar loopback CSR not present in this gateware.\n");
+        exit(1);
+    }
+    (void)conn;
+#endif
+}
 
 void intHandler(int dummy) {
     keep_running = 0;
@@ -308,9 +379,34 @@ static void m2sdr_init(
     ad9361_set_rx_rf_gain(ad9361_phy, 0, rx_gain1);
     ad9361_set_rx_rf_gain(ad9361_phy, 1, rx_gain2);
 
-    /* Configure AD9361 RX->TX Loopback */
-    printf("Setting Loopback to %d\n", loopback);
-    ad9361_bist_loopback(ad9361_phy, loopback);
+    /* Configure global loopback mode. */
+    printf("Setting loopback mode to %u (%s)\n", loopback, rf_loopback_mode_to_string(loopback));
+    switch (loopback) {
+    case 0:
+        require_loopback_ok(ad9361_bist_loopback(ad9361_phy, 0), loopback, conn);
+        txrx_loopback_set(conn, 0);
+        break;
+    case 1:
+        require_loopback_ok(ad9361_bist_loopback(ad9361_phy, 1), loopback, conn);
+        txrx_loopback_set(conn, 0);
+        break;
+    case 2:
+    {
+        int hdl_loopback_ret = ad9361_hdl_loopback(ad9361_phy, true);
+        require_loopback_ok(hdl_loopback_ret, loopback, conn);
+        require_loopback_ok(ad9361_bist_loopback(ad9361_phy, 2), loopback, conn);
+        txrx_loopback_set(conn, 0);
+        break;
+    }
+    case 3:
+        require_loopback_ok(ad9361_bist_loopback(ad9361_phy, 0), 0, conn);
+        txrx_loopback_set(conn, 1);
+        break;
+    default:
+        fprintf(stderr, "Unsupported loopback mode: %u\n", loopback);
+        m2sdr_close(conn);
+        exit(1);
+    }
 
     /* Configure 8-bit mode */
     if (enable_8bit_mode) {
@@ -509,7 +605,8 @@ static void help(void)
            "  -rx_gain gain          Set the RX gain in dB for both channels (default: %d).\n"
            "  -rx_gain1 gain         Set the RX gain in dB for channel 1 (default: %d).\n"
            "  -rx_gain2 gain         Set the RX gain in dB for channel 2 (default: %d).\n"
-           "  -loopback enable       Set the internal loopback (default: %d).\n"
+           "  -loopback mode         Set loopback mode: none|rfic_bist|fpga_hdl|txrx_crossbar\n"
+           "                         (legacy aliases 0|1|2|3 still work, default: %d = %s).\n"
            "  -tdd enable            Enable TDD TX/RX switch (0/1, default: off). Requires --with-tdd gateware.\n"
            "  -tdd_lead N            TDD PA_EN lead time in sys_clk cycles (default: 20).\n"
            "  -tdd_trail N           TDD PA_EN trail time in sys_clk cycles (default: 10).\n"
@@ -535,6 +632,7 @@ static void help(void)
            DEFAULT_RX_GAIN,
            DEFAULT_RX_GAIN,
            DEFAULT_LOOPBACK,
+           rf_loopback_mode_to_string(DEFAULT_LOOPBACK),
            DEFAULT_BIST_TONE_FREQ);
     exit(1);
 }
@@ -682,7 +780,12 @@ int main(int argc, char **argv)
                     rx_gain2 = (int64_t)strtod(optarg, NULL);
                     break;
                 case 10: /* loopback */
-                    loopback = (uint8_t)strtod(optarg, NULL);
+                    if (parse_rf_loopback_mode(optarg, &loopback) != 0) {
+                        fprintf(stderr,
+                            "Invalid loopback mode '%s'. Valid modes: none, rfic_bist, fpga_hdl, txrx_crossbar.\n",
+                            optarg);
+                        return -1;
+                    }
                     break;
                 case 11: /* bist_tx_tone */
                     bist_tx_tone = true;

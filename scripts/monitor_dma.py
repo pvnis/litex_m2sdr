@@ -28,7 +28,11 @@ IOCTL_REG_FMT       = "=IIBxxx"   # addr(4) val(4) is_write(1) pad(3) = 12 bytes
 
 # CSR addresses (from litex_m2sdr/software/kernel/csr.h)
 CSR_DMA_WRITER_LOOP_STATUS   = 0x6014   # RX path: [31:16]=loop count, [15:0]=buf index
+CSR_DMA_WRITER_TABLE_LEVEL   = 0x6018   # RX path: queued writer descriptors / level
 CSR_DMA_READER_LOOP_STATUS   = 0x6034   # TX path: same layout
+CSR_DMA_READER_TABLE_LEVEL   = 0x6038   # TX path: queued reader descriptors / level
+CSR_DMA_WRITER_ENABLE        = 0x6000
+CSR_DMA_READER_ENABLE        = 0x6020
 CSR_AD9361_PHY_CONTROL       = 0xC020   # bit0 = 0:2T2R, 1:1T1R
 
 CSR_TIME_GEN_CONTROL         = 0x8800   # bit1 = READ latch
@@ -116,7 +120,8 @@ def main() -> None:
 
     # Print header
     hdr = (f"{'Elapsed':>8}  {'RX beat/s':>12}  {'RX samp/s':>12}  {'Mode':>6}  {'TX buf/s':>10}  {'IRQ/s':>10}  "
-           f"{'IRQ:buf':>8}  {'RX loops':>9}  {'RX idx':>7}  {'TX loops':>9}  {'TX idx':>7}  "
+           f"{'IRQ:buf':>8}  {'RX en':>5}  {'RX lvl':>6}  {'RX loops':>9}  {'RX idx':>7}  "
+           f"{'TX en':>5}  {'TX lvl':>6}  {'TX loops':>9}  {'TX idx':>7}  "
            f"{'Late':>6}  {'Underrun':>8}  {'HW time s':>10}  {'Status':>6}")
     sep = "-" * len(hdr)
     print(hdr)
@@ -137,6 +142,10 @@ def main() -> None:
             sc      = read_sample_counter(fd)
             rx_stat = csr_read(fd, CSR_DMA_WRITER_LOOP_STATUS)
             tx_stat = csr_read(fd, CSR_DMA_READER_LOOP_STATUS)
+            rx_lvl  = csr_read(fd, CSR_DMA_WRITER_TABLE_LEVEL)
+            tx_lvl  = csr_read(fd, CSR_DMA_READER_TABLE_LEVEL)
+            rx_en   = csr_read(fd, CSR_DMA_WRITER_ENABLE) & 0x1
+            tx_en   = csr_read(fd, CSR_DMA_READER_ENABLE) & 0x1
             phy_mode = read_phy_mode(fd)
             irq_cnt = read_interrupt_count(args.irq_pattern)
             late    = csr_read(fd, CSR_TIMED_TX_LATE_COUNT)
@@ -175,7 +184,8 @@ def main() -> None:
             status   = "OK" if (rate_ok and late_ok and urun_ok and irq_ok) else "WARN"
 
             print(f"{elapsed:8.1f}  {beat_rate:12.0f}  {rate:12.0f}  {phy_mode:>6}  {tx_buf_rate:10.0f}  {irq_rate:10.0f}  "
-                  f"{irq_per_buf:8.3f}  {rx_loops:9}  {rx_idx:7}  {tx_loops:9}  {tx_idx:7}  "
+                  f"{irq_per_buf:8.3f}  {rx_en:5d}  {rx_lvl:6d}  {rx_loops:9}  {rx_idx:7}  "
+                  f"{tx_en:5d}  {tx_lvl:6d}  {tx_loops:9}  {tx_idx:7}  "
                   f"{late:6}  {underrun:8}  "
                   f"{hw_ns / 1e9:10.3f}  {status:>6}")
 

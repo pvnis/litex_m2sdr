@@ -80,6 +80,13 @@ static void m2sdr_play(const char *device_name, const char *filename, uint32_t l
     if (litepcie_dma_init(&dma, device_name, zero_copy))
         exit(1);
 
+    /* Bypass PCIe DMA synchronizer: allow TX data flow without waiting for a
+     * PPS edge. litepcie_dma_init resets the synchronizer (bypass->0); re-
+     * enable bypass here so standalone playback works without PPS. */
+#ifdef CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR
+    litepcie_writel(dma.fds.fd, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
+#endif
+
     if (timed_start) {
         /* Read initial timestamp */
         uint32_t ctrl = m2sdr_readl(dma.fds.fd, CSR_TIME_GEN_CONTROL_ADDR);

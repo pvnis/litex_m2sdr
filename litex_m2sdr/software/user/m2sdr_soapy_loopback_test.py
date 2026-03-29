@@ -7,12 +7,12 @@
 #
 # Copyright (c) 2024-2026 Enjoy-Digital <enjoy-digital.fr>
 #
-# Validates basic SoapySDR TX→RX path using AD9361 BIST loopback.
+# Validates basic SoapySDR TX→RX path using the Soapy PHY loopback mode.
 # No timestamps, no timed TX — just a plain continuous tone.
 #
 # Prerequisites:
 #   ./m2sdr_rf -samplerate 30.72e6
-#   (loopback is enabled via the SoapySDR 'loopback' kwarg below)
+#   (loopback is enabled via the SoapySDR 'loopback_mode=phy' kwarg below)
 #
 # Usage:
 #   python3 m2sdr_soapy_loopback_test.py [--samplerate 30720000]
@@ -45,8 +45,8 @@ def run_test(sample_rate, freq_hz, amplitude, record_s=0.5):
     # ------------------------------------------------------------------
     # Open device with loopback enabled
     # ------------------------------------------------------------------
-    print("Opening SoapySDR device with loopback=1 ...")
-    dev = SoapySDR.Device({"driver": "LiteXM2SDR", "loopback": "1"})
+    print("Opening SoapySDR device with loopback_mode=phy ...")
+    dev = SoapySDR.Device({"driver": "LiteXM2SDR", "loopback_mode": "phy"})
     dev.setSampleRate(SOAPY_SDR_TX, 0, sample_rate)
     dev.setSampleRate(SOAPY_SDR_RX, 0, sample_rate)
 

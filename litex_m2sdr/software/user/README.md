@@ -84,7 +84,7 @@ m2sdr_rf [options] cmd [args...]
 - `-rx_freq freq` (default=2400000000)
 - `-tx_gain gain` (default=-20 dB)
 - `-rx_gain gain` (default=0 dB)
-- `-loopback enable` (enables internal loopback path)
+- `-loopback mode` (loopback mode: `none|rfic_bist|fpga_hdl|txrx_crossbar`, legacy `0|1|2|3` still accepted)
 - `-bist_tx_tone`, `-bist_rx_tone`, `-bist_prbs` (built-in self-tests)
 
 Example usage:
@@ -190,8 +190,8 @@ m2sdr_sata [options] cmd [args...]
 **Commands** include:
 - **status**
   Show crossbar + SATA/loopback/streamer status.
-- **route `<txsrc> <rxdst> [loopback]`**
-  Set routing with optional loopback (0/1).
+- **route `<txsrc> <rxdst>`**
+  Set routing only. Configure TXRX crossbar loopback separately with `m2sdr_rf -loopback=txrx_crossbar`.
 - **record `<dst_sector> <nsectors>`**
   RX stream → SSD (SATA_RX_STREAMER).
 - **play `<src_sector> <nsectors>`**
@@ -206,7 +206,7 @@ m2sdr_sata [options] cmd [args...]
 Example usage:
 ~~~~
 ./m2sdr_sata status
-./m2sdr_sata route pcie sata 0
+./m2sdr_sata route pcie sata
 ./m2sdr_sata record 0x1000 8192
 ./m2sdr_sata play 0x1000 8192
 ./m2sdr_sata replay 0x1000 8192 pcie
@@ -389,9 +389,9 @@ Below is a quick guide to **generate** a tone, **initialize** the RF, **play** t
               -rx_freq=2400000000 \\
               -tx_gain=-10 \\
               -rx_gain=10 \\
-              -loopback=1
-   ~~~~
-   *(Here `-loopback=1` enables internal loopback for testing.)*
+              -loopback=rfic_bist
+~~~~
+   *(Here `-loopback=rfic_bist` enables the AD9361 internal TX->RX BIST loopback for testing. Use `-loopback=txrx_crossbar` for the FPGA TXRX crossbar loopback instead.)*
 
 3. **Play the tone (in Terminal #1)**
    ~~~~

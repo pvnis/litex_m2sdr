@@ -348,7 +348,7 @@ static bool report(const char *label, bool pass, const char *reason = nullptr)
 /*
  * LoopbackCfg: selects how phases 3 and 4 route the TX signal back to RX.
  *
- *   use_bist = true  — AD9361 BIST loopback (chip-internal, no cable needed)
+ *   use_bist = true  — Soapy PHY TX->RX loopback (no cable needed)
  *   use_bist = false — physical RF cable (TX SMA → attenuator → RX SMA)
  *                      rf_freq/tx_gain/rx_gain are applied to the device.
  *
@@ -371,7 +371,7 @@ static SoapySDR::Device *open_device(double sample_rate, const LoopbackCfg &cfg,
     SoapySDR::Kwargs args;
     args["driver"] = "LiteXM2SDR";
     if (cfg.use_bist)
-        args["loopback"] = "1";
+        args["loopback_mode"] = "phy";
 
     if (bypass_timed_tx_arbiter) {
         args["bypass_timed_tx_arbiter"] = "1";  /* optional: bypass timed TX arbiter when debugging timed scheduling */
@@ -398,7 +398,7 @@ static SoapySDR::Device *open_device(double sample_rate, const LoopbackCfg &cfg,
 static SoapySDR::Device *open_device(double sample_rate)
 {
     LoopbackCfg cfg;
-    cfg.use_bist = false;  /* no loopback, no RF freq/gain setup */
+    cfg.use_bist = false;  /* no Soapy PHY loopback, no RF freq/gain setup */
     return open_device(sample_rate, cfg, false);
 }
 
@@ -411,82 +411,114 @@ static SoapySDR::Device *open_device(double sample_rate)
  *   - no overflows
  *   - measured sample rate within ±10% of configured rate
  * ============================================================ */
-static bool test_rx_baseline(double sample_rate, int n_bufs)
+static bool test_rx_baseline(double sample_rate, int /*n_bufs*/)
 {
     printf("\n=== Phase 1: RX DMA Baseline ===\n");
 
-    LoopbackCfg cfg;
-    cfg.use_bist = true;
-    SoapySDR::Device *dev = open_device(sample_rate, cfg, false);
+    /* No loopback: receive directly from the ADC.  The PHY loopback gates
+     * RX on TX data (source.valid = sink.valid & sink.ready), so enabling
+     * loopback here ties RX throughput to TX scheduling jitter, causing
+     * wildly variable rate measurements.  Direct ADC capture is always at
+     * RFIC rate regardless of TX state. */
+    SoapySDR::Device *dev = open_device(sample_rate);
     if (!dev) return false;
 
-    /* Setup: drive TX silence in BIST loopback so RX DMA always has a source. */
-    SoapySDR::Stream *rx = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, {0});
-    SoapySDR::Stream *tx = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {0});
+    /* Set up both streams so _nChannels is 1 before getStreamMTU. */
+    SoapySDR::Stream *rx = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, {0});
+    SoapySDR::Stream *tx = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16, {0});
     const size_t mtu     = dev->getStreamMTU(rx);
     printf("  MTU        : %zu samples/buf\n", mtu);
 
+    /* Activate RX only — TX DMA is not needed for the rate measurement. */
     dev->activateStream(rx);
-    dev->activateStream(tx);
 
-    const size_t tx_mtu = dev->getStreamMTU(tx);
-    std::vector<int16_t> tone_buf(tx_mtu * 2);
-    fill_tone_cs16(tone_buf.data(), tx_mtu, TONE_FREQ_HZ, sample_rate, AMPLITUDE, 0);
-    std::atomic<bool> tx_stop(false);
-    std::atomic<int>  tx_errors(0);
-
-    std::thread tx_thread([&]() {
-        while (!tx_stop.load()) {
-            size_t handle = 0;
-            void  *buffs[1];
-            int ret = dev->acquireWriteBuffer(tx, handle, buffs, 100000);
-            if (ret == SOAPY_SDR_TIMEOUT) continue;
-            if (ret < 0) { tx_errors++; break; }
-            memcpy(buffs[0], tone_buf.data(), tx_mtu * 2 * sizeof(int16_t));
-            int flags = 0;
-            dev->releaseWriteBuffer(tx, handle, tx_mtu, flags, 0);
+    /* Synchronize: drain the DMA ring for 50 ms to confirm the pipeline is
+     * stable before timing.  The rxReceiveWorker thread starts DMA hardware
+     * asynchronously; if we time from activateStream() the worker's
+     * scheduling latency appears as low throughput.  50 ms is long enough
+     * to absorb any AD9361 ENSM settling and thread startup jitter without
+     * being a significant fraction of the 200 ms measurement window. */
+    {
+        const auto drain_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        while (std::chrono::steady_clock::now() < drain_deadline) {
+            size_t     sh = 0;
+            const void *sb[1];
+            int        sf = 0;
+            long long  st = 0;
+            int ret = dev->acquireReadBuffer(rx, sh, sb, sf, st, 2000000 /* 2 s */);
+            if (ret > 0)
+                dev->releaseReadBuffer(rx, sh);
+            else if (ret < 0) {
+                printf("  DMA sync failed: acquireReadBuffer returned %d\n", ret);
+                dev->deactivateStream(rx);
+                dev->closeStream(rx);
+                dev->closeStream(tx);
+                SoapySDR::Device::unmake(dev);
+                return false;
+            }
         }
-    });
+    }
 
-    int  overflows = 0;
-    bool errors    = false;
+    /* Time-based measurement over 200 ms.  t0 starts only once DMA is
+     * confirmed flowing; any pre-buffered data drains in < 2 ms (ring size
+     * / RFIC rate) which is < 1% of the window and within tolerance. */
+    const double MEAS_S = 0.2;
+    int      overflows     = 0;
+    bool     errors        = false;
+    int      counted       = 0;
+    long long total_samples = 0;
+    /* Per-call latency histogram buckets: <1ms, 1-10ms, 10-100ms, >100ms */
+    int lat_fast = 0, lat_ms = 0, lat_10ms = 0, lat_slow = 0;
     auto t0        = std::chrono::steady_clock::now();
 
-    for (int i = 0; i < n_bufs; i++) {
+    for (;;) {
+        if (std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()
+                >= MEAS_S)
+            break;
+
         size_t     handle = 0;
         const void *buffs[1];
         int        flags  = 0;
         long long  timeNs = 0;
+        auto call_t0 = std::chrono::steady_clock::now();
 
         int ret = dev->acquireReadBuffer(rx, handle, buffs, flags, timeNs,
                                          1000000 /* 1 s timeout */);
+
+        auto call_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - call_t0).count();
+        if (call_us < 1000) lat_fast++;
+        else if (call_us < 10000) lat_ms++;
+        else if (call_us < 100000) lat_10ms++;
+        else lat_slow++;
+
         if (ret == SOAPY_SDR_OVERFLOW) {
             overflows++;
-            /* acquireReadBuffer drained the ring on overflow — no release needed. */
             continue;
         }
         if (ret < 0) {
-            printf("  [%4d] acquireReadBuffer error %d\n", i, ret);
+            printf("  [%d] acquireReadBuffer error %d\n", counted, ret);
             errors = true;
             break;
         }
         dev->releaseReadBuffer(rx, handle);
+        counted++;
+        total_samples += ret;
     }
 
     auto   t1        = std::chrono::steady_clock::now();
     double elapsed_s = std::chrono::duration<double>(t1 - t0).count();
-    double meas_msps = (double)n_bufs * (double)mtu / elapsed_s / 1e6;
+    double meas_msps = (double)total_samples / elapsed_s / 1e6;
 
-    tx_stop.store(true);
-    tx_thread.join();
-
-    dev->deactivateStream(tx);
     dev->deactivateStream(rx);
-    dev->closeStream(tx);
     dev->closeStream(rx);
+    dev->closeStream(tx);
     SoapySDR::Device::unmake(dev);
 
-    printf("  Elapsed    : %.3f s\n", elapsed_s);
+    printf("  Elapsed    : %.3f s  (%d bufs)\n", elapsed_s, counted);
+    printf("  Latency    : fast=%d 1ms=%d 10ms=%d slow=%d\n",
+           lat_fast, lat_ms, lat_10ms, lat_slow);
     printf("  Rate       : %.3f MSPS  (expected %.3f)\n",
            meas_msps, sample_rate / 1e6);
     printf("  Overflows  : %d\n", overflows);
@@ -494,7 +526,6 @@ static bool test_rx_baseline(double sample_rate, int n_bufs)
     bool rate_ok = (meas_msps > sample_rate * 0.9e-6) &&
                    (meas_msps < sample_rate * 1.1e-6);
     bool pass = true;
-    pass &= report("RX DMA: no TX errors", !tx_errors,      "TX helper thread error");
     pass &= report("RX DMA: no errors",    !errors,         "acquireReadBuffer returned error");
     pass &= report("RX DMA: no overflows", overflows == 0,  "overflow detected");
     pass &= report("RX DMA: sample rate",  rate_ok,         "rate outside ±10%");
@@ -521,8 +552,8 @@ static bool test_tx_baseline(double sample_rate, int n_bufs)
      * Setup RX first (don't activate) so that _nChannels is set to 1
      * before TX setupStream reads it for MTU calculation.
      */
-    SoapySDR::Stream *rx     = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, {0});
-    SoapySDR::Stream *tx     = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {0});
+    SoapySDR::Stream *rx     = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, {0});
+    SoapySDR::Stream *tx     = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16, {0});
     const size_t mtu         = dev->getStreamMTU(tx);
     const size_t ring_size   = dev->getNumDirectAccessBuffers(tx);
     /*
@@ -596,7 +627,7 @@ static bool test_tx_baseline(double sample_rate, int n_bufs)
  * RX captures for duration_s seconds and measures average power, overflow
  * count, and checks for any drop-outs (buffers with anomalously low power).
  *
- * cfg.use_bist = true  : AD9361 BIST loopback (no cable required)
+ * cfg.use_bist = true  : Soapy PHY TX->RX loopback (no cable required)
  * cfg.use_bist = false : physical RF cable (TX SMA → attenuator → RX SMA)
  *
  * Checks:
@@ -617,8 +648,8 @@ static bool test_loopback(double sample_rate, double duration_s, const LoopbackC
     SoapySDR::Device *dev = open_device(sample_rate, cfg, false);
     if (!dev) return false;
 
-    SoapySDR::Stream *rx     = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, {0});
-    SoapySDR::Stream *tx     = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {0});
+    SoapySDR::Stream *rx     = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, {0});
+    SoapySDR::Stream *tx     = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16, {0});
     const size_t      rx_mtu = dev->getStreamMTU(rx);
     const size_t      tx_mtu = dev->getStreamMTU(tx);
     printf("  RX MTU     : %zu samples/buf\n", rx_mtu);
@@ -732,8 +763,8 @@ static double measure_loopback_latency(double sample_rate, const LoopbackCfg &cf
     SoapySDR::Device *dev = open_device(sample_rate, cfg, false);
     if (!dev) return -1.0;
 
-    SoapySDR::Stream *rx     = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, {0});
-    SoapySDR::Stream *tx     = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {0});
+    SoapySDR::Stream *rx     = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, {0});
+    SoapySDR::Stream *tx     = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16, {0});
     const size_t      rx_mtu = dev->getStreamMTU(rx);
     const size_t      tx_mtu = dev->getStreamMTU(tx);
     printf("  RX MTU     : %zu samples/buf  (%.3f ms/buf)\n",
@@ -1066,8 +1097,8 @@ static bool test_timed_tx(double sample_rate, double delay_s, double duration_s,
     SoapySDR::Device *dev = open_device(sample_rate, cfg, bypass_arbiter);
     if (!dev) return false;
 
-    SoapySDR::Stream *rx     = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, {0});
-    SoapySDR::Stream *tx     = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {0});
+    SoapySDR::Stream *rx     = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, {0});
+    SoapySDR::Stream *tx     = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16, {0});
     const size_t      rx_mtu = dev->getStreamMTU(rx);
     const size_t      tx_mtu = dev->getStreamMTU(tx);
     printf("  RX MTU     : %zu samples/buf\n", rx_mtu);
@@ -1358,8 +1389,8 @@ static bool test_tdd_emulation(double sample_rate, int n_frames, double lead_ms,
     SoapySDR::Device *dev = open_device(sample_rate, cfg, bypass_arbiter);
     if (!dev) return false;
 
-    SoapySDR::Stream *rx     = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CF32, {0});
-    SoapySDR::Stream *tx     = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CF32, {0});
+    SoapySDR::Stream *rx     = dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, {0});
+    SoapySDR::Stream *tx     = dev->setupStream(SOAPY_SDR_TX, SOAPY_SDR_CS16, {0});
     const size_t      tx_mtu = dev->getStreamMTU(tx);
     const size_t      ring_n = dev->getNumDirectAccessBuffers(tx);
 

@@ -199,6 +199,9 @@ static void m2sdr_fill_transport_info(struct m2sdr_dev *dev, struct m2sdr_devinf
 #elif defined(USE_LITEETH)
     snprintf(info->transport, sizeof(info->transport), "liteeth");
     snprintf(info->path, sizeof(info->path), "%s:%u", dev->eth_ip, (unsigned)dev->eth_port);
+#elif defined(USE_VFIO)
+    snprintf(info->transport, sizeof(info->transport), "vfio");
+    snprintf(info->path, sizeof(info->path), "%s", dev->vfio_pci_addr);
 #else
     (void)dev;
     (void)info;
@@ -390,6 +393,16 @@ int m2sdr_reg_write(struct m2sdr_dev *dev, uint32_t addr, uint32_t val)
     return m2sdr_hal_writel(dev, addr, val);
 }
 
+struct m2sdr_vfio *m2sdr_get_vfio(struct m2sdr_dev *dev)
+{
+#ifdef USE_VFIO
+    return dev ? dev->vfio : NULL;
+#else
+    (void)dev;
+    return NULL;
+#endif
+}
+
 /* Legacy escape hatches kept for Soapy and advanced utilities. */
 /* Return the underlying PCIe file descriptor when available. */
 int m2sdr_get_fd(struct m2sdr_dev *dev)
@@ -428,6 +441,9 @@ int m2sdr_get_transport(struct m2sdr_dev *dev, enum m2sdr_transport_kind *transp
         return M2SDR_ERR_OK;
     case M2SDR_TRANSPORT_LITEETH:
         *transport = M2SDR_TRANSPORT_KIND_LITEETH;
+        return M2SDR_ERR_OK;
+    case M2SDR_TRANSPORT_VFIO:
+        *transport = M2SDR_TRANSPORT_KIND_VFIO;
         return M2SDR_ERR_OK;
     default:
         *transport = M2SDR_TRANSPORT_KIND_UNKNOWN;

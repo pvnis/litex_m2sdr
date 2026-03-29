@@ -180,23 +180,27 @@ static void header_set_raw(void *conn, int which, int enable, int header_enable)
 #endif
 }
 
+/* TX/RX loopback status (controlled by m2sdr_rf) --------------------------- */
+
+#ifdef CSR_TXRX_LOOPBACK_CONTROL_ADDR
+static __attribute__((unused)) int txrx_loopback_get(void *conn)
+{
+    uint32_t v = m2sdr_readl(conn, CSR_TXRX_LOOPBACK_CONTROL_ADDR);
+    return (v >> CSR_TXRX_LOOPBACK_CONTROL_ENABLE_OFFSET) &
+        ((1u << CSR_TXRX_LOOPBACK_CONTROL_ENABLE_SIZE) - 1);
+}
+#endif
+
 /* SATA control (guarded) ---------------------------------------------------- */
 
 #ifdef CSR_SATA_PHY_BASE
 
 static void sata_require_csrs(void)
 {
-#if !defined(CSR_SATA_RX_STREAMER_BASE) || !defined(CSR_SATA_TX_STREAMER_BASE) || !defined(CSR_TXRX_LOOPBACK_BASE)
+#if !defined(CSR_SATA_RX_STREAMER_BASE) || !defined(CSR_SATA_TX_STREAMER_BASE)
     fprintf(stderr, "SATA blocks not fully present in this gateware.\n");
     exit(1);
 #endif
-}
-
-static void txrx_loopback_set(void *conn, int enable)
-{
-    uint32_t v = 0;
-    v |= (enable ? 1u : 0u) << CSR_TXRX_LOOPBACK_CONTROL_ENABLE_OFFSET;
-    m2sdr_writel(conn, CSR_TXRX_LOOPBACK_CONTROL_ADDR, v);
 }
 
 static void sata_rx_program(void *conn, uint64_t sector, uint32_t nsectors)
@@ -282,7 +286,6 @@ static void do_record(uint64_t dst_sector, uint32_t nsectors, int timeout_ms)
     sata_require_csrs();
 
     /* Normal path: RX -> demux -> SATA_RX_STREAMER. */
-    txrx_loopback_set(conn, 0);
     crossbar_set(conn,
         (int)m2sdr_readl(conn, CSR_CROSSBAR_MUX_SEL_ADDR),
         RXDST_SATA
@@ -302,7 +305,6 @@ static void do_play(uint64_t src_sector, uint32_t nsectors, int timeout_ms)
     sata_require_csrs();
 
     /* Normal path: SATA_TX_STREAMER -> mux -> TX. */
-    txrx_loopback_set(conn, 0);
     crossbar_set(conn,
         TXSRC_SATA,
         (int)m2sdr_readl(conn, CSR_CROSSBAR_DEMUX_SEL_ADDR)
@@ -325,7 +327,15 @@ static void do_replay(uint64_t src_sector, uint32_t nsectors, const char *dst_s,
 
     /* SATA -> TX -> loopback -> RX destination. */
     crossbar_set(conn, TXSRC_SATA, rxdst);
-    txrx_loopback_set(conn, 1);
+#ifdef CSR_TXRX_LOOPBACK_CONTROL_ADDR
+    if (!txrx_loopback_get(conn)) {
+        fprintf(stderr, "TXRX loopback is disabled. Configure it with m2sdr_rf -loopback=txrx_crossbar.\n");
+        exit(1);
+    }
+#else
+    fprintf(stderr, "TXRX loopback CSR not present in this gateware.\n");
+    exit(1);
+#endif
 
     sata_tx_program(conn, src_sector, nsectors);
     sata_tx_start(conn);
@@ -344,7 +354,15 @@ static void do_copy(uint64_t src_sector, uint64_t dst_sector, uint32_t nsectors,
      * SATA_TX_STREAMER -> TX -> loopback -> RX -> SATA_RX_STREAMER.
      */
     crossbar_set(conn, TXSRC_SATA, RXDST_SATA);
-    txrx_loopback_set(conn, 1);
+#ifdef CSR_TXRX_LOOPBACK_CONTROL_ADDR
+    if (!txrx_loopback_get(conn)) {
+        fprintf(stderr, "TXRX loopback is disabled. Configure it with m2sdr_rf -loopback=txrx_crossbar.\n");
+        exit(1);
+    }
+#else
+    fprintf(stderr, "TXRX loopback CSR not present in this gateware.\n");
+    exit(1);
+#endif
 
     /* Start RX first. */
     sata_rx_program(conn, dst_sector, nsectors);
@@ -378,6 +396,18 @@ static void status(void)
     printf("Crossbar: not present\n");
 #endif
 
+#ifdef CSR_TXRX_LOOPBACK_CONTROL_ADDR
+    {
+        uint32_t v = m2sdr_readl(conn, CSR_TXRX_LOOPBACK_CONTROL_ADDR);
+        printf("TXRX loopback:\n");
+        printf("  enable    = %u\n",
+            (v >> CSR_TXRX_LOOPBACK_CONTROL_ENABLE_OFFSET) &
+            ((1u << CSR_TXRX_LOOPBACK_CONTROL_ENABLE_SIZE) - 1));
+    }
+#else
+    printf("TXRX loopback: not present\n");
+#endif
+
 #ifdef CSR_SATA_PHY_BASE
     printf("SATA:\n");
     printf("  phy.enable = %" PRIu32 "\n", m2sdr_readl(conn, CSR_SATA_PHY_ENABLE_ADDR));
@@ -389,14 +419,6 @@ static void status(void)
         printf("    rx_ready   = %u\n", (st >> CSR_SATA_PHY_STATUS_RX_READY_OFFSET)   & ((1u << CSR_SATA_PHY_STATUS_RX_READY_SIZE)   - 1));
         printf("    ctrl_ready = %u\n", (st >> CSR_SATA_PHY_STATUS_CTRL_READY_OFFSET) & ((1u << CSR_SATA_PHY_STATUS_CTRL_READY_SIZE) - 1));
     }
-
-#ifdef CSR_TXRX_LOOPBACK_BASE
-    {
-        uint32_t v = m2sdr_readl(conn, CSR_TXRX_LOOPBACK_CONTROL_ADDR);
-        printf("  txrx_loopback.enable = %u\n",
-            (v >> CSR_TXRX_LOOPBACK_CONTROL_ENABLE_OFFSET) & ((1u << CSR_TXRX_LOOPBACK_CONTROL_ENABLE_SIZE) - 1));
-    }
-#endif
 
 #ifdef CSR_SATA_TX_STREAMER_BASE
     printf("  sata_tx_streamer: done=%" PRIu32 " error=%" PRIu32 "\n",
@@ -418,7 +440,7 @@ static void status(void)
 
 /* Route (always available if crossbar exists) ------------------------------ */
 
-static void do_route(const char *txsrc_s, const char *rxdst_s, int loopback_en)
+static void do_route(const char *txsrc_s, const char *rxdst_s)
 {
     void *conn = m2sdr_open();
 
@@ -426,23 +448,6 @@ static void do_route(const char *txsrc_s, const char *rxdst_s, int loopback_en)
     int rxdst = parse_rxdst(rxdst_s);
 
     crossbar_set(conn, txsrc, rxdst);
-
-#ifdef CSR_SATA_PHY_BASE
-    if (loopback_en >= 0) {
-        /* Only meaningful if loopback CSR is present. */
-#ifdef CSR_TXRX_LOOPBACK_BASE
-        txrx_loopback_set(conn, loopback_en);
-#else
-        fprintf(stderr, "TXRX loopback CSR not present.\n");
-        exit(1);
-#endif
-    }
-#else
-    if (loopback_en >= 0) {
-        fprintf(stderr, "SATA/loopback not present in this gateware.\n");
-        exit(1);
-    }
-#endif
 
     m2sdr_close(conn);
 }
@@ -466,13 +471,13 @@ static void help(void)
            "\n"
            "commands:\n"
            "status\n"
-           "    Show crossbar + (if present) SATA/loopback/streamer status.\n"
+           "    Show crossbar + TXRX loopback + (if present) SATA/streamer status.\n"
            "\n"
-           "route <txsrc> <rxdst> [loopback]\n"
+           "route <txsrc> <rxdst>\n"
            "    Set routing:\n"
            "      txsrc: pcie|eth|sata\n"
            "      rxdst: pcie|eth|sata\n"
-           "      loopback: 0|1 (optional, only if SATA present)\n"
+           "    TXRX loopback mode is configured separately with m2sdr_rf -loopback=txrx_crossbar.\n"
            "\n"
 #ifdef CSR_SATA_PHY_BASE
            "record <dst_sector> <nsectors>\n"
@@ -564,10 +569,7 @@ int main(int argc, char **argv)
         if (optind + 2 > argc) help();
         const char *txsrc = argv[optind++];
         const char *rxdst = argv[optind++];
-        int loopback = -1;
-        if (optind < argc)
-            loopback = (int)parse_u32(argv[optind++]);
-        do_route(txsrc, rxdst, loopback);
+        do_route(txsrc, rxdst);
         return 0;
     }
 

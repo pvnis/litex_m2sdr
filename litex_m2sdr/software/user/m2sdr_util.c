@@ -943,11 +943,11 @@ static void icap_bitstream_load(const char *filename)
         free(data);
         exit(1);
     }
-    if ((sync_offset & 0x3) != 0) {
-        fprintf(stderr, "Bitstream payload is not 32-bit aligned (offset=0x%zx).\n", (size_t)sync_offset);
-        free(data);
-        exit(1);
-    }
+    /* sync_offset need not be 4-byte aligned in the file.  The walk-back
+     * loop always steps by 4, so the sync word is always at
+     * sync_offset + 4*N; the streaming loop below reads 4 bytes at a time
+     * from sync_offset and therefore sends the sync word as a complete
+     * 32-bit ICAP word regardless of the file-offset alignment. */
 
     payload_size = (size_t)file_size - (size_t)sync_offset;
     if ((payload_size & 0x3) != 0) {

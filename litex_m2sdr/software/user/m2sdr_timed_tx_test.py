@@ -53,7 +53,7 @@ def measure_loopback_latency(sample_rate, loopback=True, chunk=4096, n_chunks=20
     print("=== Loopback Latency Baseline ===")
     args = {"driver": "LiteXM2SDR"}
     if loopback:
-        args["loopback"] = "1"
+        args["loopback_mode"] = "phy"
     dev = SoapySDR.Device(args)
     dev.setSampleRate(SOAPY_SDR_TX, 0, sample_rate)
     dev.setSampleRate(SOAPY_SDR_RX, 0, sample_rate)
@@ -171,7 +171,7 @@ def run_test(delay_s, duration_s, freq_hz, amplitude, sample_rate,
     # ------------------------------------------------------------------
     args = {"driver": "LiteXM2SDR"}
     if loopback:
-        args["loopback"] = "1"
+        args["loopback_mode"] = "phy"
     dev = SoapySDR.Device(args)
     dev.setSampleRate(SOAPY_SDR_TX, 0, sample_rate)
     dev.setSampleRate(SOAPY_SDR_RX, 0, sample_rate)
@@ -408,7 +408,7 @@ def main():
     parser.add_argument("--rf-freq",      type=float, default=None,       help="RF center frequency in Hz, e.g. 2400000000")
     parser.add_argument("--tx-gain",      type=float, default=None,       help="TX gain in dB")
     parser.add_argument("--rx-gain",      type=float, default=None,       help="RX gain in dB")
-    parser.add_argument("--loopback",     action="store_true",            help="Enable AD9361 BIST loopback (default: off)")
+    parser.add_argument("--loopback",     action="store_true",            help="Enable Soapy PHY TX->RX loopback (default: off)")
     args = parser.parse_args()
 
     print("M2SDR Timed TX Test")

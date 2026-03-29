@@ -2,7 +2,7 @@
 # M2SDR VFIO User-Mode Driver
 
 CC      ?= gcc
-CFLAGS  ?= -O2 -g -Wall -Wextra
+CFLAGS  ?= -O2 -g -Wall -Wextra -fPIC
 CFLAGS  += -I.
 
 LIB     = libm2sdr_vfio.a
