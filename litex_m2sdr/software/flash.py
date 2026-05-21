@@ -26,6 +26,16 @@ def flash_bitstream(bitstream, offset, device_num):
     )
     time.sleep(1)
 
+
+def stream_bitstream_direct(bitstream, device_num):
+    print("Streaming bitstream directly to ICAP over PCIe...")
+    subprocess.run(
+        f"cd user && ./m2sdr_util config_stream -c {device_num} {shlex.quote('../' + bitstream)}",
+        shell=True,
+        check=True,
+    )
+    time.sleep(1)
+
 # Main ---------------------------------------------------------------------------------------------
 
 def main():
@@ -34,6 +44,7 @@ def main():
     parser.add_argument("-o", "--offset",     type=lambda x: int(x, 0), default=0x00800000, help="Offset for flashing (default: 0x00800000).")
     parser.add_argument("-c", "--device_num", type=int,                 default=0,          help="Select the device number (default = 0).")
     parser.add_argument("-r", "--rescan",     action="store_true",                          help="Enable PCIe rescan after flashing.")
+    parser.add_argument("--direct", action="store_true", help="Stream bitstream directly to ICAP (no flash).")
     args = parser.parse_args()
 
     # Ask for confirmation before flashing.
@@ -49,8 +60,11 @@ def main():
             print("Flashing aborted.")
             return
 
-    # Flash with selected device.
-    flash_bitstream(args.bitstream, args.offset, args.device_num)
+    # Flash or stream with selected device.
+    if args.direct:
+        stream_bitstream_direct(args.bitstream, args.device_num)
+    else:
+        flash_bitstream(args.bitstream, args.offset, args.device_num)
 
     # PCIe Rescan and driver Remove/Reload.
     if args.rescan:

@@ -515,6 +515,14 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         bool time_warned = false;
         uint32_t hdr_trace_count = 0;
 
+        /* Timed RX activation is implemented Lime-style in software:
+         * RX starts immediately, then readStream drops/trim packets
+         * until the first returned sample is exactly the requested one.
+         */
+        bool timed_start_pending = false;
+        long long timed_start_ns = 0;
+        long long timed_start_sample = 0;
+
         /* Re-framer for the RX PCIe byte stream. LitePCIe ring-buffer
          * boundaries are not packet boundaries, so the worker accumulates
          * raw DMA bytes here until it can extract one complete stream

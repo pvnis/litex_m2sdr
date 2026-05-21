@@ -61,4 +61,12 @@ int m2sdr_flash_write(void *conn,
                       void (*progress_cb)(void *opaque, const char *fmt, ...),
                       void *opaque);
 
+/* Stream a configuration bitstream directly to ICAP (no SPI flash). The
+ * helper writes 32-bit words to the ICAP data CSR and toggles the ICAP
+ * write CSR for each word. Returns 0 on success or non-zero on error. */
+int m2sdr_config_stream(void *conn,
+                        uint8_t *buf, uint32_t size,
+                        void (*progress_cb)(void *opaque, const char *fmt, ...),
+                        void *opaque);
+
 #endif /* M2SDR_LIB_FLASH_H */

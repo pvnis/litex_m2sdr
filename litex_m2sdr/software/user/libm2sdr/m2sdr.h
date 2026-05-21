@@ -437,6 +437,10 @@ int  m2sdr_set_rx_gain_chan(struct m2sdr_dev *dev, unsigned channel, int64_t gai
 int  m2sdr_set_tx_att(struct m2sdr_dev *dev, int64_t attenuation_db);
 /* Advanced integration hook used by the SoapySDR driver. */
 int  m2sdr_rf_bind(struct m2sdr_dev *dev, void *ad9361_phy);
+/* Map an AD9361 driver return code (0 = ok, non-zero = error) into the
+ * m2sdr_error enum so SoapySDR-side code can use the standard m2sdr
+ * error-handling idiom. */
+int  m2sdr_from_ad9361_rc(int32_t rc);
 
 /* Streaming (BladeRF-like sync API) */
 /* Configure a stream directly.

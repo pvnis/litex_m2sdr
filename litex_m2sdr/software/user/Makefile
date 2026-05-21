@@ -64,6 +64,7 @@ LIBM2SDR_OBJS = \
 	libm2sdr/m2sdr_si5351_i2c.o \
 	libm2sdr/m2sdr_ad9361_spi.o \
 	libm2sdr/m2sdr_flash.o \
+	libm2sdr/m2sdr_config_stream.o \
 	libm2sdr/m2sdr_device.o \
 	libm2sdr/m2sdr_stream.o \
 	libm2sdr/m2sdr_rf.o \

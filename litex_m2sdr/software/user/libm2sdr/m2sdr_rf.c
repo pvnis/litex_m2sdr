@@ -82,7 +82,7 @@ static void *m2sdr_conn(struct m2sdr_dev *dev)
 #endif
 }
 
-static int m2sdr_from_ad9361_rc(int32_t rc)
+int m2sdr_from_ad9361_rc(int32_t rc)
 {
     return (rc == 0) ? M2SDR_ERR_OK : M2SDR_ERR_IO;
 }

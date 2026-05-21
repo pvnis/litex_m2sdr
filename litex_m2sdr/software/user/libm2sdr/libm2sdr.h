@@ -22,6 +22,7 @@ extern "C" {
 /* ICAP */
 #define ICAP_CMD_REG   0b00100
 #define ICAP_CMD_IPROG 0b01111
+#define ICAP_FDRI_REG  0b00010
 
 #define ICAP_IDCODE_REG   0b01100
 

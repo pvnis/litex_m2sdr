@@ -8,6 +8,7 @@ import hashlib
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 # Constants ----------------------------------------------------------------------------------------
@@ -115,6 +116,27 @@ def resolve_wr_paths(root_dir, wr_nic_dir=None, wr_firmware=None):
             wr_firmware = candidate
 
     return wr_nic_dir, wr_firmware
+
+
+def ensure_wr_nic_importable(root_dir, wr_nic_dir=None):
+    wr_nic_dir, _ = resolve_wr_paths(
+        root_dir    = root_dir,
+        wr_nic_dir  = wr_nic_dir,
+        wr_firmware = None,
+    )
+
+    if wr_nic_dir is None:
+        return None
+
+    wr_import_paths = [
+        os.path.abspath(wr_nic_dir),
+        os.path.abspath(os.path.dirname(wr_nic_dir)),
+    ]
+    for path in wr_import_paths:
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+    return wr_nic_dir
 
 
 def build_wr_firmware(wr_nic_dir, wr_firmware, wr_firmware_target, enforce_fresh=True):

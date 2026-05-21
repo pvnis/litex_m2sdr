@@ -130,8 +130,9 @@ static constexpr uint64_t TX_FLAG_END_BURST    = 1ULL << 62;
 static inline long long ns_to_samples(double sample_rate, long long ns)
 {
     if (sample_rate <= 0.0) return 0;
-    const double s = (static_cast<double>(ns) * sample_rate) / 1e9;
-    return static_cast<long long>(std::llround(s));
+    const long double samples =
+        (static_cast<long double>(ns) * static_cast<long double>(sample_rate)) / 1000000000.0L;
+    return static_cast<long long>(std::llround(samples));
 }
 
 /* Setup and configure a stream for RX or TX. */
@@ -473,8 +474,10 @@ int SoapyLiteXM2SDR::activateStream(
 
     /* RX */
     if (stream == RX_STREAM) {
-        for (size_t i = 0; i < _rx_stream.channels.size(); i++)
-            channel_configure(SOAPY_SDR_RX, _rx_stream.channels[i]);
+        /* Keep activation lightweight: Soapy setters apply RF/rate/gain
+         * changes immediately, and timed activation needs this path to
+         * complete well inside the caller's future start window.
+         */
 #if USE_LITEPCIE
         /* Re-assert synchronizer bypass on every activate. The kernel's
          * litepcie_dma_reader_stop / writer_stop clear bypass to 0
@@ -529,12 +532,28 @@ int SoapyLiteXM2SDR::activateStream(
         _rx_stream.last_time_ns = _rx_stream.time0_ns;
         _rx_stream.time_warned = false;
         _rx_stream.hdr_trace_count = 0;
+        _rx_stream.remainderHandle = -1;
+        _rx_stream.remainderSamps = 0;
+        _rx_stream.remainderOffset = 0;
+        _rx_stream.remainderTimeNs = 0;
         _rx_stream.rx_reframe_buf.clear();
         _rx_stream.rx_payload_buf.clear();
+        _rx_stream.timed_start_pending = false;
+        _rx_stream.timed_start_ns = 0;
+        _rx_stream.timed_start_sample = 0;
         if (flags & SOAPY_SDR_HAS_TIME) {
-            SoapySDR::logf(SOAPY_SDR_WARNING,
-                "RX timed activation requested for %lld ns; timing not supported, starting immediately",
-                (long long)timeNs);
+            if (_rx_stream.samplerate <= 0.0) {
+                SoapySDR::log(SOAPY_SDR_ERROR,
+                    "RX timed activation requested before RX sample rate was set");
+                return SOAPY_SDR_NOT_SUPPORTED;
+            }
+            _rx_stream.timed_start_pending = true;
+            _rx_stream.timed_start_ns = timeNs;
+            _rx_stream.timed_start_sample = ns_to_samples(_rx_stream.samplerate, timeNs);
+            SoapySDR::logf(SOAPY_SDR_INFO,
+                "RX timed activation requested for %lld ns (%lld samples); aligning in readStream",
+                (long long)timeNs,
+                (long long)_rx_stream.timed_start_sample);
         }
 
         /* Spin up the RX worker thread; it pumps DMA -> packet FIFO
@@ -545,8 +564,9 @@ int SoapyLiteXM2SDR::activateStream(
 
     /* TX */
     } else if (stream == TX_STREAM) {
-        for (size_t i = 0; i < _tx_stream.channels.size(); i++)
-            channel_configure(SOAPY_SDR_TX, _tx_stream.channels[i]);
+        /* RF/rate/gain settings are already applied by the Soapy setters;
+         * activateStream only arms the DMA/worker pipeline.
+         */
 #if USE_LITEPCIE
         /* Re-assert synchronizer bypass (see RX branch above for why -
          * the kernel clears bypass when both DMA directions stop, so
@@ -626,9 +646,12 @@ int SoapyLiteXM2SDR::deactivateStream(
          * will be set
          */
         _rx_stream.burst_end = true;
+        _rx_stream.timed_start_pending = false;
+        _rx_stream.timed_start_ns = 0;
+        _rx_stream.timed_start_sample = 0;
         if (flags & SOAPY_SDR_HAS_TIME) {
             SoapySDR::logf(SOAPY_SDR_WARNING,
-                "RX timed deactivation requested for %lld ns; timing not supported, stopping immediately",
+                "RX timed deactivation requested for %lld ns; stopping immediately",
                 (long long)timeNs);
         }
     } else if (stream == TX_STREAM) {
@@ -755,7 +778,8 @@ static inline long long samples_to_ns(double sample_rate, long long samples)
     if (sample_rate <= 0.0) {
         return 0;
     }
-    const double ns = (static_cast<double>(samples) * 1e9) / sample_rate;
+    const long double ns =
+        (static_cast<long double>(samples) * 1000000000.0L) / static_cast<long double>(sample_rate);
     return static_cast<long long>(std::llround(ns));
 }
 
@@ -786,34 +810,103 @@ int SoapyLiteXM2SDR::acquireReadBuffer(
         return SOAPY_SDR_STREAM_ERROR;
     }
 
-    litex_m2sdr::StreamPacket *pkt = nullptr;
-    if (!_rx_stream.work_fifo->pop(&pkt,
-                                   /*wait=*/true,
-                                   std::chrono::microseconds(timeoutUs))) {
-        return SOAPY_SDR_TIMEOUT;
-    }
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 0);
+    auto remaining_timeout_us = [&]() -> long {
+        if (timeoutUs <= 0) return timeoutUs;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return 0;
+        return static_cast<long>(
+            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count());
+    };
 
-    if (pkt->ret_code < 0) {
-        /* Worker reported an error (typically OVERFLOW). Return the
-         * carrier packet to the free pool so the worker can reuse it,
-         * mark the handle invalid, and propagate the code+flags.
-         */
-        const int code = pkt->ret_code;
-        flags |= pkt->flags;
-        timeNs = pkt->timeNs;
-        pkt->ret_code = 0;
-        pkt->samples  = 0;
-        pkt->flags    = 0;
-        _rx_stream.free_fifo->push(pkt, /*wait=*/true);
-        handle = (size_t)-1;
-        return code;
-    }
+    size_t dropped_packets = 0;
+    long long dropped_samples = 0;
 
-    handle    = pkt->index;
-    buffs[0]  = pkt->data;
-    flags    |= pkt->flags;
-    timeNs    = pkt->timeNs;
-    return static_cast<int>(pkt->samples);
+    while (true) {
+        litex_m2sdr::StreamPacket *pkt = nullptr;
+        if (!_rx_stream.work_fifo->pop(&pkt,
+                                       /*wait=*/true,
+                                       std::chrono::microseconds(remaining_timeout_us()))) {
+            return SOAPY_SDR_TIMEOUT;
+        }
+
+        if (pkt->ret_code < 0) {
+            /* Worker reported an error (typically OVERFLOW). Return the
+             * carrier packet to the free pool so the worker can reuse it,
+             * mark the handle invalid, and propagate the code+flags.
+             */
+            const int code = pkt->ret_code;
+            flags |= pkt->flags;
+            timeNs = pkt->timeNs;
+            pkt->ret_code = 0;
+            pkt->samples  = 0;
+            pkt->flags    = 0;
+            _rx_stream.free_fifo->push(pkt, /*wait=*/true);
+            handle = (size_t)-1;
+            return code;
+        }
+
+        size_t packet_offset = 0;
+        uint32_t packet_samps = pkt->samples;
+        long long packet_timeNs = pkt->timeNs;
+        int packet_flags = pkt->flags;
+
+        if (_rx_stream.timed_start_pending) {
+            if (!_rx_stream.time_valid || !(packet_flags & SOAPY_SDR_HAS_TIME)) {
+                _rx_stream.free_fifo->push(pkt, /*wait=*/true);
+                SoapySDR::log(SOAPY_SDR_ERROR,
+                    "RX timed activation cannot align because RX packets have no timestamp");
+                return SOAPY_SDR_STREAM_ERROR;
+            }
+
+            const long long packet_start_sample = ns_to_samples(_rx_stream.samplerate, packet_timeNs);
+            const long long packet_end_sample = packet_start_sample + static_cast<long long>(packet_samps);
+            const long long target_sample = _rx_stream.timed_start_sample;
+
+            if (packet_end_sample <= target_sample) {
+                dropped_packets++;
+                dropped_samples += static_cast<long long>(packet_samps);
+                pkt->samples = 0;
+                pkt->flags = 0;
+                _rx_stream.free_fifo->push(pkt, /*wait=*/true);
+                continue;
+            }
+
+            if (packet_start_sample > target_sample) {
+                _rx_stream.free_fifo->push(pkt, /*wait=*/true);
+                _rx_stream.timed_start_pending = false;
+                timeNs = samples_to_ns(_rx_stream.samplerate, target_sample);
+                flags |= SOAPY_SDR_HAS_TIME;
+                handle = (size_t)-1;
+                SoapySDR::logf(SOAPY_SDR_WARNING,
+                    "RX timed activation missed target: requested=%lld samples first=%lld samples delta=%lld samples",
+                    (long long)target_sample,
+                    (long long)packet_start_sample,
+                    (long long)(packet_start_sample - target_sample));
+                return SOAPY_SDR_TIME_ERROR;
+            }
+
+            packet_offset = static_cast<size_t>(target_sample - packet_start_sample);
+            packet_samps -= static_cast<uint32_t>(packet_offset);
+            packet_timeNs = samples_to_ns(_rx_stream.samplerate, target_sample);
+            _rx_stream.timed_start_pending = false;
+            SoapySDR::logf(SOAPY_SDR_INFO,
+                "RX timed activation aligned: requested=%lld samples packet_start=%lld offset=%zu dropped_packets=%zu dropped_samples=%lld",
+                (long long)target_sample,
+                (long long)packet_start_sample,
+                packet_offset,
+                dropped_packets,
+                (long long)dropped_samples);
+        }
+
+        const size_t byte_offset = packet_offset * _frameChannels * _bytesPerComplex;
+        handle    = pkt->index;
+        buffs[0]  = pkt->data + byte_offset;
+        flags    |= packet_flags;
+        timeNs    = packet_timeNs;
+        return static_cast<int>(packet_samps);
+    }
 }
 
 /* Release a read buffer after use: return the StreamPacket to the
@@ -1144,8 +1237,24 @@ int SoapyLiteXM2SDR::readStream(
         return SOAPY_SDR_NOT_SUPPORTED;
     }
 
+    flags = 0;
+    timeNs = 0;
+
     /* Determine the number of samples to return, respecting the MTU. */
     size_t returnedElems = std::min(numElems, this->getStreamMTU(stream));
+    if (returnedElems == 0) {
+        return 0;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 0);
+    auto remaining_timeout_us = [&]() -> long {
+        if (timeoutUs <= 0) return timeoutUs;
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) return 0;
+        return static_cast<long>(
+            std::chrono::duration_cast<std::chrono::microseconds>(deadline - now).count());
+    };
 
     size_t samp_avail = 0;
 
@@ -1193,28 +1302,93 @@ int SoapyLiteXM2SDR::readStream(
         }
     }
 
-    /* Acquire a new read buffer from the DMA engine / UDP helper. */
-    size_t handle;
-    int ret = this->acquireReadBuffer(
-        stream,
-        handle,
-        (const void **)&_rx_stream.remainderBuff,
-        flags,
-        timeNs,
-        timeoutUs);
+    /* Acquire a new read buffer. When timed activation is pending, emulate
+     * LimeSDR's contract in software: discard early packets and trim the
+     * first packet that overlaps the requested sample.
+     */
+    int ret = 0;
+    size_t dropped_packets = 0;
+    long long dropped_samples = 0;
+    while (true) {
+        size_t handle;
+        int acquire_flags = 0;
+        long long acquire_timeNs = 0;
+        int acquire_ret = this->acquireReadBuffer(
+            stream,
+            handle,
+            (const void **)&_rx_stream.remainderBuff,
+            acquire_flags,
+            acquire_timeNs,
+            remaining_timeout_us());
 
-    if (ret < 0) {
-        if ((ret == SOAPY_SDR_TIMEOUT) && (samp_avail > 0)) {
-            return samp_avail;
+        if (acquire_ret < 0) {
+            if ((acquire_ret == SOAPY_SDR_TIMEOUT) && (samp_avail > 0)) {
+                return samp_avail;
+            }
+            flags |= acquire_flags;
+            timeNs = acquire_timeNs;
+            return acquire_ret;
         }
-        return ret;
+
+        uint32_t packet_offset = 0;
+        uint32_t packet_samps = static_cast<uint32_t>(acquire_ret);
+        if (_rx_stream.timed_start_pending) {
+            if (!_rx_stream.time_valid || !(acquire_flags & SOAPY_SDR_HAS_TIME)) {
+                this->releaseReadBuffer(stream, handle);
+                SoapySDR::log(SOAPY_SDR_ERROR,
+                    "RX timed activation cannot align because RX packets have no timestamp");
+                return SOAPY_SDR_STREAM_ERROR;
+            }
+
+            const long long packet_start_sample = ns_to_samples(_rx_stream.samplerate, acquire_timeNs);
+            const long long packet_end_sample = packet_start_sample + static_cast<long long>(packet_samps);
+            const long long target_sample = _rx_stream.timed_start_sample;
+
+            if (packet_end_sample <= target_sample) {
+                dropped_packets++;
+                dropped_samples += static_cast<long long>(packet_samps);
+                this->releaseReadBuffer(stream, handle);
+                continue;
+            }
+
+            if (packet_start_sample > target_sample) {
+                this->releaseReadBuffer(stream, handle);
+                _rx_stream.timed_start_pending = false;
+                timeNs = samples_to_ns(_rx_stream.samplerate, target_sample);
+                flags |= SOAPY_SDR_HAS_TIME;
+                SoapySDR::logf(SOAPY_SDR_WARNING,
+                    "RX timed activation missed target: requested=%lld samples first=%lld samples delta=%lld samples",
+                    (long long)target_sample,
+                    (long long)packet_start_sample,
+                    (long long)(packet_start_sample - target_sample));
+                return SOAPY_SDR_TIME_ERROR;
+            }
+
+            packet_offset = static_cast<uint32_t>(target_sample - packet_start_sample);
+            packet_samps -= packet_offset;
+            _rx_stream.timed_start_pending = false;
+            SoapySDR::logf(SOAPY_SDR_INFO,
+                "RX timed activation aligned: requested=%lld samples packet_start=%lld offset=%u dropped_packets=%zu dropped_samples=%lld",
+                (long long)target_sample,
+                (long long)packet_start_sample,
+                packet_offset,
+                dropped_packets,
+                (long long)dropped_samples);
+        }
+
+        _rx_stream.remainderHandle = handle;
+        _rx_stream.remainderSamps = packet_samps;
+        _rx_stream.remainderOffset = packet_offset;
+        _rx_stream.remainderTimeNs = acquire_timeNs;
+        flags |= acquire_flags;
+        timeNs = acquire_timeNs;
+        ret = static_cast<int>(packet_samps);
+        break;
     }
 
-    _rx_stream.remainderHandle = handle;
-    _rx_stream.remainderSamps = ret;
-    _rx_stream.remainderTimeNs = timeNs;
-
+    (void)ret;
     const size_t n = std::min((returnedElems - samp_avail), _rx_stream.remainderSamps);
+    const uint32_t remainderOffset = _rx_stream.remainderOffset * _frameChannels * _bytesPerComplex;
 
     if (_rx_stream.time_valid) {
         timeNs = _rx_stream.remainderTimeNs +
@@ -1230,7 +1404,7 @@ int SoapyLiteXM2SDR::readStream(
     for (size_t i = 0; i < _rx_stream.channels.size(); i++) {
         const uint32_t chan = _rx_stream.channels[i];
         this->deinterleave(
-            _rx_stream.remainderBuff + (chan * _bytesPerComplex),
+            _rx_stream.remainderBuff + (remainderOffset + chan * _bytesPerComplex),
             buffs[i],
             n,
             _rx_stream.format,
@@ -1246,7 +1420,7 @@ int SoapyLiteXM2SDR::readStream(
         _rx_stream.remainderOffset = 0;
     }
 
-    return returnedElems;
+    return samp_avail + n;
 }
 
 /* Write to the TX stream. */

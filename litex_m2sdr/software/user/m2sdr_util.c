@@ -1189,6 +1189,55 @@ static void flash_write(const char *filename, uint32_t offset)
     free(data);
 }
 
+static void config_stream(const char *filename)
+{
+    uint8_t *data;
+    int size;
+    FILE * f;
+
+    /* Open data source file. */
+    f = fopen(filename, "rb");
+    if (!f) {
+        perror(filename);
+        exit(1);
+    }
+
+    /* Get size, alloc buffer and copy data to it. */
+    fseek(f, 0L, SEEK_END);
+    size = ftell(f);
+    fseek(f, 0L, SEEK_SET);
+    data = malloc(size);
+    if (!data) {
+        fprintf(stderr, "%d: malloc failed\n", __LINE__);
+        exit(1);
+    }
+    ssize_t ret = fread(data, size, 1, f);
+    fclose(f);
+
+    if (ret != 1)
+        perror(filename);
+    else {
+        struct m2sdr_dev *conn = m2sdr_open_dev();
+        void *handle = m2sdr_get_handle(conn);
+        printf("Streaming configuration (%d bytes) to ICAP...\n", size);
+        int errors = m2sdr_config_stream(handle, data, size, flash_progress, NULL);
+        if (errors) {
+            fprintf(stderr, "Failed to stream configuration (err=%d)\n", errors);
+            free(data);
+            m2sdr_close_dev(conn);
+            exit(1);
+        }
+        printf("Stream complete.\n");
+        printf("===========================================================================\n");
+        printf("= PLEASE REBOOT YOUR HARDWARE OR RESCAN PCIe BUS IF THE DEVICE DOES NOT RESPOND =\n");
+        printf("===========================================================================\n");
+        m2sdr_close_dev(conn);
+    }
+
+    /* Free buffer */
+    free(data);
+}
+
 #endif /* FLASH_WRITE */
 
 static void flash_read(const char *filename, uint32_t size, uint32_t offset)
@@ -2054,6 +2103,8 @@ static void help(void)
 #ifdef FLASH_WRITE
            "  flash-write FILE [OFFSET]\n"
            "      Write a file to SPI flash.\n"
+           "  config-stream FILE\n"
+           "      Stream a configuration bitstream directly to ICAP (no flash).\n"
 #endif
            "  flash-read FILE SIZE [OFFSET]\n"
            "      Read from SPI flash to a file.\n"
@@ -2308,6 +2359,13 @@ int main(int argc, char **argv)
         flash_write(filename, offset);
     }
 #endif
+    else if (cmd_is(cmd, "config_stream", "config-stream")) {
+        const char *filename;
+        if (optind + 1 > argc)
+            goto show_help;
+        filename = argv[optind++];
+        config_stream(filename);
+    }
     else if (cmd_is(cmd, "flash_read", "flash-read")) {
         const char *filename;
         uint32_t size = 0;
