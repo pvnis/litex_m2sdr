@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <mutex>
 #include <cstring>
 #include <cstdlib>
@@ -15,6 +17,7 @@
 #include <iostream>
 #include <memory>
 #include <map>
+#include <thread>
 #include <vector>
 #include <string>
 #include <cstdint>
@@ -23,6 +26,7 @@
 #include "etherbone.h"
 #include "libm2sdr.h"
 #include "m2sdr.h"
+#include "LiteXM2SDRStreamWorker.hpp"
 
 #include <SoapySDR/Constants.h>
 #include <SoapySDR/Device.hpp>
@@ -41,6 +45,8 @@ enum class SoapyLiteXM2SDREthernetMode {
     VRT = 1,
 };
 #endif
+
+enum class LoopbackMode { None, Phy, AD9361 };
 
 #define DEBUG
 
@@ -407,6 +413,16 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     SoapyLiteXM2SDREthernetMode _eth_mode = SoapyLiteXM2SDREthernetMode::UDP;
 #endif
 
+    /* Per-stream worker fan-out (one TX worker, one RX worker).
+     *
+     * Topology mirrors LimeSuiteNG/TRXLooper:
+     *   - work_fifo carries packets in the direction of useful work
+     *     (worker -> caller for RX, caller -> worker for TX).
+     *   - free_fifo recycles packet slots back to the producer side.
+     *   - pkt_pool owns the heap-allocated sample buffers and is the
+     *     authoritative answer to getDirectAccessBufferAddrs().
+     * Stats counters are atomics so readStreamStatus can be lock-free.
+     */
     struct Stream {
         Stream() :
             opened(false),
@@ -414,7 +430,9 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
             hw_count(0), sw_count(0), user_count(0),
             remainderHandle(-1), remainderSamps(0),
             remainderOffset(0), remainderBuff(nullptr),
-            format() {}
+            format(),
+            worker_running(false),
+            pkt_capacity(0) {}
 
         bool opened;
         void *buf;
@@ -425,11 +443,49 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         size_t remainderSamps;
         size_t remainderOffset;
         int8_t* remainderBuff;
+        /* Aggregated burst metadata for the currently-open remainder
+         * buffer. The first writeStream into a fresh buffer seeds
+         * remainder_flags/remainder_timeNs; later writeStream calls
+         * into the same buffer can only OR additional flag bits in
+         * (END_BURST in particular) but do not overwrite HAS_TIME's
+         * timestamp - the buffer fires from the time of its first
+         * write, and downstream samples flow in untimed order. */
+        int       remainder_flags  = 0;
+        long long remainder_timeNs = 0;
         std::string format;
         std::vector<size_t> channels;
 #if USE_LITEPCIE
         struct litepcie_dma_ctrl dma;
 #endif
+
+        /* Worker thread + lock-free FIFOs (one direction each). */
+        std::thread worker;
+        std::atomic<bool> worker_running;
+        std::vector<litex_m2sdr::StreamPacket> pkt_pool;
+        size_t pkt_capacity;
+        std::unique_ptr<litex_m2sdr::PacketsFIFO<litex_m2sdr::StreamPacket*>> work_fifo;
+        std::unique_ptr<litex_m2sdr::PacketsFIFO<litex_m2sdr::StreamPacket*>> free_fifo;
+
+        /* Stats updated by the worker, read by readStreamStatus.
+         * "edge" mirrors the last-reported value so we can return a
+         * single Soapy status event per fault occurrence.
+         */
+        std::atomic<uint64_t> overflow_count{0};
+        std::atomic<uint64_t> underflow_count{0};
+        std::atomic<uint64_t> late_count{0};
+        uint64_t reported_overflow_count = 0;
+        uint64_t reported_underflow_count = 0;
+        uint64_t reported_late_count = 0;
+
+        /* Per-commit TX-timing slip (commit_ns - target_ns), updated
+         * after each HAS_TIME commit. Positive = TX fired late.
+         * Negative = TX fired ahead of target (should be rare).
+         * Stored as a small ring so a test harness can grab the
+         * recent N samples without per-commit polling.
+         */
+        static constexpr size_t TX_SLIP_RING = 256;
+        std::array<std::atomic<int64_t>, TX_SLIP_RING> tx_slip_ring{};
+        std::atomic<uint64_t> tx_slip_count{0};
     };
 
     struct RXStream: Stream {
@@ -441,14 +497,31 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         double frequency  = 0.0;
         std::string antenna[2];
 
-        bool overflow  = false;
         bool burst_end = false;
         bool time_valid = false;
+        /* time0_ns is anchored on the first DMA buffer the worker
+         * actually acquires (not at activate). For continuous ADC
+         * streaming that's microseconds after activate; for bursty
+         * paths like PHY/AD9361 loopback, it's when the first burst
+         * arrives. Linear extrapolation from there gives sample-
+         * accurate timestamps in both regimes.
+         */
+        bool time_anchored = false;
         long long time0_ns = 0;
         int64_t time0_count = 0;
         long long remainderTimeNs = 0;
         long long last_time_ns = 0;
+        long long last_hw_time_ns = 0;  /* last getHardwareTime() observed */
         bool time_warned = false;
+        uint32_t hdr_trace_count = 0;
+
+        /* Re-framer for the RX PCIe byte stream. LitePCIe ring-buffer
+         * boundaries are not packet boundaries, so the worker accumulates
+         * raw DMA bytes here until it can extract one complete stream
+         * packet payload.
+         */
+        std::vector<uint8_t> rx_reframe_buf;
+        std::vector<uint8_t> rx_payload_buf;
     };
 
     struct TXStream: Stream {
@@ -459,11 +532,34 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         double frequency  = 0.0;
         std::string antenna[2];
 
-        bool underflow = false;
-
         bool   burst_end   = false;
         int32_t burst_samps = 0;
         std::map<size_t, uint8_t*> pendingWriteBufs;
+
+        /* Cursor for HAS_TIME-clearing on consumed buffers. The FPGA
+         * TX DMA reader runs in LOOP_PROG_N=1 (loop mode), so each
+         * ring slot is re-read each time the descriptor table cycles
+         * past it. If a buffer was submitted with HAS_TIME=1, every
+         * subsequent re-read by the FPGA would push another stale
+         * descriptor into the arbiter's ts_fifo and (because the
+         * timestamp is now in the past) increment late_count. To
+         * make HAS_TIME single-use, _dmaAcquireWrite clears the
+         * HAS_TIME / END_BURST flag bits on every buffer slot whose
+         * index is below hw_count but at-or-above cleared_count, as
+         * soon as the kernel updates hw_count.
+         */
+        int64_t cleared_count = 0;
+
+        /* True once we have called litepcie_dma_reader(enable=1) for
+         * this stream. The FPGA TX reader is held *off* until the
+         * first user buffer has been fully written into ring slot 0,
+         * because the LOOP-mode reader would otherwise immediately
+         * latch slot 0's stale uninitialised content (header word 0
+         * = 0) as an untimed descriptor and complete a full ~45 ms
+         * ring cycle before our HAS_TIME=1 header lands - by which
+         * point _clearConsumedTXHeaders has already wiped it.
+         */
+        bool reader_enabled = false;
     };
 
     RXStream _rx_stream;
@@ -525,6 +621,39 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
 
     void setSampleMode();
 
+    /* DMA-side acquire/release used by the worker threads.
+     * These are the "raw" implementations: they talk directly to the
+     * LitePCIe DMA buffers (or the LiteEth UDP helper) and are the
+     * only code paths that touch hw/sw/user_count or pendingWriteBufs.
+     * The public Soapy acquire/release APIs are now FIFO operations
+     * against pkt_pool.
+     */
+    int  _dmaAcquireRead(size_t &handle, uint8_t **buf, int &flags,
+                         long long &timeNs, const long timeoutUs);
+    void _dmaReleaseRead(size_t handle);
+    int  _dmaAcquireWrite(size_t &handle, uint8_t **buf, const long timeoutUs);
+    void _dmaReleaseWrite(size_t handle, size_t numElems,
+                          int flags, long long timeNs);
+    /* Walk _tx_stream.cleared_count up to hw_count, clearing the
+     * HAS_TIME / END_BURST bits in each consumed buffer's header so
+     * the LOOP-mode DMA reader doesn't push stale "late" descriptors
+     * the next time the ring cycles past those slots. */
+    void _clearConsumedTXHeaders();
+
+    /* Worker thread bodies. Run until worker_running is cleared. */
+    void rxWorkerLoop();
+    void txWorkerLoop();
+
+    /* Pool lifecycle: allocate StreamPacket buffers + seed FIFOs at
+     * activateStream, tear down at closeStream.
+     */
+    void _spawnWorker(Stream &s, bool is_rx);
+    void _stopWorker(Stream &s);
+    void _freePktPool(Stream &s);
+
+    static LoopbackMode parseLoopbackMode(const SoapySDR::Kwargs &args);
+    static const char  *loopbackModeToString(LoopbackMode mode);
+
     const char *dir2Str(const int direction) const {
         return (direction == SOAPY_SDR_RX) ? "RX" : "TX";
     }
@@ -536,11 +665,19 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     uint32_t _bitMode           = 16;
     uint32_t _oversampling      = 0;
     uint32_t _nChannels         = 2;
+    /* FPGA frame layout invariant: each DMA beat carries four 16-bit
+     * fields (IA, QA, IB, QB) even in 1T1R mode (the disabled channel
+     * fields stay zero). Stride/MTU arithmetic must always treat the
+     * frame as two-channel; _nChannels only governs which channels the
+     * SoapySDR caller sees.
+     */
+    static constexpr uint32_t _frameChannels = 2;
     uint32_t _samplesPerComplex = 2;
     uint32_t _bytesPerSample    = 2;
     uint32_t _bytesPerComplex   = 4;
     float    _samplesScaling    = 2047.0f;
     float    _rateMult          = 1.0f;
+    LoopbackMode _loopbackMode  = LoopbackMode::None;
 
     // register protection
     std::mutex _mutex;

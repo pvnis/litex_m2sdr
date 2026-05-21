@@ -419,6 +419,9 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     }
 #endif
 
+    _loopbackMode = parseLoopbackMode(args);
+    SoapySDR::logf(SOAPY_SDR_INFO, "Loopback mode: %s", loopbackModeToString(_loopbackMode));
+
 #if USE_LITEPCIE
     /* Open LitePCIe descriptor. */
     if (args.count("path") == 0) {
@@ -516,8 +519,26 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     /* Configure PCIe Synchronizer and DMA Headers. */
 #if USE_LITEPCIE
     SoapySDR::log(SOAPY_SDR_INFO, "Configuring PCIe DMA headers");
-    /* Enable Synchronizer */
-    litex_m2sdr_writel(_dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 0);
+    /* Bypass the LitePCIe DMA Synchronizer: PPS-edge gating is meant
+     * for production deployments where wall-clock alignment matters;
+     * for routine TDD/loopback use, requiring a PPS edge before TX/RX
+     * can flow just adds up-to-one-second of startup latency and
+     * makes timed-TX bring-up brittle. PPS-aware setups can re-enable
+     * via a SoapyKwarg later. */
+#ifdef CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR
+    litex_m2sdr_writel(_dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
+#endif
+    /* Note on LitePCIe DMA reader mode: the kernel hardwires
+     * LOOP_PROG_N=1, which makes the reader cycle the 16-entry
+     * descriptor ring indefinitely. We can't switch to PROG mode here
+     * because the kernel only loads the descriptor table once at start
+     * - in PROG mode the reader would stall after 16 buffers and the
+     * driver has no plumbing to refill descriptors. Instead, the
+     * driver clears the HAS_TIME bit from the per-buffer header in
+     * _dmaReleaseWrite *after* sw_count advance, so re-reads of the
+     * ring see has_time=0 and the TimedTXArbiter doesn't spuriously
+     * flag stale bursts as late. See _dmaReleaseWrite.
+     */
 
     /* DMA RX Header */
     #if defined(_RX_DMA_HEADER_TEST)
@@ -741,6 +762,21 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     _dma_buf = NULL;
 #endif
 
+#if defined(CSR_AD9361_PHY_CONTROL_ADDR) && defined(CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET)
+    {
+        uint32_t phy_ctrl = litex_m2sdr_readl(_dev, CSR_AD9361_PHY_CONTROL_ADDR);
+        if (_loopbackMode == LoopbackMode::Phy)
+            phy_ctrl |=  (1u << CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET);
+        else
+            phy_ctrl &= ~(1u << CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET);
+        litex_m2sdr_writel(_dev, CSR_AD9361_PHY_CONTROL_ADDR, phy_ctrl);
+    }
+#endif
+
+    if (m2sdr_from_ad9361_rc(ad9361_bist_loopback(ad9361_phy, _loopbackMode == LoopbackMode::AD9361 ? 1 : 0)) != M2SDR_ERR_OK) {
+        throw std::runtime_error("Failed to configure AD9361 loopback mode.");
+    }
+
     SoapySDR::log(SOAPY_SDR_INFO, "SoapyLiteXM2SDR initialization complete");
 }
 
@@ -750,7 +786,10 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
 
 SoapyLiteXM2SDR::~SoapyLiteXM2SDR(void) {
     SoapySDR::log(SOAPY_SDR_INFO, "Power down and cleanup");
-    spi_unregister_fd(_spi_id);
+    /* spi_unregister_fd() runs after AD9361 teardown below; calling it
+     * here would invalidate the SPI fd that ad9361_bist_loopback() and
+     * m2sdr_close() still need.
+     */
     if (_rx_stream.opened) {
 #if USE_LITEPCIE
          /* Release the DMA engine. */
@@ -779,8 +818,24 @@ SoapyLiteXM2SDR::~SoapyLiteXM2SDR(void) {
     litex_m2sdr_writel(_dev, CSR_CROSSBAR_MUX_SEL_ADDR,   0);
     litex_m2sdr_writel(_dev, CSR_CROSSBAR_DEMUX_SEL_ADDR, 0);
 
+    /* Disable PHY loopback before power-down. */
+#if defined(CSR_AD9361_PHY_CONTROL_ADDR) && defined(CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET)
+    {
+        uint32_t phy_ctrl = litex_m2sdr_readl(_dev, CSR_AD9361_PHY_CONTROL_ADDR);
+        phy_ctrl &= ~(1u << CSR_AD9361_PHY_CONTROL_LOOPBACK_OFFSET);
+        litex_m2sdr_writel(_dev, CSR_AD9361_PHY_CONTROL_ADDR, phy_ctrl);
+    }
+#endif
+
+    if (ad9361_phy != nullptr) {
+        (void)ad9361_bist_loopback(ad9361_phy, 0);
+    }
+
     /* Power-Down AD9361 */
     litex_m2sdr_writel(_dev, CSR_AD9361_CONFIG_ADDR, 0b00);
+
+    /* SPI fd is no longer needed after this point. */
+    spi_unregister_fd(_spi_id);
 
 #if USE_LITEETH
     if (_udp_inited) {
@@ -1616,6 +1671,28 @@ bool SoapyLiteXM2SDR::hasHardwareTime(const std::string &) const {
 
 long long SoapyLiteXM2SDR::getHardwareTime(const std::string &) const
 {
+#if defined(CSR_SAMPLE_COUNTER_CONTROL_ADDR)
+    /* Read the FPGA SampleCounter via its CSR latch and convert to ns
+     * using the active sample rate. This is the authoritative "now"
+     * for sample-accurate timed TX in the new gateware. */
+    const double rate = (_rx_stream.samplerate > 0.0)
+                        ? _rx_stream.samplerate : _tx_stream.samplerate;
+    if (rate > 0.0) {
+        /* Pulse read_latch (bit 1 of control) to snapshot the rfic
+         * counter into the read_value CSR. */
+        litex_m2sdr_writel(_dev, CSR_SAMPLE_COUNTER_CONTROL_ADDR,
+                           1u << CSR_SAMPLE_COUNTER_CONTROL_READ_LATCH_OFFSET);
+        const uint32_t lo = litex_m2sdr_readl(_dev, CSR_SAMPLE_COUNTER_READ_VALUE_ADDR + 4);
+        const uint32_t hi = litex_m2sdr_readl(_dev, CSR_SAMPLE_COUNTER_READ_VALUE_ADDR + 0);
+        const uint64_t samples = (static_cast<uint64_t>(hi) << 32) | lo;
+        const long long ns = static_cast<long long>(
+            (static_cast<double>(samples) * 1e9) / rate);
+        SoapySDR::logf(SOAPY_SDR_DEBUG, "Hardware time (ns from samples=%llu): %lld",
+                       (unsigned long long)samples, ns);
+        return ns;
+    }
+#endif
+    /* Fallback: ns-resolution TimeGenerator (legacy path). */
     uint64_t time_ns = 0;
     int rc = m2sdr_get_time(_dev, &time_ns);
 
@@ -1628,6 +1705,26 @@ long long SoapyLiteXM2SDR::getHardwareTime(const std::string &) const
 
 void SoapyLiteXM2SDR::setHardwareTime(const long long timeNs, const std::string &)
 {
+#if defined(CSR_SAMPLE_COUNTER_CONTROL_ADDR)
+    const double rate = (_rx_stream.samplerate > 0.0)
+                        ? _rx_stream.samplerate : _tx_stream.samplerate;
+    if (rate > 0.0) {
+        const uint64_t samples = static_cast<uint64_t>(
+            (static_cast<double>(timeNs) * rate) / 1e9);
+        /* Write counter value (32-bit hi/lo halves of the 64-bit CSR). */
+        litex_m2sdr_writel(_dev, CSR_SAMPLE_COUNTER_WRITE_VALUE_ADDR + 0,
+                           static_cast<uint32_t>(samples >> 32));
+        litex_m2sdr_writel(_dev, CSR_SAMPLE_COUNTER_WRITE_VALUE_ADDR + 4,
+                           static_cast<uint32_t>(samples & 0xffffffffu));
+        /* Pulse write (bit 0 of control). */
+        litex_m2sdr_writel(_dev, CSR_SAMPLE_COUNTER_CONTROL_ADDR,
+                           1u << CSR_SAMPLE_COUNTER_CONTROL_WRITE_OFFSET);
+        SoapySDR::logf(SOAPY_SDR_DEBUG,
+                       "Hardware time set to (ns=%lld, samples=%llu)",
+                       timeNs, (unsigned long long)samples);
+        return;
+    }
+#endif
     int rc = m2sdr_set_time(_dev, static_cast<uint64_t>(timeNs));
 
     if (rc != 0)
@@ -1649,6 +1746,10 @@ std::vector<std::string> SoapyLiteXM2SDR::listSensors(void) const {
     sensors.push_back("fpga_vccbram");
 #endif
     sensors.push_back("ad9361_temp");
+    /* TX-timing diagnostics: cumulative commit count + recent slips. */
+    sensors.push_back("tx_slip_count");
+    sensors.push_back("tx_slip_last_ns");
+    sensors.push_back("tx_slip_ring_ns");
     if (has_eth_ptp_support(_dev)) {
         sensors.push_back("ptp_locked");
         sensors.push_back("ptp_time_locked");
@@ -1722,6 +1823,34 @@ SoapySDR::ArgInfo SoapyLiteXM2SDR::getSensorInfo(
                 throw std::runtime_error("SoapyLiteXM2SDR::getSensorInfo(" + key + ") unknown sensor");
             }
             return info;
+        }
+
+        /* TX-timing diagnostics */
+        if (deviceStr == "tx") {
+            if (sensorStr == "slip_count") {
+                info.key         = "tx_slip_count";
+                info.value       = "0";
+                info.description = "Number of HAS_TIME TX commits observed";
+                info.type        = SoapySDR::ArgInfo::INT;
+                return info;
+            }
+            if (sensorStr == "slip_last_ns") {
+                info.key         = "tx_slip_last_ns";
+                info.units       = "ns";
+                info.value       = "0";
+                info.description = "Most recent TX commit slip (commit_ns - target_ns); >0 = late";
+                info.type        = SoapySDR::ArgInfo::INT;
+                return info;
+            }
+            if (sensorStr == "slip_ring_ns") {
+                info.key         = "tx_slip_ring_ns";
+                info.units       = "ns";
+                info.value       = "";
+                info.description = "Comma-separated ring of recent TX slip ns (newest first)";
+                info.type        = SoapySDR::ArgInfo::STRING;
+                return info;
+            }
+            throw std::runtime_error("SoapyLiteXM2SDR::getSensorInfo(" + key + ") unknown tx sensor");
         }
 
         if (deviceStr == "ptp") {
@@ -1826,6 +1955,34 @@ std::string SoapyLiteXM2SDR::readSensor(
             return sensorValue;
         }
 
+        /* TX-timing diagnostics */
+        if (deviceStr == "tx") {
+            const uint64_t count = _tx_stream.tx_slip_count.load(std::memory_order_acquire);
+            if (sensorStr == "slip_count") {
+                return std::to_string(count);
+            }
+            if (sensorStr == "slip_last_ns") {
+                if (count == 0) return "0";
+                const size_t slot = (count - 1) % TXStream::TX_SLIP_RING;
+                return std::to_string(
+                    _tx_stream.tx_slip_ring[slot].load(std::memory_order_relaxed));
+            }
+            if (sensorStr == "slip_ring_ns") {
+                if (count == 0) return "";
+                const size_t n = std::min<size_t>(count, TXStream::TX_SLIP_RING);
+                std::string out;
+                out.reserve(n * 12);
+                for (size_t k = 0; k < n; ++k) {
+                    const size_t slot = (count - 1 - k) % TXStream::TX_SLIP_RING;
+                    if (!out.empty()) out.push_back(',');
+                    out += std::to_string(
+                        _tx_stream.tx_slip_ring[slot].load(std::memory_order_relaxed));
+                }
+                return out;
+            }
+            throw std::runtime_error("SoapyLiteXM2SDR::readSensor(" + key + ") unknown tx sensor");
+        }
+
         if (deviceStr == "ptp") {
             struct m2sdr_ptp_status status;
             if (m2sdr_get_ptp_status(_dev, &status) != 0)
@@ -1860,4 +2017,34 @@ std::string SoapyLiteXM2SDR::readSensor(
         throw std::runtime_error("SoapyLiteXM2SDR::getSensorInfo(" + key + ") unknown device");
     }
     throw std::runtime_error("SoapyLiteXM2SDR::getSensorInfo(" + key + ") unknown key");
+}
+
+/***************************************************************************************************
+ *                                        Loopback helpers
+ **************************************************************************************************/
+
+LoopbackMode SoapyLiteXM2SDR::parseLoopbackMode(const SoapySDR::Kwargs &args)
+{
+    const auto it = args.find("loopback_mode");
+    if (it == args.end())
+        return LoopbackMode::None;
+    const std::string &v = it->second;
+    if (v == "0" || v == "false" || v == "off" || v == "none")
+        return LoopbackMode::None;
+    if (v == "1" || v == "true" || v == "on" || v == "phy")
+        return LoopbackMode::Phy;
+    if (v == "ad9361" || v == "rfic")
+        return LoopbackMode::AD9361;
+    throw std::runtime_error(
+        "Unsupported loopback_mode '" + v + "'. Valid values: none, phy, ad9361.");
+}
+
+const char *SoapyLiteXM2SDR::loopbackModeToString(LoopbackMode mode)
+{
+    switch (mode) {
+    case LoopbackMode::None: return "none";
+    case LoopbackMode::Phy:  return "phy";
+    case LoopbackMode::AD9361: return "ad9361";
+    default:                 return "unknown";
+    }
 }

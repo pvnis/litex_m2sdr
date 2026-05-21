@@ -41,7 +41,11 @@ class HeaderInserterExtractor(LiteXModule):
         # --------
         cycles = Signal(32)
         frame_cycles_eff = Signal(32)
-        self.comb += frame_cycles_eff.eq(Mux(self.frame_cycles == 0, 1, self.frame_cycles))
+        frame_last = Signal()
+        self.comb += [
+            frame_cycles_eff.eq(Mux(self.frame_cycles == 0, 1, self.frame_cycles)),
+            frame_last.eq(cycles == (frame_cycles_eff - 1)),
+        ]
 
         # FSM.
         # ----
@@ -93,7 +97,10 @@ class HeaderInserterExtractor(LiteXModule):
             # Header.
             fsm.act("HEADER",
                 sink.ready.eq(1),
-                If(sink.valid & sink.ready & sink.first,
+                # LitePCIe's DMA reader does not reliably mark host DMA
+                # buffer boundaries with `first`; framing is instead
+                # established by reset plus the fixed frame_cycles cadence.
+                If(sink.valid & sink.ready,
                     NextValue(self.header, sink.data[0:64]),
                     NextState("TIMESTAMP")
                 )
@@ -110,14 +117,19 @@ class HeaderInserterExtractor(LiteXModule):
 
         # Frame.
         fsm.act("FRAME",
-            sink.connect(source, omit={"first"}),
+            # Header mode owns frame markers: `first` marks inserted/extracted
+            # frame starts and `last` marks the CSR-programmed payload length.
+            # Passing sink.last through here can keep the FSM from returning
+            # to HEADER after the first frame on streams whose upstream last
+            # cadence differs from frame_cycles.
+            sink.connect(source, omit={"first", "last"}),
             NextValue(self.update, 0),
             If(self.header_enable,
                 source.first.eq((cycles == 0) & (mode == "extractor")),
-                source.last.eq( cycles == (frame_cycles_eff - 1)),
+                source.last.eq(frame_last),
                 If(source.valid & source.ready,
                     NextValue(cycles, cycles + 1),
-                    If(source.last,
+                    If(frame_last,
                         NextValue(cycles, 0),
                         NextState("HEADER")
                     )

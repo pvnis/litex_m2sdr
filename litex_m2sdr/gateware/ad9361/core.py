@@ -126,6 +126,16 @@ class AD9361RFIC(LiteXModule):
                 ("``0b1``", " 8-bit mode."),
             ], description="Sample format.")
         ])
+        self._ch_en = CSRStorage(fields=[
+            CSRField("ch_a", size=1, offset=0, reset=1, values=[
+                ("``0b0``", "Channel A disabled."),
+                ("``0b1``", "Channel A enabled."),
+            ]),
+            CSRField("ch_b", size=1, offset=1, reset=1, values=[
+                ("``0b0``", "Channel B disabled."),
+                ("``0b1``", "Channel B enabled."),
+            ]),
+        ], description="Per-channel enable (bit 0 = ch_a, bit 1 = ch_b).")
 
         # # #
 
@@ -133,7 +143,7 @@ class AD9361RFIC(LiteXModule):
         self.cd_rfic = ClockDomain("rfic")
 
         # SPI --------------------------------------------------------------------------------------
-        self.spi = AD9361SPIMaster(spi_pads, data_width=24, clk_divider=8)
+        self.spi = AD9361SPIMaster(spi_pads, data_width=24, clk_divider=16)
 
         # Config / Status --------------------------------------------------------------------------
         self.sync += [
@@ -196,8 +206,10 @@ class AD9361RFIC(LiteXModule):
             gpio_tx_unpacker.source.connect(self.phy.sink, keep={"valid", "ready"}),
             self.phy.sink.ia.eq(gpio_tx_unpacker.source.data[0*16:1*16]),
             self.phy.sink.qa.eq(gpio_tx_unpacker.source.data[1*16:2*16]),
-            self.phy.sink.ib.eq(gpio_tx_unpacker.source.data[2*16:3*16]),
-            self.phy.sink.qb.eq(gpio_tx_unpacker.source.data[3*16:4*16]),
+            If(self._ch_en.fields.ch_b,
+                self.phy.sink.ib.eq(gpio_tx_unpacker.source.data[2*16:3*16]),
+                self.phy.sink.qb.eq(gpio_tx_unpacker.source.data[3*16:4*16]),
+            ),
         ]
 
         # RX.
@@ -207,8 +219,10 @@ class AD9361RFIC(LiteXModule):
             self.phy.source.connect(gpio_rx_packer.sink, keep={"valid", "ready"}),
             gpio_rx_packer.sink.data[0*16:1*16].eq(_sign_extend(self.phy.source.ia, 16)),
             gpio_rx_packer.sink.data[1*16:2*16].eq(_sign_extend(self.phy.source.qa, 16)),
-            gpio_rx_packer.sink.data[2*16:3*16].eq(_sign_extend(self.phy.source.ib, 16)),
-            gpio_rx_packer.sink.data[3*16:4*16].eq(_sign_extend(self.phy.source.qb, 16)),
+            If(self._ch_en.fields.ch_b,
+                gpio_rx_packer.sink.data[2*16:3*16].eq(_sign_extend(self.phy.source.ib, 16)),
+                gpio_rx_packer.sink.data[3*16:4*16].eq(_sign_extend(self.phy.source.qb, 16)),
+            ),
         ]
         self.rx_pipeline = stream.Pipeline(
             gpio_rx_packer,

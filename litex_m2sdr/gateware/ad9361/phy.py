@@ -146,6 +146,13 @@ class AD9361PHY(LiteXModule):
             )
         ]
 
+        # Free-running sample-rate strobe (one pulse per AD9361 sample frame,
+        # i.e. one IQ tuple/beat). Exposed to other modules (SampleCounter,
+        # TimedTXArbiter) so they get a clean rfic-domain pulse independent of
+        # the data-valid / loopback gating below.
+        self.sample_strobe = Signal()
+        self.sync.rfic += self.sample_strobe.eq(rx_count == 0)
+
         # RX Data.
         # --------
         # Captures RX_D[5:0] in DDR mode: I samples on rising edge, Q samples on falling edge.

@@ -39,7 +39,6 @@ from litepcie.frontend.wishbone import LitePCIeWishboneSlave
 
 from liteeth.phy.a7_1000basex import A7_1000BASEX, A7_2500BASEX
 from liteeth.frontend.stream  import LiteEthStream2UDPTX, LiteEthUDP2StreamRX
-from liteeth.core.ptp         import LiteEthPTP
 
 from litesata.phy import LiteSATAPHY
 from litesata.frontend.stream import LiteSATAStream2Sectors, LiteSATASectors2Stream
@@ -47,7 +46,7 @@ from litesata.frontend.stream import LiteSATAStream2Sectors, LiteSATASectors2Str
 from litescope import LiteScopeAnalyzer
 
 from litex_m2sdr import Platform, _io_baseboard
-from litex_m2sdr.wr_helper import prepare_wr_environment
+from litex_m2sdr.wr_helper import prepare_wr_environment, ensure_wr_nic_importable
 
 from litex_m2sdr.gateware.capability       import Capability
 from litex_m2sdr.gateware.clock_discipline import MMCMPhaseDiscipline
@@ -55,11 +54,11 @@ from litex_m2sdr.gateware.si5351           import SI5351
 from litex_m2sdr.gateware.ad9361.core import AD9361RFIC
 from litex_m2sdr.gateware.qpll        import SharedQPLL
 from litex_m2sdr.gateware.time        import TimeGenerator, TimeNsToPS
-from litex_m2sdr.gateware.ptp_discipline import PTPTimeDiscipline, TimeDisciplineCDC
-from litex_m2sdr.gateware.ptp_identity   import PTPIdentityTracker
 from litex_m2sdr.gateware.pps         import PPSGenerator
 from litex_m2sdr.gateware.pcie        import PCIeLinkResetWorkaround
 from litex_m2sdr.gateware.header      import TXRXHeader
+from litex_m2sdr.gateware.sample_counter import SampleCounter
+from litex_m2sdr.gateware.timed_tx        import TimedTXArbiter
 from litex_m2sdr.gateware.led         import StatusLed
 from litex_m2sdr.gateware.measurement import MultiClkMeasurement
 from litex_m2sdr.gateware.gpio        import GPIO
@@ -213,6 +212,8 @@ class BaseSoC(SoCMini):
         "ad9361"           : 24,
         "crossbar"         : 25,
         "txrx_loopback"    : 33,
+        "sample_counter"   : 22,
+        "timed_tx"         : 41,
 
         # Measurements/Analyzer.
         "clk_measurement"  : 30,
@@ -485,7 +486,17 @@ class BaseSoC(SoCMini):
                     raise NotImplementedError("PCIe PTM only supported in PCIe Gen2 X1 for now.")
 
                 # Add PCIe PTM support.
-                from litex_wr_nic.gateware.soc import LiteXWRNICSoC
+                ensure_wr_nic_importable(
+                    root_dir   = os.path.dirname(os.path.abspath(__file__)),
+                    wr_nic_dir = wr_nic_dir,
+                )
+                try:
+                    from litex_wr_nic.gateware.soc import LiteXWRNICSoC
+                except ModuleNotFoundError as e:
+                    raise ModuleNotFoundError(
+                        "PCIe PTM requires a litex_wr_nic checkout. "
+                        "Use --wr-nic-dir, set LITEX_WR_NIC_DIR, or place a sibling litex_wr_nic checkout next to this repository."
+                    ) from e
                 LiteXWRNICSoC.add_pcie_ptm(self)
 
                 # Connect Time Gen's Time to PCIe PTM.
@@ -532,6 +543,10 @@ class BaseSoC(SoCMini):
             self.add_etherbone(**eth_etherbone_kwargs)
 
             if with_eth_ptp:
+                from liteeth.core.ptp import LiteEthPTP
+                from litex_m2sdr.gateware.ptp_discipline import PTPTimeDiscipline, TimeDisciplineCDC
+                from litex_m2sdr.gateware.ptp_identity import PTPIdentityTracker
+                
                 nominal_time_inc = int(round((1e9/100e6) * (1 << 24)))
                 eth_ptp_clock_id = Cat(Constant(eth_sfp + 1, 16), self.dna._id.status)
 
@@ -677,12 +692,23 @@ class BaseSoC(SoCMini):
         self.ad9361.add_prbs()
         self.ad9361.add_agc()
 
+        # Sample Counter ---------------------------------------------------------------------------
+
+        # Free-running 64-bit counter that ticks once per AD9361 sample
+        # frame. Used as the sample-domain time reference for timed TX
+        # (TimedTXArbiter) and for RX header timestamping.
+        self.sample_counter = SampleCounter(
+            sample_strobe = self.ad9361.phy.sample_strobe,
+        )
+
         # TX/RX Header Extracter/Inserter ----------------------------------------------------------
 
         self.header = TXRXHeader(data_width=64)
         self.comb += [
             self.header.rx.header.eq(0x5aa5_5aa5_5aa5_5aa5), # Unused for now, arbitrary.
-            self.header.rx.timestamp.eq(self.time_gen.time),
+            # RX header timestamp = current sample count (Gray-coded CDC
+            # rfic -> sys, ~3 sys cycles lag, atomic).
+            self.header.rx.timestamp.eq(self.sample_counter.count_sys),
         ]
 
         # TX/RX Datapath ---------------------------------------------------------------------------
@@ -692,9 +718,25 @@ class BaseSoC(SoCMini):
         # -------------------------------
         self.txrx_loopback = TXRXLoopback(data_width=64, with_csr=True)
 
-        # Header TX -> Loopback -> RFIC TX.
+        # Timed TX Arbiter -----------------------------------------------------
+        # Sits between TX header extractor and the loopback/AD9361 sinks,
+        # gating sample release on the sample_counter so timed bursts
+        # leave the FPGA at the host-requested sample timestamp. Mirrors
+        # the PCIe DMA synchronizer reset so a stalled prior run cannot
+        # leave stale data blocking the arbiter.
+        self.timed_tx = TimedTXArbiter(
+            header       = self.header.tx,
+            sample_count = self.sample_counter.count_sys,
+        )
+        # if with_pcie:
+        #     self.comb += If(self.crossbar.mux.sel == 0,
+        #         self.timed_tx.reset.eq(~self.pcie_dma0.synchronizer.synced),
+        #     )
+
+        # Header TX -> TimedTXArbiter -> Loopback -> RFIC TX.
         self.comb += [
-            self.header.tx.source.connect(self.txrx_loopback.tx_sink),
+            self.header.tx.source.connect(self.timed_tx.sink),
+            self.timed_tx.source.connect(self.txrx_loopback.tx_sink),
             self.txrx_loopback.tx_source.connect(self.ad9361.sink),
         ]
 
@@ -717,6 +759,10 @@ class BaseSoC(SoCMini):
                     self.header.tx.reset.eq(~self.pcie_dma0.synchronizer.synced)
                 )
             ]
+
+            self.comb += If(self.crossbar.mux.sel == 0,
+                self.timed_tx.reset.eq(~self.pcie_dma0.synchronizer.synced),
+            )
         if with_eth:
             self.comb += self.eth_tx_streamer.source.connect(self.crossbar.mux.sink1, omit={"error"})
         if with_sata:
@@ -791,11 +837,10 @@ class BaseSoC(SoCMini):
             wr_firmware = os.path.abspath(wr_firmware)
 
             # Ensure local/sibling litex_wr_nic checkout is importable in CI and local runs.
-            if wr_nic_dir is not None:
-                wr_import_paths = [os.path.abspath(wr_nic_dir), os.path.abspath(os.path.dirname(wr_nic_dir))]
-                for path in wr_import_paths:
-                    if path not in sys.path:
-                        sys.path.insert(0, path)
+            ensure_wr_nic_importable(
+                root_dir   = os.path.dirname(os.path.abspath(__file__)),
+                wr_nic_dir = wr_nic_dir,
+            )
 
             from litex.soc.cores.uart import UARTPHY, UART
 
