@@ -1841,6 +1841,19 @@ void SoapyLiteXM2SDR::_dmaReleaseRead(size_t handle) {
 #endif
 }
 
+void SoapyLiteXM2SDR::_clearAllTXHeaderFlags() {
+#if USE_LITEPCIE
+    static constexpr uint64_t TX_HEADER_FLAG_MASK =
+        TX_FLAG_HAS_TIME | TX_FLAG_END_BURST;
+    for (size_t i = 0; i < _dma_mmap_info.dma_tx_buf_count; ++i) {
+        uint64_t *hdr0 = reinterpret_cast<uint64_t*>(
+            reinterpret_cast<uint8_t*>(_tx_stream.buf) +
+            i * _dma_mmap_info.dma_tx_buf_size);
+        *hdr0 &= ~TX_HEADER_FLAG_MASK;
+    }
+#endif
+}
+
 void SoapyLiteXM2SDR::_clearConsumedTXHeaders() {
 #if USE_LITEPCIE
     /* Once hw_count has advanced past a buffer index, the FPGA TX DMA
@@ -1905,6 +1918,12 @@ int SoapyLiteXM2SDR::_dmaAcquireWrite(
         litepcie_dma_reader(_fd, 1, &_tx_stream.hw_count, &_tx_stream.sw_count);
         _clearConsumedTXHeaders();
         buffers_pending = _tx_stream.user_count - _tx_stream.hw_count;
+        if (buffers_pending < 0) {
+            _clearAllTXHeaderFlags();
+            _tx_stream.user_count = _tx_stream.hw_count;
+            _tx_stream.cleared_count = _tx_stream.hw_count;
+            buffers_pending = 0;
+        }
     }
     if (buffers_pending == ((int64_t)_dma_mmap_info.dma_tx_buf_count)) {
         if (timeoutUs == 0) return SOAPY_SDR_TIMEOUT;
@@ -2177,6 +2196,29 @@ void SoapyLiteXM2SDR::txWorkerLoop() {
 
         if ((pkt->flags & SOAPY_SDR_HAS_TIME) && pkt->timeNs > 0) {
             const long long now = this->getHardwareTime("");
+            const int64_t slip = static_cast<int64_t>(now - pkt->timeNs);
+            const uint64_t slip_count =
+                _tx_stream.tx_slip_count.fetch_add(1, std::memory_order_acq_rel);
+            _tx_stream.tx_slip_ring[slip_count % TXStream::TX_SLIP_RING].store(
+                slip, std::memory_order_relaxed);
+            if (const char *trace_env = std::getenv("M2SDR_SOAPY_TX_SLIP_TRACE")) {
+                if (std::string_view(trace_env) != "0") {
+                    size_t trace_limit = 256;
+                    if (const char *limit_env = std::getenv("M2SDR_SOAPY_TX_SLIP_TRACE_LIMIT")) {
+                        trace_limit = static_cast<size_t>(std::max<long>(0, std::strtol(limit_env, nullptr, 10)));
+                    }
+                    if (slip_count < trace_limit) {
+                        SoapySDR::logf(SOAPY_SDR_INFO,
+                            "TX timed commit slip: seq=%llu samples=%u flags=0x%x target_ns=%lld now_ns=%lld slip_ns=%lld",
+                            (unsigned long long)slip_count,
+                            pkt->samples,
+                            pkt->flags,
+                            (long long)pkt->timeNs,
+                            (long long)now,
+                            (long long)slip);
+                    }
+                }
+            }
             if (now > pkt->timeNs) {
                 _tx_stream.late_count.fetch_add(1, std::memory_order_relaxed);
             }
@@ -2217,6 +2259,10 @@ void SoapyLiteXM2SDR::_spawnWorker(Stream &s, bool is_rx) {
     s.reported_overflow_count  = 0;
     s.reported_underflow_count = 0;
     s.reported_late_count      = 0;
+    s.tx_slip_count.store(0);
+    for (auto &slip : s.tx_slip_ring) {
+        slip.store(0, std::memory_order_relaxed);
+    }
 
     s.worker_running.store(true, std::memory_order_release);
     if (is_rx) {

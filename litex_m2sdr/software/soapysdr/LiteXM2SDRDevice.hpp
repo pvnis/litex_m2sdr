@@ -647,6 +647,7 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
      * the LOOP-mode DMA reader doesn't push stale "late" descriptors
      * the next time the ring cycles past those slots. */
     void _clearConsumedTXHeaders();
+    void _clearAllTXHeaderFlags();
 
     /* Worker thread bodies. Run until worker_running is cleared. */
     void rxWorkerLoop();
