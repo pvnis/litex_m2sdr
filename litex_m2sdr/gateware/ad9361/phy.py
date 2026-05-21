@@ -146,12 +146,21 @@ class AD9361PHY(LiteXModule):
             )
         ]
 
-        # Free-running sample-rate strobe (one pulse per AD9361 sample frame,
-        # i.e. one IQ tuple/beat). Exposed to other modules (SampleCounter,
-        # TimedTXArbiter) so they get a clean rfic-domain pulse independent of
-        # the data-valid / loopback gating below.
+        # Free-running sample-rate strobe (one pulse per AD9361 sample on the
+        # active channel; in 2R2T that's one IA+QA+IB+QB beat = 4 rfic
+        # cycles; in 1R1T it's one IA+QA pair = 2 rfic cycles, since
+        # rfic_clk = sample_rate * 2 in 1R1T vs * 4 in 2R2T).
+        # Exposed to SampleCounter and TimedTXArbiter, which need a
+        # strobe that matches the AD9361's *actual* per-channel sample
+        # rate (not half of it).
         self.sample_strobe = Signal()
-        self.sync.rfic += self.sample_strobe.eq(rx_count == 0)
+        self.sync.rfic += [
+            If(mode == AD9361PHY1R1T_MODE,
+                self.sample_strobe.eq(rx_count[0] == 0),
+            ).Else(
+                self.sample_strobe.eq(rx_count == 0),
+            )
+        ]
 
         # RX Data.
         # --------
@@ -183,34 +192,59 @@ class AD9361PHY(LiteXModule):
         rx_data_qa  = Signal(12)
         rx_data_ib  = Signal(12)
         rx_data_qb  = Signal(12)
+        # 1R1T: rfic_clk = 2 * sample_rate. Every rfic cycle captures one 6-bit
+        # half of IA and QA; assembly produces one IA/QA pair every 2 cycles.
+        # IB/QB unused (stay 0). 2R2T: rfic_clk = 4 * sample_rate. Cycles 0,1
+        # assemble IA/QA, cycles 2,3 assemble IB/QB (selected by rx_count[1]).
         self.sync.rfic += [
-            Case(rx_count[1], {
-                0b0: [  # Assemble IA/QA: MSBs in high bits, LSBs in low bits.
-                    rx_data_ia[0: 6].eq(rx_data_half_i),
-                    rx_data_ia[6:12].eq(rx_data_ia[0:6]),
-                    rx_data_qa[0: 6].eq(rx_data_half_q),
-                    rx_data_qa[6:12].eq(rx_data_qa[0:6]),
-                ],
-                0b1: [  # Assemble IB/QB: MSBs in high bits, LSBs in low bits.
-                    rx_data_ib[0: 6].eq(rx_data_half_i),
-                    rx_data_ib[6:12].eq(rx_data_ib[0:6]),
-                    rx_data_qb[0: 6].eq(rx_data_half_q),
-                    rx_data_qb[6:12].eq(rx_data_qb[0:6]),
-                ]
-            })
+            If(mode == AD9361PHY1R1T_MODE,
+                rx_data_ia[0: 6].eq(rx_data_half_i),
+                rx_data_ia[6:12].eq(rx_data_ia[0:6]),
+                rx_data_qa[0: 6].eq(rx_data_half_q),
+                rx_data_qa[6:12].eq(rx_data_qa[0:6]),
+                rx_data_ib.eq(0),
+                rx_data_qb.eq(0),
+            ).Else(
+                Case(rx_count[1], {
+                    0b0: [  # Assemble IA/QA: MSBs in high bits, LSBs in low bits.
+                        rx_data_ia[0: 6].eq(rx_data_half_i),
+                        rx_data_ia[6:12].eq(rx_data_ia[0:6]),
+                        rx_data_qa[0: 6].eq(rx_data_half_q),
+                        rx_data_qa[6:12].eq(rx_data_qa[0:6]),
+                    ],
+                    0b1: [  # Assemble IB/QB: MSBs in high bits, LSBs in low bits.
+                        rx_data_ib[0: 6].eq(rx_data_half_i),
+                        rx_data_ib[6:12].eq(rx_data_ib[0:6]),
+                        rx_data_qb[0: 6].eq(rx_data_half_q),
+                        rx_data_qb[6:12].eq(rx_data_qb[0:6]),
+                    ]
+                })
+            )
         ]
 
         # RX Source Interface.
         # --------------------
-        # Outputs assembled RX samples when valid (rx_count == 0).
+        # 1R1T: emit one IA/QA pair every 2 rfic cycles (when rx_count[0]==0,
+        # i.e. just after the MSB half has been latched). 2R2T: emit a full
+        # IA+QA+IB+QB beat every 4 rfic cycles (when rx_count == 0).
         self.sync.rfic += [
             source.valid.eq(0),
-            If(rx_count == 0,
-                source.valid.eq(1),
-                source.ia.eq(rx_data_ia),
-                source.qa.eq(rx_data_qa),
-                source.ib.eq(rx_data_ib),
-                source.qb.eq(rx_data_qb),
+            If(mode == AD9361PHY1R1T_MODE,
+                If(rx_count[0] == 0,
+                    source.valid.eq(1),
+                    source.ia.eq(rx_data_ia),
+                    source.qa.eq(rx_data_qa),
+                    source.ib.eq(0),
+                    source.qb.eq(0),
+                )
+            ).Else(
+                If(rx_count == 0,
+                    source.valid.eq(1),
+                    source.ia.eq(rx_data_ia),
+                    source.qa.eq(rx_data_qa),
+                    source.ib.eq(rx_data_ib),
+                    source.qb.eq(rx_data_qb),
+                )
             )
         ]
 
@@ -231,10 +265,27 @@ class AD9361PHY(LiteXModule):
 
         # TX Sink Interface.
         # ------------------
-        # Accepts new TX samples every 4 RFIC clock cycles (tx_count == 0).
+        # 1R1T: accept a new IA/QA sample every 2 rfic cycles
+        # (tx_count[0] == 0). 2R2T: every 4 rfic cycles (tx_count == 0).
+        # In 1R1T we hold tx_count[1] = 0 so the data selector below
+        # only ever emits the IA/QA half of the 4-cycle pattern, which
+        # is what the AD9361 expects in 1R1T DDR mode.
         tx_count = Signal(2)
-        self.sync.rfic += tx_count.eq(tx_count + 1)
-        self.comb += sink.ready.eq(tx_count == 0)  # Ready for new data at cycle 0.
+        self.sync.rfic += [
+            If(mode == AD9361PHY1R1T_MODE,
+                tx_count[0].eq(~tx_count[0]),
+                tx_count[1].eq(0),
+            ).Else(
+                tx_count.eq(tx_count + 1),
+            )
+        ]
+        self.comb += [
+            If(mode == AD9361PHY1R1T_MODE,
+                sink.ready.eq(tx_count[0] == 0),
+            ).Else(
+                sink.ready.eq(tx_count == 0),
+            )
+        ]
 
         # TX Data Latching.
         # -----------------
