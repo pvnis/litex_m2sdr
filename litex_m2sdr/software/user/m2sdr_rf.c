@@ -66,7 +66,9 @@ static void help(void)
            "      --bist-rx-tone     Run RX tone test.\n"
            "      --bist-prbs        Run PRBS test.\n"
            "      --calibrate-delay  Scan and program FPGA <-> AD9361 RX/TX clock/data delays using PRBS.\n"
-           "      --bist-tone-freq HZ Set the BIST tone frequency in Hz (default: %d).\n",
+           "      --bist-tone-freq HZ Set the BIST tone frequency in Hz (default: %d).\n"
+           "      --timed-tx-counters       Read gateware timed-TX counters and exit.\n"
+           "      --timed-tx-reset-counters Reset timed-TX counters, read them, and exit.\n",
            DEFAULT_REFCLK_FREQ,
            DEFAULT_SAMPLERATE,
            DEFAULT_BANDWIDTH,
@@ -92,11 +94,41 @@ static int parse_i64_option(const char *name, const char *value, int64_t *out)
     return -1;
 }
 
+static const char *timed_tx_state_name(uint32_t state)
+{
+    switch (state) {
+    case 0: return "IDLE";
+    case 1: return "WAIT";
+    case 2: return "STREAM";
+    case 3: return "DROP";
+    default: return "UNKNOWN";
+    }
+}
+
+static void print_timed_tx_counters(const struct m2sdr_timed_tx_counters *counters)
+{
+    printf("Timed TX Counters\n");
+    printf("  Late Bursts     : %" PRIu32 "\n", counters->late_count);
+    printf("  Underruns       : %" PRIu32 "\n", counters->underrun_count);
+    printf("  Dropped Bursts  : %" PRIu32 "\n", counters->drop_count);
+    printf("  Descriptors     : %" PRIu32 "\n", counters->ts_pop_count);
+    printf("  State           : %s (%" PRIu32 ")\n",
+           timed_tx_state_name(counters->state), counters->state);
+    printf("  Armed Timestamp : %" PRIu64 " samples\n", counters->armed_ts);
+    printf("  Armed Has Time  : %s\n", counters->armed_has_time ? "yes" : "no");
+    if (counters->sample_counter_valid)
+        printf("  Sample Counter  : %" PRIu64 " samples\n", counters->sample_counter);
+    else
+        printf("  Sample Counter  : unavailable\n");
+}
+
 int main(int argc, char **argv)
 {
     int c;
     struct m2sdr_config cfg;
     struct m2sdr_cli_device cli_dev;
+    bool show_timed_tx_counters = false;
+    bool reset_timed_tx_counters = false;
     int option_index = 0;
     static struct option options[] = {
         { "help", no_argument, NULL, 'h' },
@@ -140,6 +172,14 @@ int main(int argc, char **argv)
         { "dig_tune_prbs", no_argument, NULL, 20 },
         { "bist-tone-freq", required_argument, NULL, 19 },
         { "bist_tone_freq", required_argument, NULL, 19 },
+        { "timed-tx-counters", no_argument, NULL, 21 },
+        { "timed_tx_counters", no_argument, NULL, 21 },
+        { "gateware-counters", no_argument, NULL, 21 },
+        { "counters", no_argument, NULL, 21 },
+        { "timed-tx-reset-counters", no_argument, NULL, 22 },
+        { "timed_tx_reset_counters", no_argument, NULL, 22 },
+        { "reset-counters", no_argument, NULL, 22 },
+        { "reset_counters", no_argument, NULL, 22 },
         { NULL, 0, NULL, 0 }
     };
     m2sdr_config_init(&cfg);
@@ -263,6 +303,13 @@ int main(int argc, char **argv)
         case 20:
             cfg.calibrate_interface_delay = true;
             break;
+        case 21:
+            show_timed_tx_counters = true;
+            break;
+        case 22:
+            reset_timed_tx_counters = true;
+            show_timed_tx_counters = true;
+            break;
         default:
             exit(1);
         }
@@ -275,6 +322,31 @@ int main(int argc, char **argv)
     if (m2sdr_open(&dev, m2sdr_cli_device_id(&cli_dev)) != 0) {
         fprintf(stderr, "Could not open device: %s\n", m2sdr_cli_device_id(&cli_dev));
         return 1;
+    }
+
+    if (show_timed_tx_counters) {
+        struct m2sdr_timed_tx_counters counters;
+        int rc;
+
+        if (reset_timed_tx_counters) {
+            rc = m2sdr_reset_timed_tx_counters(dev);
+            if (rc != 0) {
+                fprintf(stderr, "m2sdr_reset_timed_tx_counters failed: %s\n", m2sdr_strerror(rc));
+                m2sdr_close(dev);
+                return 1;
+            }
+            printf("Timed TX counters reset.\n");
+        }
+
+        rc = m2sdr_get_timed_tx_counters(dev, &counters);
+        if (rc != 0) {
+            fprintf(stderr, "m2sdr_get_timed_tx_counters failed: %s\n", m2sdr_strerror(rc));
+            m2sdr_close(dev);
+            return 1;
+        }
+        print_timed_tx_counters(&counters);
+        m2sdr_close(dev);
+        return 0;
     }
 
     {

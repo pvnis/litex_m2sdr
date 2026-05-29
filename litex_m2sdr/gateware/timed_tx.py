@@ -97,6 +97,11 @@ class TimedTXArbiter(LiteXModule):
             description="HAS_TIME bit of the currently-armed descriptor.")
         self._ts_pop_count = CSRStatus(32,
             description="Total number of burst descriptors latched (running total).")
+        self._reset = CSRStorage(1, reset=0,
+            description="Write 1 to flush timed-TX FIFOs/FSM state and clear status counters.")
+
+        reset_req = Signal()
+        self.comb += reset_req.eq(self.reset | (self._reset.re & self._reset.storage))
 
         # # #
 
@@ -109,7 +114,7 @@ class TimedTXArbiter(LiteXModule):
         # Buffers sample frames so the arbiter can pace release.
         self.data_fifo = data_fifo = ResetInserter()(
             stream.SyncFIFO(dma_layout(data_width), data_fifo_depth))
-        self.comb += data_fifo.reset.eq(self.reset)
+        self.comb += data_fifo.reset.eq(reset_req)
         self.comb += sink.connect(data_fifo.sink)
 
         # Burst descriptor FIFO ---------------------------------------------------------------------
@@ -118,7 +123,7 @@ class TimedTXArbiter(LiteXModule):
             ("ts",       64),
             ("has_time",  1),
         ], ts_fifo_depth))
-        self.comb += ts_fifo.reset.eq(self.reset)
+        self.comb += ts_fifo.reset.eq(reset_req)
 
         # Status counters / latched state -----------------------------------------------------------
         late_count          = Signal(32)
@@ -142,8 +147,8 @@ class TimedTXArbiter(LiteXModule):
             self._ts_pop_count.status.eq(ts_pop_count),
         ]
 
-        # Counter-reset CSR clears state atomically.
-        self.sync += If(self._reset_counts.re & self._reset_counts.storage,
+        # Counter-reset CSR clears status; full reset also flushes FIFOs/FSM.
+        self.sync += If((self._reset_counts.re & self._reset_counts.storage) | reset_req,
             late_count.eq(0),
             underrun_count.eq(0),
             drop_count.eq(0),
@@ -219,39 +224,51 @@ class TimedTXArbiter(LiteXModule):
         )
 
         fsm.act("WAIT",
-            If(self._gap_fill.storage,
-                source.valid.eq(1),
-                source.first.eq(0),
-                source.last.eq(0),
-                source.data.eq(0),
-            ),
-            If(sample_count >= ts_reg,
-                NextState("STREAM"),
+            If(reset_req,
+                NextState("IDLE"),
+            ).Else(
+                If(self._gap_fill.storage,
+                    source.valid.eq(1),
+                    source.first.eq(0),
+                    source.last.eq(0),
+                    source.data.eq(0),
+                ),
+                If(sample_count >= ts_reg,
+                    NextState("STREAM"),
+                ),
             ),
         )
 
         fsm.act("STREAM",
-            data_fifo.source.connect(source),
-            If(data_fifo.source.valid & source.ready,
-                NextValue(burst_seen, 1),
-            ),
-            # Underrun: streaming has started and data_fifo went empty
-            # mid-burst.
-            If(burst_seen & data_fifo_was_valid & ~data_fifo.source.valid,
-                NextValue(underrun_count, underrun_count + 1),
-            ),
-            If(source.valid & source.ready & source.last,
-                NextValue(gap_fill_active, ts_has_time_r),
+            If(reset_req,
                 NextState("IDLE"),
+            ).Else(
+                data_fifo.source.connect(source),
+                If(data_fifo.source.valid & source.ready,
+                    NextValue(burst_seen, 1),
+                ),
+                # Underrun: streaming has started and data_fifo went empty
+                # mid-burst.
+                If(burst_seen & data_fifo_was_valid & ~data_fifo.source.valid,
+                    NextValue(underrun_count, underrun_count + 1),
+                ),
+                If(source.valid & source.ready & source.last,
+                    NextValue(gap_fill_active, ts_has_time_r),
+                    NextState("IDLE"),
+                ),
             ),
         )
 
         fsm.act("DROP",
-            # Drain the dropped DMA frame from the data FIFO.
-            data_fifo.source.ready.eq(1),
-            If(data_fifo.source.valid & data_fifo.source.last,
-                NextValue(drop_count, drop_count + 1),
-                NextValue(gap_fill_active, 0),
+            If(reset_req,
                 NextState("IDLE"),
+            ).Else(
+                # Drain the dropped DMA frame from the data FIFO.
+                data_fifo.source.ready.eq(1),
+                If(data_fifo.source.valid & data_fifo.source.last,
+                    NextValue(drop_count, drop_count + 1),
+                    NextValue(gap_fill_active, 0),
+                    NextState("IDLE"),
+                ),
             ),
         )

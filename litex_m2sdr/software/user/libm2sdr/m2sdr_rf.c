@@ -767,6 +767,23 @@ void M2SDR_WEAK gpio_set_value(unsigned gpio, int value)
     (void)value;
 }
 
+
+static int m2sdr_read_u64_csr(struct m2sdr_dev *dev, uint32_t addr, uint64_t *value)
+{
+    uint32_t hi = 0;
+    uint32_t lo = 0;
+
+    if (!dev || !value)
+        return M2SDR_ERR_INVAL;
+    if (m2sdr_reg_read(dev, addr + 0, &hi) != 0)
+        return M2SDR_ERR_IO;
+    if (m2sdr_reg_read(dev, addr + 4, &lo) != 0)
+        return M2SDR_ERR_IO;
+
+    *value = ((uint64_t)hi << 32) | lo;
+    return M2SDR_ERR_OK;
+}
+
 /* Public API */
 /*------------*/
 
@@ -803,6 +820,7 @@ void m2sdr_config_init(struct m2sdr_config *cfg)
 
 /* Bind an externally-initialized AD9361 instance to libm2sdr, primarily for
  * the Soapy integration path. */
+
 int m2sdr_rf_bind(struct m2sdr_dev *dev, void *phy)
 {
     if (!dev && phy)
@@ -818,6 +836,70 @@ int m2sdr_rf_bind(struct m2sdr_dev *dev, void *phy)
         tls_rf_dev = dev;
 
     return M2SDR_ERR_OK;
+}
+
+int m2sdr_get_timed_tx_counters(struct m2sdr_dev *dev, struct m2sdr_timed_tx_counters *counters)
+{
+#if defined(CSR_TIMED_TX_LATE_COUNT_ADDR) && defined(CSR_TIMED_TX_UNDERRUN_COUNT_ADDR) && \
+    defined(CSR_TIMED_TX_DROP_COUNT_ADDR) && defined(CSR_TIMED_TX_STATE_ADDR) && \
+    defined(CSR_TIMED_TX_ARMED_TS_ADDR) && defined(CSR_TIMED_TX_ARMED_HAS_TIME_ADDR) && \
+    defined(CSR_TIMED_TX_TS_POP_COUNT_ADDR)
+    uint32_t value = 0;
+    int rc = M2SDR_ERR_OK;
+
+    if (!dev || !counters)
+        return M2SDR_ERR_INVAL;
+
+    memset(counters, 0, sizeof(*counters));
+
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_LATE_COUNT_ADDR, &counters->late_count) != 0)
+        return M2SDR_ERR_IO;
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_UNDERRUN_COUNT_ADDR, &counters->underrun_count) != 0)
+        return M2SDR_ERR_IO;
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_DROP_COUNT_ADDR, &counters->drop_count) != 0)
+        return M2SDR_ERR_IO;
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_STATE_ADDR, &counters->state) != 0)
+        return M2SDR_ERR_IO;
+    rc = m2sdr_read_u64_csr(dev, CSR_TIMED_TX_ARMED_TS_ADDR, &counters->armed_ts);
+    if (rc != M2SDR_ERR_OK)
+        return rc;
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_ARMED_HAS_TIME_ADDR, &value) != 0)
+        return M2SDR_ERR_IO;
+    counters->armed_has_time = value != 0;
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_TS_POP_COUNT_ADDR, &counters->ts_pop_count) != 0)
+        return M2SDR_ERR_IO;
+
+#if defined(CSR_SAMPLE_COUNTER_CONTROL_ADDR) && defined(CSR_SAMPLE_COUNTER_READ_VALUE_ADDR) && \
+    defined(CSR_SAMPLE_COUNTER_CONTROL_READ_LATCH_OFFSET)
+    if (m2sdr_reg_write(dev, CSR_SAMPLE_COUNTER_CONTROL_ADDR,
+                        1u << CSR_SAMPLE_COUNTER_CONTROL_READ_LATCH_OFFSET) != 0)
+        return M2SDR_ERR_IO;
+    rc = m2sdr_read_u64_csr(dev, CSR_SAMPLE_COUNTER_READ_VALUE_ADDR, &counters->sample_counter);
+    if (rc != M2SDR_ERR_OK)
+        return rc;
+    counters->sample_counter_valid = true;
+#endif
+
+    return M2SDR_ERR_OK;
+#else
+    (void)dev;
+    (void)counters;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_reset_timed_tx_counters(struct m2sdr_dev *dev)
+{
+#if defined(CSR_TIMED_TX_RESET_COUNTS_ADDR)
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+    if (m2sdr_reg_write(dev, CSR_TIMED_TX_RESET_COUNTS_ADDR, 1) != 0)
+        return M2SDR_ERR_IO;
+    return M2SDR_ERR_OK;
+#else
+    (void)dev;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
 }
 
 /* Execute the full RF bring-up sequence: clocks, AD9361 init, rates, gains,

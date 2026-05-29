@@ -430,6 +430,67 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
 
     ad9361_set_no_ch_mode(ad9361_phy, _nChannels);
 
+    /* ad9361_set_no_ch_mode() rewrites AD9361 channel-mode state. Many
+     * Soapy clients configure rate/frequency/gain before setupStream(), so
+     * reapply the cached RF settings here after the final channel mode is
+     * known. Without this, TX descriptors can stream while the RF datapath
+     * stays effectively muted until the application happens to set RF again.
+     */
+    {
+        const double rate = (_tx_stream.samplerate > 0.0)
+            ? _tx_stream.samplerate
+            : _rx_stream.samplerate;
+        if (rate > 0.0) {
+            int rc = m2sdr_set_sample_rate(_dev, static_cast<int64_t>(rate / _rateMult));
+            if (rc != 0) {
+                SoapySDR::logf(SOAPY_SDR_ERROR,
+                    "m2sdr_set_sample_rate(reapply after channel mode) failed: %s",
+                    m2sdr_strerror(rc));
+            }
+            setSampleMode();
+        }
+
+        const double bw = (_tx_stream.bandwidth > 0.0)
+            ? _tx_stream.bandwidth
+            : _rx_stream.bandwidth;
+        if (bw > 0.0) {
+            int rc = m2sdr_set_bandwidth(_dev, static_cast<int64_t>(bw));
+            if (rc != 0) {
+                SoapySDR::logf(SOAPY_SDR_ERROR,
+                    "m2sdr_set_bandwidth(reapply after channel mode) failed: %s",
+                    m2sdr_strerror(rc));
+            }
+        }
+
+        if (_tx_stream.frequency > 0.0) {
+            int rc = m2sdr_set_frequency(_dev, M2SDR_TX,
+                static_cast<uint64_t>(_tx_stream.frequency));
+            if (rc != 0) {
+                SoapySDR::logf(SOAPY_SDR_ERROR,
+                    "m2sdr_set_frequency(TX reapply after channel mode) failed: %s",
+                    m2sdr_strerror(rc));
+            }
+        }
+        if (_rx_stream.frequency > 0.0) {
+            int rc = m2sdr_set_frequency(_dev, M2SDR_RX,
+                static_cast<uint64_t>(_rx_stream.frequency));
+            if (rc != 0) {
+                SoapySDR::logf(SOAPY_SDR_ERROR,
+                    "m2sdr_set_frequency(RX reapply after channel mode) failed: %s",
+                    m2sdr_strerror(rc));
+            }
+        }
+
+        for (size_t ch = 0; ch < 2; ++ch) {
+            int rc = m2sdr_set_tx_att(_dev, _tx_stream.gain[ch]);
+            if (rc != 0) {
+                SoapySDR::logf(SOAPY_SDR_ERROR,
+                    "m2sdr_set_tx_att(ch%zu reapply after channel mode) failed: %s",
+                    ch, m2sdr_strerror(rc));
+            }
+        }
+    }
+
     return direction == SOAPY_SDR_RX ? RX_STREAM : TX_STREAM;
 }
 
@@ -588,6 +649,21 @@ int SoapyLiteXM2SDR::activateStream(
         litex_m2sdr_writel(_dev, CSR_CROSSBAR_MUX_SEL_ADDR, 0);
         /* Configure the DMA engine for TX, but don't enable it yet. */
         litepcie_dma_reader(_fd, 0, &_tx_stream.hw_count, &_tx_stream.sw_count);
+        /* The kernel reuses the mmap TX ring across sessions. If a previous
+         * process exited before the idle cleanup cleared consumed headers, the
+         * LOOP-mode DMA reader can replay stale HAS_TIME descriptors as soon
+         * as it starts, causing startup-only late drops. With the reader
+         * stopped, it is safe to sanitize every slot before first release. */
+        _clearAllTXHeaderFlags();
+        /* Newer gateware exposes a real timed-TX reset that flushes the
+         * arbiter FIFOs/FSM, not just the status counters. Use it at the
+         * last quiet point before the first DMA release; old bitstreams keep
+         * the counter reset as a harmless fallback. */
+#if defined(CSR_TIMED_TX_RESET_ADDR)
+        litex_m2sdr_writel(_dev, CSR_TIMED_TX_RESET_ADDR, 1);
+#elif defined(CSR_TIMED_TX_RESET_COUNTS_ADDR)
+        litex_m2sdr_writel(_dev, CSR_TIMED_TX_RESET_COUNTS_ADDR, 1);
+#endif
         _tx_stream.user_count = _tx_stream.hw_count;
         _tx_stream.cleared_count = _tx_stream.hw_count;
         _tx_stream.reader_enabled = false;
@@ -660,6 +736,11 @@ int SoapyLiteXM2SDR::deactivateStream(
         /* Disable the DMA engine for TX. */
         litepcie_dma_reader(_fd, 0, &_tx_stream.hw_count, &_tx_stream.sw_count);
         _tx_stream.reader_enabled = false;
+#if defined(CSR_TIMED_TX_RESET_ADDR)
+        litex_m2sdr_writel(_dev, CSR_TIMED_TX_RESET_ADDR, 1);
+#elif defined(CSR_TIMED_TX_RESET_COUNTS_ADDR)
+        litex_m2sdr_writel(_dev, CSR_TIMED_TX_RESET_COUNTS_ADDR, 1);
+#endif
 #elif USE_LITEETH
         /* No-op for UDP helper. */
 #endif
