@@ -435,9 +435,16 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
      * reapply the cached RF settings here after the final channel mode is
      * known. Without this, TX descriptors can stream while the RF datapath
      * stays effectively muted until the application happens to set RF again.
+     *
+     * For sample rate and bandwidth, the AD9361 has a single value shared
+     * by TX and RX. We honor the direction being currently set up - the
+     * stream the caller is actively configuring - rather than blindly
+     * preferring TX. Otherwise an RX-only application that never set TX
+     * rate would force the chip back to the 30.72 MSPS init-time default
+     * and silently run at the wrong rate.
      */
     {
-        const double rate = (_tx_stream.samplerate > 0.0)
+        const double rate = (direction == SOAPY_SDR_TX)
             ? _tx_stream.samplerate
             : _rx_stream.samplerate;
         if (rate > 0.0) {
@@ -450,7 +457,7 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
             setSampleMode();
         }
 
-        const double bw = (_tx_stream.bandwidth > 0.0)
+        const double bw = (direction == SOAPY_SDR_TX)
             ? _tx_stream.bandwidth
             : _rx_stream.bandwidth;
         if (bw > 0.0) {
