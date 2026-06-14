@@ -17,6 +17,12 @@ modules.order
 __pycache__
 *.csv
 
+# OCUDU validation local secrets and run artifacts
+/litex_m2sdr/software/validation/ocudu/configs/*.local.conf
+/litex_m2sdr/software/validation/ocudu/configs/*.local.toml
+/litex_m2sdr/software/validation/ocudu/runs/
+/litex_m2sdr/software/validation/ocudu/tmp/
+
 # Local fetched dependencies and generated host-side binaries
 /wr-cores/
 /litex_m2sdr/software/user/cimgui/

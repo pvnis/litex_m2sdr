@@ -1,0 +1,43 @@
+gnb_id: 332
+
+cu_cp:
+  inactivity_timer: 7200
+  amf:
+    addr: 127.0.0.1
+    bind_addr: 127.0.0.2
+    supported_tracking_areas:
+      - tac: 1
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+                sd: 0
+
+ru_sdr:
+  device_driver: soapy
+  device_args: "driver=LiteXM2SDR"
+  expert_cfg:
+    tx_mode: continuous
+  srate: 11.52
+  otw_format: sc16
+  tx_gain: 0
+  rx_gain: 50
+  amplitude_control:
+    tx_gain_backoff: 30
+    enable_clipping: false
+
+cell_cfg:
+  dl_arfcn: 368500
+  band: 3
+  channel_bandwidth_MHz: 10
+  common_scs: 15
+  plmn: "00101"
+  tac: 1
+  pci: 1
+  prach:
+    prach_config_index: 1
+
+log:
+  filename: /tmp/gnb_m2sdr_band3_ota.log
+  all_level: info
+  broadcast_enabled: true

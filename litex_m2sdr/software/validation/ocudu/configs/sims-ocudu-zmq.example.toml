@@ -1,0 +1,8 @@
+# Example/test SIM credentials matching configs/ue-zmq-netns.template.conf.
+# Replace these with local test credentials in a private, untracked file.
+#
+# Do not commit real subscriber credentials.
+
+[imsi-001010000000001]
+ki = "00000000000000000000000000000000"
+opc = "00000000000000000000000000000000"
