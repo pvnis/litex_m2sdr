@@ -40,19 +40,40 @@ printf '5 packets transmitted, 5 received, 0%% packet loss\n' > "$tmp/dataplane.
 "$SCRIPT_DIR/summarize_zmq_run.sh" "$tmp" >/dev/null
 grep -q '"result":"PASS"' "$tmp/summary.json"
 
-cat > "$tmp/fake-m2sdr-util" <<'EOF'
-#!/usr/bin/env bash
-cat <<'CLOCKS'
-Meas.     Sys Clk          PCIe Clk         AD9361 Ref Clk   AD9361 Dat Clk   Time Ref Clk (MHz)
-1                  100.00           125.00            40.00             0.00           100.00
-CLOCKS
-EOF
-chmod +x "$tmp/fake-m2sdr-util"
-if M2SDR_UTIL="$tmp/fake-m2sdr-util" "$SCRIPT_DIR/check_m2sdr_clock_gate.sh" "$tmp/zero-clock.log" > "$tmp/zero-clock-result.log" 2>&1; then
-    echo "FAIL: clock gate accepted zero AD9361 Dat Clk" >&2
-    exit 1
-fi
-grep -q 'AD9361 Dat Clk is zero or unparsable' "$tmp/zero-clock-result.log"
+check_clock_fixture() {
+    local name="$1"
+    local expected="$2"
+    local fixture="$tmp/$name"
+    shift 2
+    {
+        echo '#!/usr/bin/env bash'
+        printf "printf '%%s\\\\n'"
+        printf " %q" "$@"
+        echo
+    } > "$fixture"
+    chmod +x "$fixture"
+    if M2SDR_UTIL="$fixture" "$SCRIPT_DIR/check_m2sdr_clock_gate.sh" "$tmp/$name.log" > "$tmp/$name-result.log" 2>&1; then
+        actual=PASS
+    else
+        actual=FAIL
+    fi
+    [[ "$actual" == "$expected" ]] || {
+        echo "FAIL: $name clock fixture expected $expected, got $actual" >&2
+        cat "$tmp/$name-result.log" >&2
+        exit 1
+    }
+}
+table_header='Meas. Sys Clk PCIe Clk AD9361 Ref Clk AD9361 Dat Clk Time Ref Clk'
+check_clock_fixture named-line-non-zero PASS \
+    'Sys Clk 125.00' 'PCIe Clk 124.71' 'AD9361 Ref Clk 38.40' \
+    'AD9361 Dat Clk 122.88' 'Time Ref Clk 100.00'
+check_clock_fixture named-line-zero FAIL \
+    'Sys Clk 125.00' 'PCIe Clk 124.71' 'AD9361 Ref Clk 38.40' \
+    'AD9361 Dat Clk 0.00' 'Time Ref Clk 100.00'
+check_clock_fixture table-non-zero PASS \
+    "$table_header" '1 100.00 125.00 40.00 122.88 100.00'
+check_clock_fixture table-zero FAIL \
+    "$table_header" '1 100.00 125.00 40.00 0.00 100.00'
 
 if "$SCRIPT_DIR/run_zmq_ocudu_dataplane.sh" > "$tmp/refusal.log" 2>&1; then
     echo "FAIL: ZMQ runner accepted missing private configs" >&2

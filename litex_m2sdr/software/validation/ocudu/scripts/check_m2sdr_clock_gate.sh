@@ -16,14 +16,24 @@ for clock in "Sys Clk" "PCIe Clk" "AD9361 Ref Clk" "AD9361 Dat Clk" "Time Ref Cl
     grep -Fq "$clock" "$LOG" || { echo "FAIL: missing $clock in $LOG" >&2; exit 1; }
 done
 if ! awk '
+    function valid_positive(value) {
+        return value ~ /^[0-9]+([.][0-9]+)?$/ && (value + 0) > 0
+    }
+    $1 == "AD9361" && $2 == "Dat" && $3 == "Clk" {
+        measurements++
+        if (NF != 4 || !valid_positive($4)) {
+            invalid = 1
+        }
+        next
+    }
     /^[[:space:]]*[0-9]+[[:space:]]/ {
         measurements++
-        if ($5 !~ /^[0-9]+([.][0-9]+)?$/ || ($5 + 0) <= 0) {
-            exit 1
+        if (NF < 6 || !valid_positive($5)) {
+            invalid = 1
         }
     }
     END {
-        if (measurements == 0) {
+        if (measurements == 0 || invalid) {
             exit 1
         }
     }
