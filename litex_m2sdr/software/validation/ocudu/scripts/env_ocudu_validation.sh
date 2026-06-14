@@ -8,10 +8,23 @@ export WORKSPACE_ROOT="${WORKSPACE_ROOT:-$(cd "$M2SDR_REPO/.." && pwd)}"
 export OCUDU_REPO="${OCUDU_REPO:-$WORKSPACE_ROOT/ocudu}"
 export QCORE_REPO="${QCORE_REPO:-$WORKSPACE_ROOT/qcore}"
 export SRSRAN_4G_REPO="${SRSRAN_4G_REPO:-$WORKSPACE_ROOT/srsRAN_4G}"
-export OCUDU_GNB_BIN="${OCUDU_GNB_BIN:-$OCUDU_REPO/build/apps/gnb/gnb}"
+
+_ocudu_validation_preferred_binary() {
+    if [[ -x "$1" ]]; then
+        printf '%s' "$1"
+    else
+        printf '%s' "$2"
+    fi
+}
+export OCUDU_GNB_BIN="${OCUDU_GNB_BIN:-$(_ocudu_validation_preferred_binary "$OCUDU_REPO/build-clion/apps/gnb/gnb" "$OCUDU_REPO/build/apps/gnb/gnb")}"
 export QCORE_BIN="${QCORE_BIN:-$QCORE_REPO/target/debug/qcore}"
-export SRSUE_BIN="${SRSUE_BIN:-$SRSRAN_4G_REPO/build/srsue/src/srsue}"
-export SRSRAN_RF_PLUGIN_DIR="${SRSRAN_RF_PLUGIN_DIR:-$SRSRAN_4G_REPO/build/lib/src/phy/rf}"
+export SRSUE_BIN="${SRSUE_BIN:-$(_ocudu_validation_preferred_binary "$SRSRAN_4G_REPO/build-clion/srsue/src/srsue" "$SRSRAN_4G_REPO/build/srsue/src/srsue")}"
+if [[ "$SRSUE_BIN" == "$SRSRAN_4G_REPO/build-clion/"* ]]; then
+    export SRSRAN_RF_PLUGIN_DIR="${SRSRAN_RF_PLUGIN_DIR:-$SRSRAN_4G_REPO/build-clion/lib/src/phy/rf}"
+else
+    export SRSRAN_RF_PLUGIN_DIR="${SRSRAN_RF_PLUGIN_DIR:-$SRSRAN_4G_REPO/build/lib/src/phy/rf}"
+fi
+unset -f _ocudu_validation_preferred_binary
 export M2SDR_SW="${M2SDR_SW:-$M2SDR_REPO/litex_m2sdr/software}"
 export M2SDR_UTIL="${M2SDR_UTIL:-$M2SDR_SW/user/m2sdr_util}"
 export VALIDATION_RUN_ROOT="${VALIDATION_RUN_ROOT:-$VALIDATION_ROOT/runs}"

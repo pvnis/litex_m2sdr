@@ -40,6 +40,20 @@ printf '5 packets transmitted, 5 received, 0%% packet loss\n' > "$tmp/dataplane.
 "$SCRIPT_DIR/summarize_zmq_run.sh" "$tmp" >/dev/null
 grep -q '"result":"PASS"' "$tmp/summary.json"
 
+cat > "$tmp/fake-m2sdr-util" <<'EOF'
+#!/usr/bin/env bash
+cat <<'CLOCKS'
+Meas.     Sys Clk          PCIe Clk         AD9361 Ref Clk   AD9361 Dat Clk   Time Ref Clk (MHz)
+1                  100.00           125.00            40.00             0.00           100.00
+CLOCKS
+EOF
+chmod +x "$tmp/fake-m2sdr-util"
+if M2SDR_UTIL="$tmp/fake-m2sdr-util" "$SCRIPT_DIR/check_m2sdr_clock_gate.sh" "$tmp/zero-clock.log" > "$tmp/zero-clock-result.log" 2>&1; then
+    echo "FAIL: clock gate accepted zero AD9361 Dat Clk" >&2
+    exit 1
+fi
+grep -q 'AD9361 Dat Clk is zero or unparsable' "$tmp/zero-clock-result.log"
+
 if "$SCRIPT_DIR/run_zmq_ocudu_dataplane.sh" > "$tmp/refusal.log" 2>&1; then
     echo "FAIL: ZMQ runner accepted missing private configs" >&2
     exit 1

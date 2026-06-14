@@ -17,7 +17,10 @@ workspace/
 ```
 
 All important paths can be overridden before sourcing
-`scripts/env_ocudu_validation.sh`. Run
+`scripts/env_ocudu_validation.sh`. The defaults prefer executable OCUDU and
+srsUE binaries under `build-clion/`, then fall back to `build/`; qcore defaults
+to `target/debug/qcore`. Set `OCUDU_GNB_BIN`, `SRSUE_BIN`, `QCORE_BIN`, and
+`SRSRAN_RF_PLUGIN_DIR` explicitly for other build layouts. Run
 `ocudu_validation_print_env` afterward to inspect the resolved paths. The
 sourceable file deliberately does not enable strict shell mode because doing so
 would silently change the behavior of the caller's interactive shell or script.

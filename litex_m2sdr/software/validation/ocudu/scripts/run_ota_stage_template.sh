@@ -77,8 +77,8 @@ sudo -v
 (cd "$QCORE_REPO" && sudo -n ./setup-routing "$EXTERNAL_IFACE") >> "$RUN_DIR/setup.log" 2>&1
 
 setsid sudo -n env RUST_LOG=info "$QCORE_BIN" --mcc 001 --mnc 01 \
-    --sim-cred-file "$SIM_FILE" --local-ip 127.0.0.1 --lan-interface-name "$EXTERNAL_IFACE" \
-    --no-dhcp < /dev/null > "$RUN_DIR/qcore.log" 2>&1 &
+    --sim-cred-file "$SIM_FILE" --local-ip 127.0.0.1 --no-dhcp \
+    < /dev/null > "$RUN_DIR/qcore.log" 2>&1 &
 QCORE_PID=$!; echo "qcore $QCORE_PID" >> "$RUN_DIR/pids.txt"
 sleep 3
 setsid "$OCUDU_GNB_BIN" -c "$RUN_DIR/gnb-run.yml" < /dev/null > "$RUN_DIR/gnb.log" 2>&1 &

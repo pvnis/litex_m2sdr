@@ -65,7 +65,7 @@ The known ZMQ cell and matching private subscriber provisioning complete attach 
 See RESULT.md and summary.json.
 EOF
 {
-    printf 'qcore command: %q --mcc 001 --mnc 01 --sim-cred-file <redacted> --local-ip 127.0.0.1 --lan-interface-name %q --no-dhcp\n' "$QCORE_BIN" "$EXTERNAL_IFACE"
+    printf 'qcore command: %q --mcc 001 --mnc 01 --sim-cred-file <redacted> --local-ip 127.0.0.1 --no-dhcp\n' "$QCORE_BIN"
     printf 'gNB command: %q -c %q\n' "$OCUDU_GNB_BIN" "$GNB_CONF"
     printf 'srsUE command: %q <private-config>\n' "$SRSUE_BIN"
     printf 'gNB config sha256: %s\n' "$(sha256sum "$GNB_CONF" | awk '{print $1}')"
@@ -90,7 +90,7 @@ sudo -n ip netns add ue1 >> "$RUN_DIR/setup.log" 2>&1
 
 setsid sudo -n env RUST_LOG=info "$QCORE_BIN" \
     --mcc 001 --mnc 01 --sim-cred-file "$SIM_FILE" --local-ip 127.0.0.1 \
-    --lan-interface-name "$EXTERNAL_IFACE" --no-dhcp < /dev/null > "$RUN_DIR/qcore.log" 2>&1 &
+    --no-dhcp < /dev/null > "$RUN_DIR/qcore.log" 2>&1 &
 QCORE_PID=$!
 echo "qcore $QCORE_PID" >> "$RUN_DIR/pids.txt"
 sleep 3

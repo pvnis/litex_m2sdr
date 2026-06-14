@@ -7,6 +7,11 @@ sibling `ocudu`, `qcore`, and `srsRAN_4G` checkouts. Paths and timeouts are
 environment-overridable. It assumes the binaries and the local M2SDR Soapy
 plugin have already been built.
 
+The defaults prefer executable OCUDU and srsUE binaries in `build-clion/`, with
+`build/` as fallback, and qcore at `target/debug/qcore`. Override
+`OCUDU_GNB_BIN`, `SRSUE_BIN`, `QCORE_BIN`, or `SRSRAN_RF_PLUGIN_DIR` for a
+different build layout.
+
 Prepare private UE and qcore SIM configs from the committed templates. Keep them
 outside version control with mode `0600`; IMSI, K, OPc, PLMN, and MNC must
 match. The ZMQ baseline is n78, ARFCN 626000, SSB ARFCN 625632, 20 MHz, SCS 30,
