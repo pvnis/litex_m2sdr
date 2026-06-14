@@ -113,6 +113,7 @@ done
 
 {
     sudo -n ip netns exec ue1 ip address show
+    sudo -n ip netns exec ue1 ip -o -4 address show dev tun_ue1
     sudo -n ip netns exec ue1 ip route show
 } > "$RUN_DIR/checks.txt" 2>&1 || true
 sudo -n ip netns exec ue1 ip route replace default dev tun_ue1 >> "$RUN_DIR/setup.log" 2>&1 || true
