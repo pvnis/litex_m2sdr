@@ -127,6 +127,22 @@ static constexpr uint64_t RX_HEADER_SYNC_VALUE = 0x5aa5'5aa5'5aa5'5aa5ULL;
 static constexpr uint64_t TX_FLAG_HAS_TIME     = 1ULL << 63;
 static constexpr uint64_t TX_FLAG_END_BURST    = 1ULL << 62;
 
+
+static bool m2sdr_env_disables_litepcie_zero_copy()
+{
+    const char *v = std::getenv("M2SDR_LITEPCIE_ZERO_COPY");
+    if (!v || !*v)
+        return false;
+
+    return std::strcmp(v, "0") == 0 ||
+           std::strcmp(v, "false") == 0 ||
+           std::strcmp(v, "FALSE") == 0 ||
+           std::strcmp(v, "off") == 0 ||
+           std::strcmp(v, "OFF") == 0 ||
+           std::strcmp(v, "no") == 0 ||
+           std::strcmp(v, "NO") == 0;
+}
+
 static inline long long ns_to_samples(double sample_rate, long long ns)
 {
     if (sample_rate <= 0.0) return 0;
@@ -196,7 +212,11 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
         _rx_stream.dma.use_reader = 0;
         _rx_stream.dma.use_writer = 1;
         _rx_stream.dma.loopback   = 0;
-        _rx_stream.dma.zero_copy  = 1;
+        _rx_stream.dma.zero_copy  = m2sdr_env_disables_litepcie_zero_copy() ? 0 : 1;
+        if (!_rx_stream.dma.zero_copy) {
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                "LitePCIe RX zero-copy disabled by M2SDR_LITEPCIE_ZERO_COPY=0; using read() copy path");
+        }
         if (litepcie_dma_init(&_rx_stream.dma, "", _rx_stream.dma.zero_copy) < 0)
             throw std::runtime_error("DMA Writer/RX not available (litepcie_dma_init failed).");
 
@@ -325,7 +345,11 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
         _tx_stream.dma.use_reader = 1;
         _tx_stream.dma.use_writer = 0;
         _tx_stream.dma.loopback   = 0;
-        _tx_stream.dma.zero_copy  = 1;
+        _tx_stream.dma.zero_copy  = m2sdr_env_disables_litepcie_zero_copy() ? 0 : 1;
+        if (!_tx_stream.dma.zero_copy) {
+            SoapySDR_logf(SOAPY_SDR_WARNING,
+                "LitePCIe TX zero-copy disabled by M2SDR_LITEPCIE_ZERO_COPY=0; using write() copy path");
+        }
         if (litepcie_dma_init(&_tx_stream.dma, "", _tx_stream.dma.zero_copy) < 0)
             throw std::runtime_error("DMA Reader/TX not available (litepcie_dma_init failed).");
 
@@ -1771,6 +1795,31 @@ int SoapyLiteXM2SDR::_dmaAcquireRead(
     };
 
     auto append_dma_buffer = [&]() -> int {
+        /*
+         * Non-zero-copy mode does not expose the kernel DMA ring through
+         * _rx_stream.buf. It must drive liblitepcie's read() path, then pull
+         * populated userspace buffers with litepcie_dma_next_read_buffer().
+         */
+        if (!_rx_stream.dma.zero_copy) {
+            _rx_stream.dma.writer_enable = 1;
+            litepcie_dma_process(&_rx_stream.dma);
+
+            auto &q = _rx_stream.rx_reframe_buf;
+            size_t appended = 0;
+
+            while (true) {
+                char *copy_buf = litepcie_dma_next_read_buffer(&_rx_stream.dma);
+                if (!copy_buf)
+                    break;
+
+                const uint8_t *raw = reinterpret_cast<const uint8_t *>(copy_buf);
+                q.insert(q.end(), raw, raw + _rx_stream.dma.mmap_dma_info.dma_rx_buf_size);
+                appended++;
+            }
+
+            return appended ? 0 : SOAPY_SDR_TIMEOUT;
+        }
+
         int buffers_available = _rx_stream.hw_count - _rx_stream.user_count;
         assert(buffers_available >= 0);
         if (buffers_available == 0 || DETECT_EVERY_OVERFLOW) {

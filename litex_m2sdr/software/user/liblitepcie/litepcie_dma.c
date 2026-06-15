@@ -89,9 +89,16 @@ int litepcie_dma_init(struct litepcie_dma_ctrl *dma, const char *device_name, ui
 
     litepcie_dma_set_loopback(dma->fds.fd, dma->loopback);
 
+    /*
+     * The buffer geometry is needed by users above liblitepcie even when
+     * zero-copy is disabled. In copy mode the userspace buffers are allocated
+     * here, but Soapy still needs dma_rx/tx_buf_size and dma_rx/tx_buf_count
+     * to size its packet pool and MTU correctly.
+     */
+    checked_ioctl(dma->fds.fd, LITEPCIE_IOCTL_MMAP_DMA_INFO, &dma->mmap_dma_info);
+
     if (dma->zero_copy) {
-        /* if mmap: get it from the kernel */
-        checked_ioctl(dma->fds.fd, LITEPCIE_IOCTL_MMAP_DMA_INFO, &dma->mmap_dma_info);
+        /* if mmap: map kernel coherent DMA buffers into userspace */
         if (dma->use_writer) {
             dma->buf_rd = mmap(NULL, DMA_BUFFER_TOTAL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
                                dma->fds.fd, dma->mmap_dma_info.dma_rx_buf_offset);
@@ -145,7 +152,7 @@ void litepcie_dma_cleanup(struct litepcie_dma_ctrl *dma)
             dma->buf_wr = NULL;
         }
         if (dma->use_writer) {
-            munmap(dma->buf_rd, dma->mmap_dma_info.dma_tx_buf_size * dma->mmap_dma_info.dma_tx_buf_count);
+            munmap(dma->buf_rd, dma->mmap_dma_info.dma_rx_buf_size * dma->mmap_dma_info.dma_rx_buf_count);
             dma->buf_rd = NULL;
         }
     } else {
@@ -176,7 +183,7 @@ void litepcie_dma_process(struct litepcie_dma_ctrl *dma)
 
     /* polling */
     ret = poll(&dma->fds, 1, 100);
-    if (poll < 0) {
+    if (ret < 0) {
         perror("poll");
         return;
     } else if (ret == 0) {
