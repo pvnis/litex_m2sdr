@@ -18,7 +18,11 @@ timeout 30 "$M2SDR_UTIL" scratch-test > "$RUN_DIR/scratch-test.log" 2>&1 && scra
 "$SCRIPT_DIR/check_m2sdr_clock_gate.sh" "$RUN_DIR/clk-test.log" > "$RUN_DIR/clock-gate.log" 2>&1 && clock=PASS
 timeout 30 SoapySDRUtil --info > "$RUN_DIR/soapy-info.log" 2>&1 || true
 timeout 30 SoapySDRUtil '--find=driver=LiteXM2SDR' > "$RUN_DIR/soapy-find.log" 2>&1 || true
-grep -q 'LiteXM2SDR' "$RUN_DIR/soapy-find.log" && soapy=PASS
+if grep -q 'Found device' "$RUN_DIR/soapy-find.log" && \
+   grep -q 'driver.*LiteXM2SDR\|LiteXM2SDR' "$RUN_DIR/soapy-find.log" && \
+   ! grep -q 'No devices found' "$RUN_DIR/soapy-find.log"; then
+  soapy=PASS
+fi
 command -v bladeRF-cli >/dev/null && timeout 30 bladeRF-cli -e 'version; info' > "$RUN_DIR/bladerf-info.log" 2>&1 || true
 
 result=FAIL
