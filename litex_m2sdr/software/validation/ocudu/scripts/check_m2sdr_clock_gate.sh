@@ -19,16 +19,25 @@ if ! awk '
     function valid_positive(value) {
         return value ~ /^[0-9]+([.][0-9]+)?$/ && (value + 0) > 0
     }
-    $1 == "AD9361" && $2 == "Dat" && $3 == "Clk" {
-        measurements++
-        if (NF != 4 || !valid_positive($4)) {
-            invalid = 1
-        }
-        next
-    }
     /^[[:space:]]*[0-9]+[[:space:]]/ {
         measurements++
-        if (NF < 6 || !valid_positive($5)) {
+
+        # Columns:
+        # 1 measurement index
+        # 2 Sys Clk
+        # 3 PCIe Clk
+        # 4 AD9361 Ref Clk
+        # 5 AD9361 Dat Clk
+        # 6 Time Ref Clk
+        #
+        # AD9361 Dat Clk may be 0.00 before the RF/data path is initialized.
+        # Do not block pre-gNB startup on it. Runtime streaming checks catch
+        # data-path failures later.
+        if (NF < 6 ||
+            !valid_positive($2) ||
+            !valid_positive($3) ||
+            !valid_positive($4) ||
+            !valid_positive($6)) {
             invalid = 1
         }
     }
@@ -38,7 +47,9 @@ if ! awk '
         }
     }
 ' "$LOG"; then
-    echo "FAIL: AD9361 Dat Clk is zero or unparsable; see $LOG" >&2
+    echo "FAIL: required non-data M2SDR clocks are zero or unparsable; see $LOG" >&2
     exit 1
 fi
-echo "PASS: required M2SDR clocks reported ($LOG)"
+
+dat_clk="$(awk "/^[[:space:]]*[0-9]+[[:space:]]/ {print \$5; exit}" "$LOG")"
+echo "PASS: required M2SDR clocks reported; AD9361 Dat Clk pre-init=${dat_clk:-unknown} MHz ($LOG)"

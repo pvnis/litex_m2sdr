@@ -49,12 +49,19 @@ cp "$GNB_CONF" "$RUN_DIR/gnb-run.yml"
     printf 'UE config sha256: %s\n' "$(sha256sum "$UE_CONF" | awk '{print $1}')"
     printf 'qcore SIM file sha256: %s\n' "$(sha256sum "$SIM_FILE" | awk '{print $1}')"
 } > "$RUN_DIR/commands-and-checksums.txt"
+NETWORK_SETUP_STARTED=0
+
 cleanup() {
     set +e
     for pid in ${SRSUE_PID:-} ${GNB_PID:-} ${QCORE_PID:-}; do
+        [[ -n "${pid:-}" ]] || continue
         sudo -n kill -TERM -- "-$pid" 2>/dev/null || kill -TERM -- "-$pid" 2>/dev/null || true
     done
-    "$SCRIPT_DIR/cleanup_zmq_ocudu.sh" --external-iface "$EXTERNAL_IFACE" >> "$RUN_DIR/setup.log" 2>&1 || true
+    if [[ "${NETWORK_SETUP_STARTED:-0}" == "1" || -n "${QCORE_PID:-}" || -n "${GNB_PID:-}" || -n "${SRSUE_PID:-}" ]]; then
+        "$SCRIPT_DIR/cleanup_zmq_ocudu.sh" --external-iface "$EXTERNAL_IFACE" >> "$RUN_DIR/setup.log" 2>&1 || true
+    else
+        echo "Skipping qcore network cleanup: qcore/routing/gNB startup was not reached." >> "$RUN_DIR/setup.log" 2>&1 || true
+    fi
     if [[ ! -f "$RUN_DIR/RESULT.md" ]]; then
         cat > "$RUN_DIR/RESULT.md" <<EOF
 # OTA stage result
@@ -72,8 +79,20 @@ trap cleanup EXIT INT TERM
 "$SCRIPT_DIR/check_m2sdr_clock_gate.sh" "$RUN_DIR/clk-test.log" | tee "$RUN_DIR/clock-gate.log"
 "$SCRIPT_DIR/collect_host_state.sh" "$RUN_DIR" > "$RUN_DIR/collect-host-state.log" 2>&1
 
-sudo -v
-"$SCRIPT_DIR/cleanup_zmq_ocudu.sh" --external-iface "$EXTERNAL_IFACE" >> "$RUN_DIR/setup.log" 2>&1
+# Non-interactive: the caller must prime sudo before detached launch.
+sudo -n true
+NETWORK_SETUP_STARTED=1
+{
+    echo "===== pre-clean qcore/OCUDU network state ====="
+    date --iso-8601=seconds
+} >> "$RUN_DIR/setup.log" 2>&1
+if ! "$SCRIPT_DIR/cleanup_zmq_ocudu.sh" --external-iface "$EXTERNAL_IFACE" >> "$RUN_DIR/setup.log" 2>&1; then
+    echo "WARN: cleanup_zmq_ocudu.sh returned nonzero during pre-clean; continuing to setup-routing." >> "$RUN_DIR/setup.log" 2>&1
+fi
+{
+    echo "===== qcore setup-routing ====="
+    date --iso-8601=seconds
+} >> "$RUN_DIR/setup.log" 2>&1
 (cd "$QCORE_REPO" && sudo -n ./setup-routing "$EXTERNAL_IFACE") >> "$RUN_DIR/setup.log" 2>&1
 
 setsid sudo -n env RUST_LOG=info "$QCORE_BIN" --mcc 001 --mnc 01 \

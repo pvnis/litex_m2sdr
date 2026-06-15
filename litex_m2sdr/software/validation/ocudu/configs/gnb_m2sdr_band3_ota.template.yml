@@ -17,7 +17,7 @@ ru_sdr:
   device_driver: soapy
   device_args: "driver=LiteXM2SDR"
   expert_cfg:
-    tx_mode: continuous
+    tx_mode: discontinuous
   srate: 11.52
   otw_format: sc16
   tx_gain: 0
