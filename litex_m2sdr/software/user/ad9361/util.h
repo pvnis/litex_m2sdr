@@ -88,7 +88,16 @@
 #define printk(format, ...)			({ if (0) printf(format, ## __VA_ARGS__); })
 #endif
 
+/*
+ * Keep this placeholder non-empty.
+ *
+ * GCC accepts empty C structs as a zero-size extension, while C++ gives an
+ * empty struct size 1. struct spi_device is shared between the AD9361 C code
+ * and the Soapy C++ bridge; if this struct is empty, both languages disagree
+ * on the offset of spi_device.id_no and the Soapy SPI callback reads garbage.
+ */
 struct device {
+	uint8_t dummy;
 };
 
 struct spi_device {

@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <stdint.h>
+#include <stdlib.h>
 
 #include "libm2sdr.h"
 #include "liblitepcie.h"
@@ -53,25 +54,49 @@ void m2sdr_ad9361_spi_init(void *conn, uint8_t reset) {
 /* m2sdr_ad9361_spi_xfer */
 /*-----------------------*/
 
-void m2sdr_ad9361_spi_xfer(void *conn, uint8_t len, uint8_t *mosi, uint8_t *miso) {
+int m2sdr_ad9361_spi_xfer(void *conn, uint8_t len, uint8_t *mosi, uint8_t *miso) {
     (void)len;
 
     /* The AD9361 bridge always transfers 24 bits on this platform. The first
      * control byte encodes both the R/W bit and the high register address
      * bits, so we only need to distinguish read from write here. */
     bool is_write = (mosi[0] & 0x80) != 0;
+    uint32_t mosi_word = ((uint32_t)mosi[0] << 16) | ((uint32_t)mosi[1] << 8) | mosi[2];
+    uint32_t control_word = 24 * SPI_CONTROL_LENGTH | SPI_CONTROL_START;
 
     /* Write MOSI. */
-    m2sdr_writel(conn, CSR_AD9361_SPI_MOSI_ADDR, mosi[0] << 16 | mosi[1] << 8 | mosi[2]);
+    m2sdr_writel(conn, CSR_AD9361_SPI_MOSI_ADDR, mosi_word);
 
     /* Start SPI. */
-    m2sdr_writel(conn, CSR_AD9361_SPI_CONTROL_ADDR, 24*SPI_CONTROL_LENGTH | SPI_CONTROL_START);
+    m2sdr_writel(conn, CSR_AD9361_SPI_CONTROL_ADDR, control_word);
 
     /* Wait done. */
 #ifdef AD9361_SPI_WAIT_DONE
     /* Keep the helper synchronous so the caller sees a simple register-style
-     * interface even though the FPGA block is command based. */
-    while ((m2sdr_readl(conn, CSR_AD9361_SPI_STATUS_ADDR) & 0x1) != SPI_STATUS_DONE);
+     * interface even though the FPGA block is command based. Do not spin
+     * forever: a stuck SPI bridge otherwise hides the real failure site. */
+    uint32_t status = 0;
+    unsigned timeout = 1000000;
+    const char *timeout_env = getenv("M2SDR_AD9361_SPI_TIMEOUT_POLLS");
+    if (timeout_env && timeout_env[0]) {
+        unsigned parsed = (unsigned)strtoul(timeout_env, NULL, 0);
+        if (parsed > 0)
+            timeout = parsed;
+    }
+
+    for (unsigned i = 0; i < timeout; i++) {
+        status = m2sdr_readl(conn, CSR_AD9361_SPI_STATUS_ADDR);
+        if ((status & SPI_STATUS_DONE) == SPI_STATUS_DONE)
+            goto done;
+    }
+
+    fprintf(stderr,
+            "m2sdr_ad9361_spi_xfer timeout: mosi=0x%06x control=0x%08x "
+            "status=0x%08x is_write=%u timeout_polls=%u\n",
+            mosi_word, control_word, status, is_write ? 1u : 0u, timeout);
+    return -1;
+
+done:
 #endif
 
     /* Read MISO if read. */
@@ -79,6 +104,8 @@ void m2sdr_ad9361_spi_xfer(void *conn, uint8_t len, uint8_t *mosi, uint8_t *miso
     if (!is_write) {
         miso[2] = m2sdr_readl(conn, CSR_AD9361_SPI_MISO_ADDR) & 0xff;
     }
+
+    return 0;
 }
 
 /* m2sdr_ad9361_spi_write */
@@ -99,7 +126,8 @@ void m2sdr_ad9361_spi_write(void *conn, uint16_t reg, uint8_t dat) {
     mosi[2]  = dat;
 
     /* Do SPI Xfer. */
-    m2sdr_ad9361_spi_xfer(conn, 3, mosi, miso);
+    if (m2sdr_ad9361_spi_xfer(conn, 3, mosi, miso) != 0)
+        return;
 }
 
 /* m2sdr_ad9361_spi_read */
@@ -117,7 +145,8 @@ uint8_t m2sdr_ad9361_spi_read(void *conn, uint16_t reg) {
     mosi[2]  = 0x00;
 
     /* Do SPI Xfer. */
-    m2sdr_ad9361_spi_xfer(conn, 3, mosi, miso);
+    if (m2sdr_ad9361_spi_xfer(conn, 3, mosi, miso) != 0)
+        return 0xff;
 
     /* Process Data. */
     dat = miso[2];
