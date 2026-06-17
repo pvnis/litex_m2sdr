@@ -18,6 +18,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <fstream>
+#include <unistd.h>
+#include <limits>
 
 #include "ad9361/ad9361.h"
 #include "ad9361/ad9361_api.h"
@@ -126,6 +131,405 @@ static constexpr uint64_t TX_HEADER_SYNC_MASK  = 0x3fff'ffff'ffff'ffffULL;
 static constexpr uint64_t RX_HEADER_SYNC_VALUE = 0x5aa5'5aa5'5aa5'5aa5ULL;
 static constexpr uint64_t TX_FLAG_HAS_TIME     = 1ULL << 63;
 static constexpr uint64_t TX_FLAG_END_BURST    = 1ULL << 62;
+
+
+static bool m2sdr_env_tx_cs16_to_sc12_enabled()
+{
+    const char *v = std::getenv("M2SDR_SOAPY_TX_CS16_TO_SC12");
+    return v && *v &&
+           std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0 &&
+           std::strcmp(v, "OFF") != 0 &&
+           std::strcmp(v, "no") != 0 &&
+           std::strcmp(v, "NO") != 0;
+}
+
+static inline int16_t m2sdr_cs16_to_sc12_word(int16_t x)
+{
+    /*
+     * Soapy CS16 convention is full-scale int16.  The M2SDR/AD9361 sample
+     * lane is signed 12-bit stored in a 16-bit word.  Divide by 16 to map
+     * [-32768, 32767] -> [-2048, 2047] without low-12-bit wrapping.
+     */
+    return static_cast<int16_t>(static_cast<int32_t>(x) / 16);
+}
+
+
+
+static bool m2sdr_env_tx_idle_fill_enabled()
+{
+    const char *v = std::getenv("M2SDR_SOAPY_TX_IDLE_FILL");
+    return v && *v &&
+           std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0 &&
+           std::strcmp(v, "OFF") != 0 &&
+           std::strcmp(v, "no") != 0 &&
+           std::strcmp(v, "NO") != 0;
+}
+
+static bool m2sdr_env_tx_dedup_time_enabled()
+{
+    const char *v = std::getenv("M2SDR_SOAPY_TX_DEDUP_TIME");
+    if (!v || !*v)
+        return true;
+    return std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0 &&
+           std::strcmp(v, "OFF") != 0 &&
+           std::strcmp(v, "no") != 0 &&
+           std::strcmp(v, "NO") != 0;
+}
+
+
+
+static bool m2sdr_env_tx_rms_log_enabled()
+{
+    const char *v = std::getenv("M2SDR_SOAPY_TX_RMS_LOG");
+    return v && *v && std::strcmp(v, "0") != 0 &&
+           std::strcmp(v, "false") != 0 &&
+           std::strcmp(v, "FALSE") != 0 &&
+           std::strcmp(v, "off") != 0;
+}
+
+
+
+static void m2sdr_dump_tx_input_once(
+    const void *buf,
+    const size_t numElems,
+    const std::string &format,
+    const size_t channel_index,
+    const size_t inputOffsetElems,
+    const int flags,
+    const long long timeNs,
+    const size_t frameChannels,
+    const size_t inputBytesPerComplex,
+    const double sampleRate)
+{
+    const char *path = std::getenv("M2SDR_SOAPY_TX_DUMP_PATH");
+    if (!path || !*path || !buf || numElems == 0)
+        return;
+
+    const char *limit_s = std::getenv("M2SDR_SOAPY_TX_DUMP_SAMPLES");
+    const size_t limit = limit_s && *limit_s ? std::strtoul(limit_s, nullptr, 10) : 2000000;
+
+    static size_t dumped_samples = 0;
+    static size_t dumped_records = 0;
+    static bool announced = false;
+
+    if (dumped_samples >= limit)
+        return;
+
+    const size_t n = std::min(numElems, limit - dumped_samples);
+    const size_t dumpBytesPerComplex = 2 * sizeof(int16_t); /* pre-dump is always CS16 IQ on disk */
+    const size_t offset_bytes = dumped_samples * dumpBytesPerComplex;
+
+    double sum2 = 0.0;
+    double peak = 0.0;
+    double mean_i = 0.0;
+    double mean_q = 0.0;
+
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out.good())
+        return;
+
+    if (format == SOAPY_SDR_CS16) {
+        const int16_t *x = static_cast<const int16_t *>(buf) + inputOffsetElems * 2;
+        for (size_t i = 0; i < n; ++i) {
+            const double re = x[2*i + 0] / 32768.0;
+            const double im = x[2*i + 1] / 32768.0;
+            const double mag = std::sqrt(re*re + im*im);
+            sum2 += re*re + im*im;
+            peak = std::max(peak, mag);
+            mean_i += re;
+            mean_q += im;
+        }
+        out.write(reinterpret_cast<const char *>(x), n * dumpBytesPerComplex);
+    } else if (format == SOAPY_SDR_CF32) {
+        const float *x = static_cast<const float *>(buf) + inputOffsetElems * 2;
+        std::vector<int16_t> tmp(2 * n);
+        for (size_t i = 0; i < n; ++i) {
+            const double re0 = x[2*i + 0];
+            const double im0 = x[2*i + 1];
+            const double mag = std::sqrt(re0*re0 + im0*im0);
+            sum2 += re0*re0 + im0*im0;
+            peak = std::max(peak, mag);
+            mean_i += re0;
+            mean_q += im0;
+
+            const double re = std::max(-1.0, std::min(1.0, re0));
+            const double im = std::max(-1.0, std::min(1.0, im0));
+            tmp[2*i + 0] = (int16_t)std::lrint(re * 32767.0);
+            tmp[2*i + 1] = (int16_t)std::lrint(im * 32767.0);
+        }
+        out.write(reinterpret_cast<const char *>(tmp.data()), tmp.size() * sizeof(int16_t));
+    } else {
+        return;
+    }
+
+    if (!out.good())
+        return;
+
+    const double denom = std::max<size_t>(n, 1);
+    const double rms = std::sqrt(sum2 / denom);
+    mean_i /= denom;
+    mean_q /= denom;
+
+    const std::string meta_path = std::string(path) + ".meta.jsonl";
+    std::ofstream meta(meta_path, std::ios::app);
+    if (meta.good()) {
+        meta
+            << "{"
+            << "\"seq\":" << dumped_records
+            << ",\"offset_bytes\":" << offset_bytes
+            << ",\"numElems\":" << n
+            << ",\"requestedNumElems\":" << numElems
+            << ",\"format\":\"" << format << "\""
+            << ",\"flags\":" << flags
+            << ",\"timeNs\":" << timeNs
+            << ",\"sampleRate\":" << sampleRate
+            << ",\"channel\":" << channel_index
+            << ",\"inputOffsetElems\":" << inputOffsetElems
+            << ",\"frameChannels\":" << frameChannels
+            << ",\"bytesPerComplex\":" << dumpBytesPerComplex
+            << ",\"inputBytesPerComplex\":" << inputBytesPerComplex
+            << ",\"rms\":" << rms
+            << ",\"peak\":" << peak
+            << ",\"mean_i\":" << mean_i
+            << ",\"mean_q\":" << mean_q
+            << "}\n";
+    }
+
+    dumped_samples += n;
+    ++dumped_records;
+
+    if (!announced) {
+        SoapySDR_logf(
+            SOAPY_SDR_INFO,
+            "TX_DUMP_PROBE path=%s meta=%s format=%s channel=%zu limit_samples=%zu",
+            path, meta_path.c_str(), format.c_str(), channel_index, limit);
+        announced = true;
+    }
+
+    if (dumped_samples >= limit) {
+        SoapySDR_logf(
+            SOAPY_SDR_INFO,
+            "TX_DUMP_PROBE complete path=%s dumped_samples=%zu records=%zu",
+            path, dumped_samples, dumped_records);
+    }
+}
+
+
+static size_t m2sdr_env_tx_dma_dump_buffers()
+{
+    const char *v = std::getenv("M2SDR_SOAPY_TX_DMA_DUMP_BUFFERS");
+    if (!v || !*v)
+        return 16;
+
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0)
+        return 0;
+    if (n > 4096)
+        return 4096;
+    return static_cast<size_t>(n);
+}
+
+
+static void m2sdr_dump_tx_dma_buffer_once(
+    const uint8_t *tx_buffer,
+    const size_t write_size,
+    const size_t handle,
+    const size_t numElems,
+    const int flags,
+    const long long timeNs,
+    const size_t frameChannels,
+    const size_t bytesPerComplex,
+    const double sampleRate,
+    const bool zeroCopy)
+{
+    const char *path = std::getenv("M2SDR_SOAPY_TX_DMA_DUMP_PATH");
+    if (!path || !*path || !tx_buffer || write_size == 0)
+        return;
+
+    const size_t limit = m2sdr_env_tx_dma_dump_buffers();
+    if (limit == 0)
+        return;
+
+    static size_t dumped_buffers = 0;
+    static bool announced = false;
+
+    if (dumped_buffers >= limit)
+        return;
+
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out.good())
+        return;
+
+    out.write(reinterpret_cast<const char *>(tx_buffer), write_size);
+    if (!out.good())
+        return;
+
+    const uint64_t header0 = (write_size >= 8)
+        ? *reinterpret_cast<const uint64_t *>(tx_buffer + 0)
+        : 0;
+    const uint64_t header1 = (write_size >= 16)
+        ? *reinterpret_cast<const uint64_t *>(tx_buffer + 8)
+        : 0;
+
+    char header0_hex[32];
+    char header1_hex[32];
+    std::snprintf(header0_hex, sizeof(header0_hex), "0x%016llx",
+                  static_cast<unsigned long long>(header0));
+    std::snprintf(header1_hex, sizeof(header1_hex), "0x%016llx",
+                  static_cast<unsigned long long>(header1));
+
+    const size_t payload_bytes = write_size > TX_DMA_HEADER_SIZE
+        ? write_size - TX_DMA_HEADER_SIZE
+        : 0;
+    const size_t logical_payload_bytes = numElems * frameChannels * bytesPerComplex;
+    const size_t zero_padding_bytes = payload_bytes > logical_payload_bytes
+        ? payload_bytes - logical_payload_bytes
+        : 0;
+
+    const std::string meta_path = std::string(path) + ".meta.jsonl";
+    std::ofstream meta(meta_path, std::ios::app);
+    if (meta.good()) {
+        meta
+            << "{"
+            << "\"seq\":" << dumped_buffers
+            << ",\"handle\":" << handle
+            << ",\"write_size\":" << write_size
+            << ",\"payload_bytes\":" << payload_bytes
+            << ",\"numElems\":" << numElems
+            << ",\"logical_payload_bytes\":" << logical_payload_bytes
+            << ",\"zero_padding_bytes\":" << zero_padding_bytes
+            << ",\"flags\":" << flags
+            << ",\"timeNs\":" << timeNs
+            << ",\"timestamp_samples\":" << static_cast<unsigned long long>(header1)
+            << ",\"header0\":\"" << header0_hex << "\""
+            << ",\"header1\":\"" << header1_hex << "\""
+            << ",\"frameChannels\":" << frameChannels
+            << ",\"bytesPerComplex\":" << bytesPerComplex
+            << ",\"sampleRate\":" << sampleRate
+            << ",\"zeroCopy\":" << (zeroCopy ? "true" : "false")
+            << "}\n";
+    }
+
+    if (!announced) {
+        SoapySDR_logf(
+            SOAPY_SDR_INFO,
+            "TX_DMA_DUMP_PROBE path=%s meta=%s buffer_bytes=%zu limit_buffers=%zu",
+            path, meta_path.c_str(), write_size, limit);
+        announced = true;
+    }
+
+    ++dumped_buffers;
+
+    if (dumped_buffers >= limit) {
+        SoapySDR_logf(
+            SOAPY_SDR_INFO,
+            "TX_DMA_DUMP_PROBE complete path=%s dumped_buffers=%zu",
+            path, dumped_buffers);
+    }
+}
+
+
+
+static void m2sdr_log_tx_input_rms_once(
+    const void *buf,
+    const size_t numElems,
+    const std::string &format,
+    const size_t channel_index,
+    const int flags,
+    const long long timeNs)
+{
+    static size_t logged = 0;
+    if (!m2sdr_env_tx_rms_log_enabled())
+        return;
+
+    const char *limit_s = std::getenv("M2SDR_SOAPY_TX_RMS_LOG_LIMIT");
+    const size_t limit = limit_s && *limit_s ? std::strtoul(limit_s, nullptr, 10) : 64;
+    if (logged >= limit)
+        return;
+
+    if (!buf || numElems == 0)
+        return;
+
+    const size_t n = std::min<size_t>(numElems, 4096);
+    double sum2 = 0.0;
+    double peak = 0.0;
+    double mean_i = 0.0;
+    double mean_q = 0.0;
+
+    if (format == SOAPY_SDR_CF32) {
+        const float *x = static_cast<const float *>(buf);
+        for (size_t i = 0; i < n; ++i) {
+            const double re = x[2*i + 0];
+            const double im = x[2*i + 1];
+            const double p = re*re + im*im;
+            sum2 += p;
+            peak = std::max(peak, std::sqrt(p));
+            mean_i += re;
+            mean_q += im;
+        }
+    } else if (format == SOAPY_SDR_CS16) {
+        const int16_t *x = static_cast<const int16_t *>(buf);
+        for (size_t i = 0; i < n; ++i) {
+            const double re = x[2*i + 0] / 32768.0;
+            const double im = x[2*i + 1] / 32768.0;
+            const double p = re*re + im*im;
+            sum2 += p;
+            peak = std::max(peak, std::sqrt(p));
+            mean_i += re;
+            mean_q += im;
+        }
+    } else {
+        SoapySDR_logf(
+            SOAPY_SDR_INFO,
+            "TX_RMS_PROBE[%zu] ch=%zu format=%s numElems=%zu flags=0x%x timeNs=%lld unsupported_format",
+            logged, channel_index, format.c_str(), numElems, flags, timeNs);
+        ++logged;
+        return;
+    }
+
+    const double rms = std::sqrt(sum2 / std::max<size_t>(n, 1));
+    mean_i /= std::max<size_t>(n, 1);
+    mean_q /= std::max<size_t>(n, 1);
+
+    SoapySDR_logf(
+        SOAPY_SDR_INFO,
+        "TX_RMS_PROBE[%zu] ch=%zu format=%s numElems=%zu n=%zu rms=%.6g peak=%.6g mean_i=%.6g mean_q=%.6g flags=0x%x timeNs=%lld",
+        logged, channel_index, format.c_str(), numElems, n, rms, peak, mean_i, mean_q, flags, timeNs);
+
+    ++logged;
+}
+
+
+static long long m2sdr_env_tx_time_offset_ns()
+{
+    const char *v = std::getenv("M2SDR_SOAPY_TX_TIME_OFFSET_NS");
+    if (!v || !*v)
+        return 0;
+    return std::strtoll(v, nullptr, 10);
+}
+
+
+static long m2sdr_env_tx_copy_prime_buffers()
+{
+    const char *v = std::getenv("M2SDR_SOAPY_TX_COPY_PRIME_BUFFERS");
+    if (!v || !*v)
+        return 8;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n < 1)
+        return 1;
+    if (n > 16)
+        return 16;
+    return n;
+}
 
 
 static bool m2sdr_env_disables_litepcie_zero_copy()
@@ -345,6 +749,16 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
         _tx_stream.dma.use_reader = 1;
         _tx_stream.dma.use_writer = 0;
         _tx_stream.dma.loopback   = 0;
+        /*
+         * In TX copy-mode, do not enable the FPGA reader from
+         * litepcie_dma_process() during acquire.  Copy-mode must first stage a
+         * completed userspace buffer, write() it into the kernel, and only then
+         * start the reader after a small priming queue exists.  Otherwise the
+         * FPGA reader can run ahead of reader_sw_count and the kernel reports
+         * "Writing too late".
+         */
+        _tx_stream.dma.reader_enable = 0;
+        _tx_stream.dma.writer_enable = 0;
         _tx_stream.dma.zero_copy  = m2sdr_env_disables_litepcie_zero_copy() ? 0 : 1;
         if (!_tx_stream.dma.zero_copy) {
             SoapySDR_logf(SOAPY_SDR_WARNING,
@@ -1191,9 +1605,16 @@ void SoapyLiteXM2SDR::interleaveCS16(
     if (_bytesPerSample == 2) {
         int16_t *dst_int16 = reinterpret_cast<int16_t*>(dst) + (offset * 2 * _samplesPerComplex);
 
+        const bool cs16_to_sc12 = m2sdr_env_tx_cs16_to_sc12_enabled();
+
         for (uint32_t i = 0; i < len; i++) {
-            dst_int16[0] = samples_cs16[0]; /* I. */
-            dst_int16[1] = samples_cs16[1]; /* Q. */
+            if (cs16_to_sc12) {
+                dst_int16[0] = m2sdr_cs16_to_sc12_word(samples_cs16[0]); /* I. */
+                dst_int16[1] = m2sdr_cs16_to_sc12_word(samples_cs16[1]); /* Q. */
+            } else {
+                dst_int16[0] = samples_cs16[0]; /* I. */
+                dst_int16[1] = samples_cs16[1]; /* Q. */
+            }
             samples_cs16 += 2;
             dst_int16 += _frameChannels * _samplesPerComplex;
         }
@@ -1563,6 +1984,26 @@ int SoapyLiteXM2SDR::writeStream(
 
         /* Write out channels to the remainder buffer. */
         for (size_t i = 0; i < _tx_stream.channels.size(); i++) {
+            m2sdr_log_tx_input_rms_once(
+                buffs[i],
+                n,
+                _tx_stream.format,
+                _tx_stream.channels[i],
+                flags,
+                timeNs
+            );
+            m2sdr_dump_tx_input_once(
+                buffs[i],
+                n,
+                _tx_stream.format,
+                _tx_stream.channels[i],
+                0,
+                flags,
+                timeNs,
+                _frameChannels,
+                _bytesPerComplex,
+                _tx_stream.samplerate
+            );
             this->interleave(
                 buffs[i],
                 _tx_stream.remainderBuff + remainderOffset + (_tx_stream.channels[i] * _bytesPerComplex),
@@ -1628,6 +2069,26 @@ int SoapyLiteXM2SDR::writeStream(
 
     /* Write out channels to the new buffer. */
     for (size_t i = 0; i < _tx_stream.channels.size(); i++) {
+        m2sdr_log_tx_input_rms_once(
+            buffs[i],
+            n,
+            _tx_stream.format,
+            _tx_stream.channels[i],
+            flags,
+            timeNs
+        );
+            m2sdr_dump_tx_input_once(
+                buffs[i],
+                n,
+                _tx_stream.format,
+                _tx_stream.channels[i],
+                samp_avail,
+                flags,
+                timeNs,
+                _frameChannels,
+                _bytesPerComplex,
+                _tx_stream.samplerate
+            );
         this->interleave(
             buffs[i],
             _tx_stream.remainderBuff + (_tx_stream.channels[i] * _bytesPerComplex),
@@ -1970,6 +2431,16 @@ int SoapyLiteXM2SDR::_dmaAcquireRead(
 
 void SoapyLiteXM2SDR::_dmaReleaseRead(size_t handle) {
 #if USE_LITEPCIE
+    /*
+     * RX copy-mode uses liblitepcie's read(fd, dma.buf_rd, ...) path from
+     * litepcie_dma_process(), not mmap writer-counter updates. In this mode
+     * _rx_stream.dma.buf_rd is userspace calloc() storage, and advancing mmap
+     * writer counters is stale zero-copy bookkeeping.
+     */
+    if (!_rx_stream.dma.zero_copy) {
+        return;
+    }
+
     struct litepcie_ioctl_mmap_dma_update mmap_dma_update;
     mmap_dma_update.sw_count = handle + 1;
     checked_ioctl(_fd, LITEPCIE_IOCTL_MMAP_DMA_WRITER_UPDATE, &mmap_dma_update);
@@ -2031,6 +2502,37 @@ int SoapyLiteXM2SDR::_dmaAcquireWrite(
     uint8_t **buf,
     const long timeoutUs) {
 #if USE_LITEPCIE
+    /*
+     * TX copy-mode uses liblitepcie write() path.
+     *
+     * In non-zero-copy mode litepcie_dma_init() allocates dma.buf_wr with
+     * calloc(); it is not a kernel mmap ring. Therefore advancing the mmap
+     * DMA reader sw_count does not deliver these userspace bytes to the FPGA.
+     * The actual delivery mechanism is litepcie_dma_process(), which performs
+     * write(fd, dma->buf_wr, DMA_BUFFER_TOTAL_SIZE) when POLLOUT is ready.
+     */
+    if (!_tx_stream.dma.zero_copy) {
+        /*
+         * Copy-mode staging: return a userspace slot directly.  The completed
+         * slot is copied into the kernel in _dmaReleaseWrite() with write().
+         * Do not call litepcie_dma_process() here, because that can enable the
+         * FPGA reader and flush stale/previous userspace contents before this
+         * buffer's header and payload are filled.
+         */
+        const size_t buf_offset = _tx_stream.user_count %
+                                  _tx_stream.dma.mmap_dma_info.dma_tx_buf_count;
+        uint8_t *tx_buffer = reinterpret_cast<uint8_t*>(_tx_stream.dma.buf_wr) +
+                             buf_offset * _tx_stream.dma.mmap_dma_info.dma_tx_buf_size;
+
+        *reinterpret_cast<uint64_t*>(tx_buffer + 0) = TX_HEADER_SYNC_VALUE;
+        *reinterpret_cast<uint64_t*>(tx_buffer + 8) = 0;
+
+        *buf = tx_buffer + TX_DMA_HEADER_SIZE;
+        handle = _tx_stream.user_count++;
+        (void)timeoutUs;
+        return static_cast<int>(getStreamMTU(TX_STREAM));
+    }
+
     /* Note on LitePCIe DMA reader mode: the kernel hardwires
      * LOOP_PROG_N=1, which makes the reader cycle the 16-entry
      * descriptor ring indefinitely. We can't switch to PROG mode here
@@ -2138,6 +2640,24 @@ void SoapyLiteXM2SDR::_dmaReleaseWrite(
     if (flags & SOAPY_SDR_END_BURST) {
         _tx_stream.burst_end = true;
     }
+
+    /*
+     * Some clients submit continuation buffers with SOAPY_SDR_HAS_TIME and
+     * the exact same timestamp as the burst-opening buffer.  The FPGA timed
+     * arbiter interprets HAS_TIME as a new timed descriptor, so duplicate
+     * timestamps can reopen the same burst and poison timing.  Keep HAS_TIME
+     * only on the first buffer for a given timestamp; following buffers are
+     * ordinary continuation payload until a new timestamp appears.
+     */
+    static long long last_has_time_ns = std::numeric_limits<long long>::min();
+    if (m2sdr_env_tx_dedup_time_enabled() &&
+        (flags & SOAPY_SDR_HAS_TIME) &&
+        timeNs == last_has_time_ns) {
+        flags &= ~SOAPY_SDR_HAS_TIME;
+    } else if (flags & SOAPY_SDR_HAS_TIME) {
+        last_has_time_ns = timeNs;
+    }
+
 #if USE_LITEPCIE
     {
         const size_t buf_offset = handle % _dma_mmap_info.dma_tx_buf_count;
@@ -2177,6 +2697,69 @@ void SoapyLiteXM2SDR::_dmaReleaseWrite(
     }
 
 #if USE_LITEPCIE
+    /*
+     * TX copy-mode delivery: the payload lives in userspace calloc() storage,
+     * so the completed single DMA buffer must be copied into the kernel here,
+     * after its header and payload are valid.  Only start the FPGA reader once
+     * a small priming queue is present.
+     */
+    if (!_tx_stream.dma.zero_copy) {
+        const size_t buf_offset = handle % _tx_stream.dma.mmap_dma_info.dma_tx_buf_count;
+        const size_t write_size = _tx_stream.dma.mmap_dma_info.dma_tx_buf_size;
+        uint8_t *tx_buffer = reinterpret_cast<uint8_t*>(_tx_stream.dma.buf_wr) +
+                             buf_offset * write_size;
+
+        /*
+         * Optional post-DMA-frame diagnostic dump.  At this point the Soapy
+         * input samples have already been interleaved/framed, the 16-byte TX
+         * DMA header has been finalized, and partial buffers have been
+         * zero-padded.  This is the exact buffer copy-mode hands to the
+         * LitePCIe kernel driver with write().
+         */
+        m2sdr_dump_tx_dma_buffer_once(
+            tx_buffer,
+            write_size,
+            handle,
+            numElems,
+            flags,
+            timeNs,
+            _frameChannels,
+            _bytesPerComplex,
+            _tx_stream.samplerate,
+            /*zeroCopy=*/false);
+
+        ssize_t written = 0;
+        while (written < static_cast<ssize_t>(write_size)) {
+            ssize_t ret = ::write(_fd, tx_buffer + written, write_size - written);
+            if (ret < 0) {
+                if (errno == EINTR)
+                    continue;
+                SoapySDR_logf(SOAPY_SDR_ERROR,
+                    "LitePCIe TX copy-mode write failed: errno=%d (%s)",
+                    errno, std::strerror(errno));
+                return;
+            }
+            if (ret == 0) {
+                SoapySDR_logf(SOAPY_SDR_ERROR,
+                    "LitePCIe TX copy-mode write returned 0 before completing buffer");
+                return;
+            }
+            written += ret;
+        }
+
+        const long prime = m2sdr_env_tx_copy_prime_buffers();
+        if (!_tx_stream.reader_enabled &&
+            _tx_stream.user_count >= static_cast<int64_t>(prime)) {
+            litepcie_dma_reader(_fd, 1, &_tx_stream.hw_count, &_tx_stream.sw_count);
+            _tx_stream.reader_enabled = true;
+            SoapySDR_logf(SOAPY_SDR_INFO,
+                "LitePCIe TX copy-mode reader enabled after priming %ld buffers",
+                prime);
+        }
+
+        return;
+    }
+
     struct litepcie_ioctl_mmap_dma_update mmap_dma_update;
     mmap_dma_update.sw_count = handle + 1;
     checked_ioctl(_fd, LITEPCIE_IOCTL_MMAP_DMA_READER_UPDATE, &mmap_dma_update);
@@ -2282,10 +2865,46 @@ void SoapyLiteXM2SDR::txWorkerLoop() {
 
     while (_tx_stream.worker_running.load(std::memory_order_acquire)) {
         litex_m2sdr::StreamPacket *pkt = nullptr;
-        if (!_tx_stream.work_fifo->pop(&pkt,
-                                       /*wait=*/true,
-                                       std::chrono::milliseconds(50))) {
+        const bool tx_idle_fill =
 #if USE_LITEPCIE
+            m2sdr_env_tx_idle_fill_enabled() &&
+            !_tx_stream.dma.zero_copy &&
+            _tx_stream.reader_enabled;
+#else
+            false;
+#endif
+
+        if (!_tx_stream.work_fifo->pop(&pkt,
+                                       /*wait=*/!tx_idle_fill,
+                                       tx_idle_fill ? std::chrono::microseconds(0)
+                                                    : std::chrono::milliseconds(50))) {
+#if USE_LITEPCIE
+            /*
+             * Copy-mode idle fill: OCUDU submits sparse/discontinuous timed
+             * buffers.  Once the FPGA DMA reader is running, leaving it idle
+             * lets reader_hw_count outrun reader_sw_count, so the next real
+             * write() triggers kernel "Writing too late" messages.  Feed
+             * zero, no-HAS_TIME DMA frames during gaps; write() naturally
+             * back-pressures when the kernel queue is full.
+             */
+            if (tx_idle_fill) {
+                size_t idle_handle = 0;
+                uint8_t *idle_dma_buf = nullptr;
+                const int idle_ret = _dmaAcquireWrite(idle_handle, &idle_dma_buf,
+                                                      /*timeoutUs=*/0);
+                if (idle_ret > 0 && idle_dma_buf) {
+                    const size_t mtu_bytes =
+                        static_cast<size_t>(this->getStreamMTU(TX_STREAM)) *
+                        _frameChannels * _bytesPerComplex;
+                    std::memset(idle_dma_buf, 0, mtu_bytes);
+                    _dmaReleaseWrite(idle_handle,
+                                     this->getStreamMTU(TX_STREAM),
+                                     /*flags=*/0,
+                                     /*timeNs=*/0);
+                }
+                continue;
+            }
+
             /* Idle tick: poll hw_count and clear HAS_TIME on any
              * buffer the FPGA has finished reading. Only meaningful
              * once the reader is actually running - before then,
@@ -2331,9 +2950,12 @@ void SoapyLiteXM2SDR::txWorkerLoop() {
             std::memset(dma_buf + bytes, 0, mtu_bytes - bytes);
         }
 
+        long long release_timeNs = pkt->timeNs;
         if ((pkt->flags & SOAPY_SDR_HAS_TIME) && pkt->timeNs > 0) {
+            const long long tx_time_offset_ns = m2sdr_env_tx_time_offset_ns();
+            release_timeNs = pkt->timeNs + tx_time_offset_ns;
             const long long now = this->getHardwareTime("");
-            const int64_t slip = static_cast<int64_t>(now - pkt->timeNs);
+            const int64_t slip = static_cast<int64_t>(now - release_timeNs);
             const uint64_t slip_count =
                 _tx_stream.tx_slip_count.fetch_add(1, std::memory_order_acq_rel);
             _tx_stream.tx_slip_ring[slip_count % TXStream::TX_SLIP_RING].store(
@@ -2346,21 +2968,23 @@ void SoapyLiteXM2SDR::txWorkerLoop() {
                     }
                     if (slip_count < trace_limit) {
                         SoapySDR::logf(SOAPY_SDR_INFO,
-                            "TX timed commit slip: seq=%llu samples=%u flags=0x%x target_ns=%lld now_ns=%lld slip_ns=%lld",
+                            "TX timed commit slip: seq=%llu samples=%u flags=0x%x target_ns=%lld release_ns=%lld offset_ns=%lld now_ns=%lld slip_ns=%lld",
                             (unsigned long long)slip_count,
                             pkt->samples,
                             pkt->flags,
                             (long long)pkt->timeNs,
+                            (long long)release_timeNs,
+                            (long long)tx_time_offset_ns,
                             (long long)now,
                             (long long)slip);
                     }
                 }
             }
-            if (now > pkt->timeNs) {
+            if (now > release_timeNs) {
                 _tx_stream.late_count.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        _dmaReleaseWrite(handle, pkt->samples, pkt->flags, pkt->timeNs);
+        _dmaReleaseWrite(handle, pkt->samples, pkt->flags, release_timeNs);
         _tx_stream.free_fifo->push(pkt, /*wait=*/true);
     }
 }
