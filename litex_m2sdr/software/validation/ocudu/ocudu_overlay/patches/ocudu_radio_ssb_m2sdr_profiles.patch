@@ -1,0 +1,107 @@
+diff --git a/apps/examples/phy/CMakeLists.txt b/apps/examples/phy/CMakeLists.txt
+index 7ceab624ad..37b289ce62 100644
+--- a/apps/examples/phy/CMakeLists.txt
++++ b/apps/examples/phy/CMakeLists.txt
+@@ -5,7 +5,7 @@
+ 
+ set_directory_properties(PROPERTIES LABELS "phy")
+ 
+-if (ZEROMQ_FOUND OR UHD_FOUND)
++if (ZEROMQ_FOUND OR UHD_FOUND OR ENABLE_SOAPY)
+ 
+     add_executable(radio_ssb radio_ssb.cpp lower_phy_example_factory.cpp upper_phy_ssb_example.cpp)
+     target_link_libraries(radio_ssb
+@@ -25,4 +25,4 @@ if (ZEROMQ_FOUND OR UHD_FOUND)
+         add_test(radio_ssb_zmq_20MHz_n78 radio_ssb -P zmq_20MHz_n78 -D 10 -L 1 -v warning -du)
+     endif (ZEROMQ_FOUND AND BUILD_TESTING)
+ 
+-endif (ZEROMQ_FOUND OR UHD_FOUND)
++endif (ZEROMQ_FOUND OR UHD_FOUND OR ENABLE_SOAPY)
+diff --git a/apps/examples/phy/radio_ssb.cpp b/apps/examples/phy/radio_ssb.cpp
+index 87a62bbc15..dae9df06f2 100644
+--- a/apps/examples/phy/radio_ssb.cpp
++++ b/apps/examples/phy/radio_ssb.cpp
+@@ -74,6 +74,7 @@ static sampling_rate                             srate                      = sa
+ static unsigned                                  bw_rb                      = 52;
+ static radio_configuration::over_the_wire_format otw_format           = radio_configuration::over_the_wire_format::SC16;
+ static unsigned                                  duration_slots       = 60000;
++static unsigned                                  phys_cell_id         = 500;
+ static bool                                      zmq_loopback         = true;
+ static ssb_pattern_case                          ssb_pattern          = ssb_pattern_case::A;
+ static bool                                      enable_random_data   = false;
+@@ -181,6 +182,57 @@ static const auto profiles = to_array<configuration_profile>({
+        ssb_center_freq  = 1842.5e6;
+        rx_freq          = 1747.5e6;
+      }},
++    {"m2sdr_band3_10MHz",
++     "LiteX-M2SDR single-channel Band 3 10MHz SSB debug profile.",
++     []() {
++       driver_name      = "soapy";
++       device_arguments = "driver=LiteXM2SDR";
++       scs              = subcarrier_spacing::kHz15;
++       srate            = sampling_rate::from_MHz(11.52);
++       bw_rb            = 52;
++       otw_format       = radio_configuration::over_the_wire_format::SC16;
++       dl_center_freq   = 1842.5e6;
++       ssb_center_freq  = 1839.65e6;
++       rx_freq          = 1747.5e6;
++       tx_gain          = 0;
++       rx_gain          = 50;
++       ssb_pattern      = ssb_pattern_case::A;
++       phys_cell_id     = 1;
++     }},
++    {"m2sdr_n78_20MHz",
++     "LiteX-M2SDR single-channel n78 20MHz SSB debug profile.",
++     []() {
++       driver_name      = "soapy";
++       device_arguments = "driver=LiteXM2SDR";
++       scs              = subcarrier_spacing::kHz30;
++       srate            = sampling_rate::from_MHz(61.44);
++       bw_rb            = 52;
++       otw_format       = radio_configuration::over_the_wire_format::SC16;
++       dl_center_freq   = 3489.42e6;
++       ssb_center_freq  = 3488.16e6;
++       rx_freq          = 3489.42e6;
++       tx_gain          = 0;
++       rx_gain          = 50;
++       ssb_pattern      = ssb_pattern_case::C;
++       phys_cell_id     = 1;
++     }},
++    {"m2sdr_35g_10MHz",
++     "LiteX-M2SDR single-channel 3.5GHz 10MHz SSB RF observability profile.",
++     []() {
++       driver_name      = "soapy";
++       device_arguments = "driver=LiteXM2SDR";
++       scs              = subcarrier_spacing::kHz15;
++       srate            = sampling_rate::from_MHz(11.52);
++       bw_rb            = 52;
++       otw_format       = radio_configuration::over_the_wire_format::SC16;
++       dl_center_freq   = 3500.00e6;
++       ssb_center_freq  = 3497.15e6;
++       rx_freq          = 3500.00e6;
++       tx_gain          = 0;
++       rx_gain          = 50;
++       ssb_pattern      = ssb_pattern_case::A;
++       phys_cell_id     = 1;
++     }},
+     {"zmq_20MHz_n7",
+      "Single 20MHz FDD in band n7 using ZMQ.",
+      []() {
+@@ -677,7 +729,7 @@ int main(int argc, char** argv)
+   upper_phy_sample_config.ldpc_encoder_type            = "generic";
+   upper_phy_sample_config.gateway                      = &rg_gateway_adapter;
+   upper_phy_sample_config.rx_symb_req_notifier         = &phy_rx_symbol_req_adapter;
+-  upper_phy_sample_config.ssb_config.phys_cell_id      = 500;
++  upper_phy_sample_config.ssb_config.phys_cell_id      = phys_cell_id;
+   upper_phy_sample_config.ssb_config.cp                = cyclic_prefix::NORMAL;
+   upper_phy_sample_config.ssb_config.period_ms         = 5;
+   upper_phy_sample_config.ssb_config.beta_pss_dB       = 0.0;
+@@ -700,7 +752,7 @@ int main(int argc, char** argv)
+   phy_rx_symbol_req_adapter.connect(&lower_phy_instance->get_uplink_request_handler());
+ 
+   // Calculate starting time.
+-  double                     delay_s      = 0.1;
++  double                     delay_s      = 1.0;
+   baseband_gateway_timestamp current_time = radio->read_current_time();
+   baseband_gateway_timestamp start_time = current_time + static_cast<uint64_t>(delay_s * radio_config.sampling_rate_Hz);
+ 
