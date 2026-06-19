@@ -1,0 +1,12 @@
+# Validation outputs: keep scripts/docs/tools in git, not raw captures/logs.
+runs/
+*.sc16
+*.bin
+*.raw
+*.iq
+*.cf32
+*.cs16
+*.log
+*.pcap
+*.npy
+*.npz

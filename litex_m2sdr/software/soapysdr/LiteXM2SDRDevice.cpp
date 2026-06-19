@@ -773,6 +773,21 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     }
 #endif
 
+    /*
+     * Explicitly disable AD9361 BIST tone/PRBS before normal host-DMA TX.
+     *
+     * A prior low-level BIST TX tone test can leave the RF output dominated by
+     * an internal +1 MHz tone even when Soapy writeStream() receives all-zero
+     * host samples. Normal Soapy operation must use the external data port,
+     * not AD9361 internal BIST injection.
+     */
+    if (m2sdr_from_ad9361_rc(ad9361_bist_tone(ad9361_phy, BIST_DISABLE, 0, 0, 0x0)) != M2SDR_ERR_OK) {
+        throw std::runtime_error("Failed to disable AD9361 BIST tone.");
+    }
+    if (m2sdr_from_ad9361_rc(ad9361_bist_prbs(ad9361_phy, BIST_DISABLE)) != M2SDR_ERR_OK) {
+        throw std::runtime_error("Failed to disable AD9361 BIST PRBS.");
+    }
+
     if (m2sdr_from_ad9361_rc(ad9361_bist_loopback(ad9361_phy, _loopbackMode == LoopbackMode::AD9361 ? 1 : 0)) != M2SDR_ERR_OK) {
         throw std::runtime_error("Failed to configure AD9361 loopback mode.");
     }
