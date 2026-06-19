@@ -690,6 +690,23 @@ static ssize_t litepcie_write(struct file *file, const char __user *data, size_t
 	return size - len;
 }
 
+
+/* Mark the real VMA used for DMA mmap teardown.
+ *
+ * The non-ARM path maps each DMA chunk through a temporary sub_vma, but the
+ * kernel later tears down the original VMA. If the original VMA is not marked
+ * as a PFN/device mapping, exit_mmap() can treat DMA PFNs as normal pages and
+ * report "BUG: Bad page map" for mappings installed by litepcie_mmap().
+ */
+static inline void litepcie_set_dma_mmap_flags(struct vm_area_struct *vma)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 3, 0)
+	vm_flags_set(vma, VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP);
+#else
+	vma->vm_flags |= VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
+#endif
+}
+
 /* Memory map DMA buffers for user space access */
 static int litepcie_mmap(struct file *file, struct vm_area_struct *vma)
 {
@@ -712,6 +729,8 @@ static int litepcie_mmap(struct file *file, struct vm_area_struct *vma)
 		is_tx = 0;
 	else
 		return -EINVAL;
+
+	litepcie_set_dma_mmap_flags(vma);
 
 	for (i = 0; i < DMA_BUFFER_COUNT; i++) {
 #if defined(__arm__) || defined(__aarch64__)

@@ -57,3 +57,27 @@ Use `pgprot_writecombine()` instead of `pgprot_noncached()` only if the existing
    - Soapy loopback teardown test
    - `radio_ssb` short run
    - `journalctl -k` bad-page grep
+## Source inspection finding: 2026-06-19
+
+Inspection of `litex_m2sdr/software/kernel/main.c` found `litepcie_mmap()` at the DMA mmap path. On non-ARM/x86 it maps each DMA buffer by creating a temporary `struct vm_area_struct sub_vma = *vma` and calling `dma_mmap_coherent()` for each chunk. Kernel logs show the failing path as:
+
+```text
+BUG: Bad page map in process radio_ssb
+file:m2sdr0 fault:0x0 mmap:litepcie_mmap [m2sdr]
+```
+
+The source did not mark the original VMA with `VM_IO`, `VM_PFNMAP`, `VM_DONTEXPAND`, or `VM_DONTDUMP` before installing DMA/PFN mappings. Because teardown uses the original VMA, not the temporary `sub_vma`, this is a contained candidate cause for the bad-page warnings.
+
+Candidate source fix applied here:
+
+```c
+litepcie_set_dma_mmap_flags(vma);
+```
+
+where the helper marks the original VMA as:
+
+```c
+VM_IO | VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP
+```
+
+This source patch is not a runtime fix until the kernel module is rebuilt, installed, and loaded by a planned reboot or another controlled recovery path. Do not test by remote `rmmod`/`modprobe -r`/`insmod` sequencing on nuc4.
