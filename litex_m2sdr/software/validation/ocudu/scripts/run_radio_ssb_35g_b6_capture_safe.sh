@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# NOTE: LitePCIe copy-mode is disabled on nuc4; use env_m2sdr_ocudu_safe_rf.sh.
 
 set +e
 set +u
@@ -82,7 +83,7 @@ sudo -n env \
   SOAPY_SDR_ROOT="${SOAPY_SDR_ROOT:-/tmp/empty-soapy-root}" \
   SOAPY_SDR_PLUGIN_PATH="${SOAPY_SDR_PLUGIN_PATH:-}" \
   LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
-  M2SDR_LITEPCIE_ZERO_COPY=0 \
+  # copy-mode assignment disabled on nuc4 \
   M2SDR_DIRECT_DEINTERLEAVE=1 \
   M2SDR_SOAPY_TX_COPY_PRIME_BUFFERS=8 \
   M2SDR_SOAPY_TX_TIME_OFFSET_NS=0 \
