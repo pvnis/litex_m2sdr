@@ -38,17 +38,38 @@ def nr_sss(nid1: int, nid2: int) -> np.ndarray:
     d = (1 - 2 * x0[(n + m0) % 127]) * (1 - 2 * x1[(n + m1) % 127])
     return d.astype(np.complex64)
 
-def load_sc16(path: Path) -> np.ndarray:
+def load_sc16_with_stats(path: Path):
     raw = np.fromfile(path, dtype=np.int16)
     if raw.size < 4:
         raise SystemExit(f"ERROR: empty capture: {path}")
     if raw.size % 2:
         raw = raw[:-1]
     raw = raw.reshape(-1, 2)
-    x = raw[:, 0].astype(np.float32) + 1j * raw[:, 1].astype(np.float32)
+
+    i = raw[:, 0].astype(np.float32)
+    q = raw[:, 1].astype(np.float32)
+
+    component_abs_max = int(max(np.max(np.abs(raw[:, 0])), np.max(np.abs(raw[:, 1]))))
+    clip2040 = int(np.count_nonzero((np.abs(raw[:, 0]) >= 2040) | (np.abs(raw[:, 1]) >= 2040)))
+    clip32760 = int(np.count_nonzero((np.abs(raw[:, 0]) >= 32760) | (np.abs(raw[:, 1]) >= 32760)))
+
+    # The existing detector normalizes bladeRF-style SC16 by 2048. Keep that
+    # convention and report dBFS relative to 2048 so clipping/overdrive is visible.
+    rms_rel_2048 = float(np.sqrt(np.mean(i * i + q * q)) / 2048.0)
+    rms_rel_32768 = float(np.sqrt(np.mean(i * i + q * q)) / 32768.0)
+
+    stats = {
+        "raw_component_abs_max": component_abs_max,
+        "raw_clip2040_count": clip2040,
+        "raw_clip32760_count": clip32760,
+        "raw_rms_rel_2048_dbfs": 20 * np.log10(rms_rel_2048 + 1e-15),
+        "raw_rms_rel_32768_dbfs": 20 * np.log10(rms_rel_32768 + 1e-15),
+    }
+
+    x = i + 1j * q
     x = x / 2048.0
     x = x - np.mean(x)
-    return x.astype(np.complex64)
+    return x.astype(np.complex64), stats
 
 def main():
     ap = argparse.ArgumentParser()
@@ -57,6 +78,9 @@ def main():
     ap.add_argument("--fc", type=float, required=True)
     ap.add_argument("--ssb", type=float, required=True)
     ap.add_argument("--expected-pci", type=int, default=1)
+    ap.add_argument("--scs-khz", type=float, default=15.0)
+    ap.add_argument("--dominates-ratio", type=float, default=1.20)
+    ap.add_argument("--low-margin-ratio", type=float, default=1.05)
     ap.add_argument("--max-pss-candidates", type=int, default=12)
     ap.add_argument("--sss-delta-min", type=int, default=760)
     ap.add_argument("--sss-delta-max", type=int, default=900)
@@ -66,13 +90,14 @@ def main():
     args = ap.parse_args()
 
     raw = Path(args.raw)
-    x = load_sc16(raw)
+    x, raw_stats = load_sc16_with_stats(raw)
 
     fs = args.fs
     fc = args.fc
     ssb_abs = args.ssb
     ssb_offset = ssb_abs - fc
-    nfft = int(round(fs / 15000.0))
+    scs_hz = args.scs_khz * 1000.0
+    nfft = int(round(fs / scs_hz))
 
     expected_nid2 = args.expected_pci % 3
     expected_nid1 = args.expected_pci // 3
@@ -82,13 +107,25 @@ def main():
     print(f"samples={x.size}")
     print(f"duration_s={x.size / fs:.6f}")
     print(f"fs={fs:.3f}")
+    print(f"scs_khz={args.scs_khz:.3f}")
     print(f"fc={fc:.3f}")
+    print(f"fc_MHz={fc / 1e6:.6f}")
+    print(f"fc_GHz={fc / 1e9:.9f}")
     print(f"ssb_abs={ssb_abs:.3f}")
+    print(f"ssb_abs_MHz={ssb_abs / 1e6:.6f}")
+    print(f"ssb_abs_GHz={ssb_abs / 1e9:.9f}")
     print(f"expected_ssb_offset_Hz={ssb_offset:.1f}")
     print(f"nfft={nfft}")
     print(f"expected_pci={args.expected_pci}")
     print(f"expected_nid1={expected_nid1}")
     print(f"expected_nid2={expected_nid2}")
+    print()
+    print("===== raw SC16 amplitude stats =====")
+    print(f"RAW_COMPONENT_ABS_MAX={raw_stats['raw_component_abs_max']}")
+    print(f"RAW_CLIP2040_COUNT={raw_stats['raw_clip2040_count']}")
+    print(f"RAW_CLIP32760_COUNT={raw_stats['raw_clip32760_count']}")
+    print(f"RAW_RMS_REL_2048_DBFS={raw_stats['raw_rms_rel_2048_dbfs']:.2f}")
+    print(f"RAW_RMS_REL_32768_DBFS={raw_stats['raw_rms_rel_32768_dbfs']:.2f}")
 
     # Energy-gated regions, same idea as the previous PSS checker.
     block = 8192
@@ -251,15 +288,37 @@ def main():
         )
 
     if expected_rows and wrong_rows:
-        ratio = expected_rows[0]["score"] / (wrong_rows[0]["score"] + 1e-12)
+        er = expected_rows[0]
+        wr = wrong_rows[0]
+        ratio = er["score"] / (wr["score"] + 1e-12)
+
+        expected_rank = 1 + sum(
+            1 for r in sss_hits
+            if r["score"] > er["score"] and r["pci"] != args.expected_pci
+        )
+        expected_tops_wrong = int(er["score"] >= wr["score"])
+
         print(f"expected_vs_best_wrong_ratio={ratio:.3f}")
-        if ratio >= 1.20:
+        print(f"EXPECTED_PCI_RANK={expected_rank}")
+        print(f"EXPECTED_PCI_TOPS_WRONG={expected_tops_wrong}")
+        print(f"DOMINATES_RATIO_THRESHOLD={args.dominates_ratio:.3f}")
+        print(f"LOW_MARGIN_RATIO_THRESHOLD={args.low_margin_ratio:.3f}")
+
+        if ratio >= args.dominates_ratio:
             print("VERDICT=SSS_EXPECTED_PCI_DOMINATES")
+        elif expected_tops_wrong and ratio >= args.low_margin_ratio:
+            print("VERDICT=SSS_EXPECTED_PCI_TOP_LOW_MARGIN")
+        elif expected_tops_wrong:
+            print("VERDICT=SSS_EXPECTED_PCI_TOP_TINY_MARGIN")
         else:
             print("VERDICT=SSS_AMBIGUOUS_OR_WRONG")
     elif expected_rows:
+        print("EXPECTED_PCI_RANK=1")
+        print("EXPECTED_PCI_TOPS_WRONG=1")
         print("VERDICT=SSS_EXPECTED_PCI_FOUND_NO_WRONG_ROWS")
     else:
+        print("EXPECTED_PCI_RANK=NOT_FOUND")
+        print("EXPECTED_PCI_TOPS_WRONG=0")
         print("VERDICT=SSS_EXPECTED_PCI_NOT_FOUND")
 
 if __name__ == "__main__":
