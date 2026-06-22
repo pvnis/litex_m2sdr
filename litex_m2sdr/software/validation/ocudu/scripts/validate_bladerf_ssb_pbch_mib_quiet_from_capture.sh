@@ -162,7 +162,7 @@ fi
 echo "STATE=running_detector" >> "$STATUS"
 
 "$PY" "$DET" \
-  --raw "$RAW" \
+  "$RAW" \
   --fs "$FS" \
   --fc "$FC" \
   --ssb "$SSB_FREQ" \
