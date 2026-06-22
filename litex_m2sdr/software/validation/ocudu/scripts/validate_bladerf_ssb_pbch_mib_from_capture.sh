@@ -16,7 +16,7 @@
 set +e +u
 set +o pipefail 2>/dev/null || true
 
-RUN="${1:-$(ls -td "$HOME"/pavonis_bladerf_local/runs/bladerf_radio_ssb_ssbcenter_* 2>/dev/null | head -1)}"
+RUN="${RUN:-${1:-$(ls -td "$HOME"/pavonis_bladerf_local/runs/bladerf_radio_ssb_ssbcenter_* 2>/dev/null | head -1)}}"
 
 FS="${FS:-5760000}"
 FC="${FC:-3497150000}"
@@ -42,7 +42,7 @@ SSB_BIN="${SSB_BIN:-$SRSRAN_4G_REPO/build-clion/lib/src/phy/sync/test/ssb_file_t
 RAW="${RAW:-$(ls "$RUN"/radio_ssb_fc${FC}_fs${FS}.sc16 2>/dev/null | head -1)}"
 
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
-OUT="$RUN/validation_ssb_pbch_mib_$TS"
+OUT="${OUT:-$RUN/validation_ssb_pbch_mib_$TS}"
 mkdir -p "$OUT"
 
 OFFLINE_LOG="$OUT/offline_pss_sss.log"
