@@ -1,0 +1,372 @@
+From fd70f69ff6d1dd81116259c8be77c992db36ff75 Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 23:17:36 +0200
+Subject: [PATCH 3/3] cleanup: remove embedded primer diagnostics after CP3114
+
+Keep the opt-in primer transport and compatibility behavior while deleting default-off MAC and user-plane traces from production files. The successful CP3114 path does not require these observers.
+---
+ srsenb/hdr/stack/upper/gtpu_pdcp_adapter.h |  34 -------
+ srsenb/src/stack/upper/gtpu.cc             |  45 ---------
+ srsenb/src/stack/upper/pdcp.cc             |  39 --------
+ srsgnb/src/stack/mac/mac_nr.cc             | 111 +--------------------
+ 4 files changed, 1 insertion(+), 228 deletions(-)
+
+diff --git a/srsenb/hdr/stack/upper/gtpu_pdcp_adapter.h b/srsenb/hdr/stack/upper/gtpu_pdcp_adapter.h
+index af30249b0..9373d7399 100644
+--- a/srsenb/hdr/stack/upper/gtpu_pdcp_adapter.h
++++ b/srsenb/hdr/stack/upper/gtpu_pdcp_adapter.h
+@@ -25,9 +25,6 @@
+ #include "srsran/common/bearer_manager.h"
+ #include "srsran/interfaces/enb_gtpu_interfaces.h"
+ #include "srsran/srslog/logger.h"
+-#include <atomic>
+-#include <cstdlib>
+-#include <cstring>
+ 
+ namespace srsenb {
+ 
+@@ -46,21 +43,6 @@ public:
+   void write_pdu(uint16_t rnti, uint32_t lcid, srsran::unique_byte_buffer_t pdu) override
+   {
+     auto bearer = bearers->get_lcid_bearer(rnti, lcid);
+-    uint32_t row = 0;
+-    if (pavonis_nr_userplane_trace_enabled() && pavonis_nr_userplane_trace_take(row)) {
+-      const uint32_t bytes = pdu != nullptr ? pdu->N_bytes : 0;
+-      const uint32_t first8 = bytes > 0 ? pdu->msg[0] : 0;
+-      logger.warning("PAVONIS_NR_USERPLANE_TRACE stage=adapter row=%u rnti=0x%x lcid=%u bytes=%u "
+-                     "first8=0x%02x bearer_valid=%u eps_bearer=%u rat=%u",
+-                     row,
+-                     rnti,
+-                     lcid,
+-                     bytes,
+-                     first8,
+-                     bearer.is_valid(),
+-                     bearer.eps_bearer_id,
+-                     static_cast<unsigned>(bearer.rat));
+-    }
+     if (not bearer.is_valid()) {
+       logger.error("Bearer rnti=0x%x, lcid=%d not found", rnti, lcid);
+       return;
+@@ -93,22 +75,6 @@ public:
+   }
+ 
+ private:
+-  static bool pavonis_nr_userplane_trace_enabled()
+-  {
+-    static const bool enabled = []() {
+-      const char* value = std::getenv("PAVONIS_NR_USERPLANE_TRACE");
+-      return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+-    }();
+-    return enabled;
+-  }
+-
+-  static bool pavonis_nr_userplane_trace_take(uint32_t& row)
+-  {
+-    static std::atomic<uint32_t> rows{0};
+-    row = rows.fetch_add(1, std::memory_order_relaxed);
+-    return row < 128;
+-  }
+-
+   srslog::basic_logger& logger;
+   gtpu*                 gtpu_obj     = nullptr;
+   pdcp_interface_gtpu*  pdcp_lte_obj = nullptr;
+diff --git a/srsenb/src/stack/upper/gtpu.cc b/srsenb/src/stack/upper/gtpu.cc
+index 65c52b12e..139021a7f 100644
+--- a/srsenb/src/stack/upper/gtpu.cc
++++ b/srsenb/src/stack/upper/gtpu.cc
+@@ -43,15 +43,6 @@ namespace srsenb {
+ 
+ namespace {
+ 
+-bool pavonis_nr_userplane_trace_enabled()
+-{
+-  static const bool enabled = []() {
+-    const char* value = std::getenv("PAVONIS_NR_USERPLANE_TRACE");
+-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+-  }();
+-  return enabled;
+-}
+-
+ bool pavonis_nr_gtpu_pdu_session_container_enabled()
+ {
+   static const bool enabled = []() {
+@@ -61,13 +52,6 @@ bool pavonis_nr_gtpu_pdu_session_container_enabled()
+   return enabled;
+ }
+ 
+-bool pavonis_nr_userplane_trace_take(uint32_t& row)
+-{
+-  static std::atomic<uint32_t> rows{0};
+-  row = rows.fetch_add(1, std::memory_order_relaxed);
+-  return row < 256;
+-}
+-
+ } // namespace
+ 
+ // ensure consistent formatting
+@@ -485,19 +469,6 @@ void gtpu::stop()
+ void gtpu::write_pdu(uint16_t rnti, uint32_t eps_bearer_id, srsran::unique_byte_buffer_t pdu)
+ {
+   srsran::span<gtpu_tunnel_manager::bearer_teid_pair> teids = tunnels.find_rnti_bearer_tunnels(rnti, eps_bearer_id);
+-  uint32_t row = 0;
+-  if (pavonis_nr_userplane_trace_enabled() && pavonis_nr_userplane_trace_take(row)) {
+-    const uint32_t bytes = pdu != nullptr ? pdu->N_bytes : 0;
+-    const uint32_t first8 = bytes > 0 ? pdu->msg[0] : 0;
+-    logger.warning("PAVONIS_NR_USERPLANE_TRACE stage=gtpu_lookup row=%u rnti=0x%x eps_bearer=%u bytes=%u "
+-                   "first8=0x%02x tunnel_count=%u",
+-                   row,
+-                   rnti,
+-                   eps_bearer_id,
+-                   bytes,
+-                   first8,
+-                   static_cast<unsigned>(teids.size()));
+-  }
+   if (teids.empty()) {
+     logger.warning("The rnti=0x%x, eps-BearerID=%d does not have any pdcp_active tunnel", rnti, eps_bearer_id);
+     return;
+@@ -554,23 +525,7 @@ void gtpu::send_pdu_to_tunnel(const gtpu_tunnel& tx_tun, srsran::unique_byte_buf
+     return;
+   }
+   const ssize_t send_rc = sendto(fd, pdu->msg, pdu->N_bytes, MSG_EOR, (struct sockaddr*)&servaddr, sizeof(struct sockaddr_in));
+-  const int     send_errno = send_rc < 0 ? errno : 0;
+-  uint32_t      send_row = 0;
+-  if (pavonis_nr_userplane_trace_enabled() && pavonis_nr_userplane_trace_take(send_row)) {
+-    logger.warning("PAVONIS_NR_USERPLANE_TRACE stage=sendto row=%u rnti=0x%x eps_bearer=%u teid_out=0x%x "
+-                   "payload_bytes=%u wire_bytes=%u pdu_session_ext=%u rc=%d errno=%d",
+-                   send_row,
+-                   tx_tun.rnti,
+-                   tx_tun.eps_bearer_id,
+-                   tx_tun.teid_out,
+-                   payload_bytes,
+-                   pdu->N_bytes,
+-                   add_pdu_session_container,
+-                   static_cast<int>(send_rc),
+-                   send_errno);
+-  }
+   if (send_rc < 0) {
+-    errno = send_errno;
+     perror("sendto");
+   }
+ }
+diff --git a/srsenb/src/stack/upper/pdcp.cc b/srsenb/src/stack/upper/pdcp.cc
+index 7f2a8d85b..cc30f39d9 100644
+--- a/srsenb/src/stack/upper/pdcp.cc
++++ b/srsenb/src/stack/upper/pdcp.cc
+@@ -24,32 +24,9 @@
+ #include "srsran/interfaces/enb_gtpu_interfaces.h"
+ #include "srsran/interfaces/enb_rlc_interfaces.h"
+ #include "srsran/interfaces/enb_rrc_interface_pdcp.h"
+-#include <atomic>
+-#include <cstdlib>
+-#include <cstring>
+ 
+ namespace srsenb {
+ 
+-namespace {
+-
+-bool pavonis_nr_userplane_trace_enabled()
+-{
+-  static const bool enabled = []() {
+-    const char* value = std::getenv("PAVONIS_NR_USERPLANE_TRACE");
+-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
+-  }();
+-  return enabled;
+-}
+-
+-bool pavonis_nr_userplane_trace_take(uint32_t& row)
+-{
+-  static std::atomic<uint32_t> rows{0};
+-  row = rows.fetch_add(1, std::memory_order_relaxed);
+-  return row < 128;
+-}
+-
+-} // namespace
+-
+ pdcp::pdcp(srsran::task_sched_handle task_sched_, srslog::basic_logger& logger_) :
+   task_sched(task_sched_), logger(logger_)
+ {}
+@@ -224,22 +201,6 @@ std::map<uint32_t, srsran::unique_byte_buffer_t> pdcp::get_buffered_pdus(uint16_
+ 
+ void pdcp::write_pdu(uint16_t rnti, uint32_t lcid, srsran::unique_byte_buffer_t sdu)
+ {
+-  uint32_t row = 0;
+-  if (lcid >= 4 && pavonis_nr_userplane_trace_enabled() && pavonis_nr_userplane_trace_take(row)) {
+-    const uint32_t bytes = sdu != nullptr ? sdu->N_bytes : 0;
+-    const uint32_t first24 = bytes >= 3 ? (static_cast<uint32_t>(sdu->msg[0]) << 16U) |
+-                                             (static_cast<uint32_t>(sdu->msg[1]) << 8U) |
+-                                             static_cast<uint32_t>(sdu->msg[2])
+-                                       : 0;
+-    logger.warning("PAVONIS_NR_USERPLANE_TRACE stage=pdcp_input row=%u rnti=0x%x lcid=%u bytes=%u "
+-                   "first24=0x%06x user_exists=%u",
+-                   row,
+-                   rnti,
+-                   lcid,
+-                   bytes,
+-                   first24,
+-                   users.count(rnti) != 0);
+-  }
+   if (users.count(rnti)) {
+     users[rnti].pdcp->write_pdu(lcid, std::move(sdu));
+   }
+diff --git a/srsgnb/src/stack/mac/mac_nr.cc b/srsgnb/src/stack/mac/mac_nr.cc
+index 7bcbcf51d..d07144cc9 100644
+--- a/srsgnb/src/stack/mac/mac_nr.cc
++++ b/srsgnb/src/stack/mac/mac_nr.cc
+@@ -30,36 +30,14 @@
+ #include "srsran/mac/mac_rar_pdu_nr.h"
+ 
+ #include <atomic>
+-#include <cerrno>
+ #include <cstdlib>
+ #include <cstring>
+-#include <fcntl.h>
+-#include <string>
+-#include <unistd.h>
+ 
+ //#define WRITE_SIB_PCAP
+ 
+ namespace srsenb {
+ namespace {
+ 
+-bool pucch_ack_trace_enabled()
+-{
+-  static const bool enabled = []() {
+-    const char* value = std::getenv("PAVONIS_NR_PUCCH_ACK_TRACE");
+-    return value != nullptr && std::strcmp(value, "0") != 0;
+-  }();
+-  return enabled;
+-}
+-
+-bool setup_ul_trace_enabled()
+-{
+-  static const bool enabled = []() {
+-    const char* value = std::getenv("PAVONIS_NR_SETUP_UL_TRACE");
+-    return value != nullptr && std::strcmp(value, "0") != 0;
+-  }();
+-  return enabled;
+-}
+-
+ bool setup_ack_ul_grant_enabled()
+ {
+   static const bool enabled = []() {
+@@ -69,36 +47,6 @@ bool setup_ack_ul_grant_enabled()
+   return enabled;
+ }
+ 
+-const std::string& setup_ack_tx_worker_trace_arm_path()
+-{
+-  static const std::string path = []() {
+-    const char* value = std::getenv("PAVONIS_NR_TX_WORKER_TRACE_ARM_FILE_ON_SETUP_ACK");
+-    return value != nullptr ? std::string(value) : std::string();
+-  }();
+-  return path;
+-}
+-
+-int arm_tx_worker_trace_on_setup_ack()
+-{
+-  const std::string& path = setup_ack_tx_worker_trace_arm_path();
+-  if (path.empty()) {
+-    return 0;
+-  }
+-
+-  static std::atomic<bool> attempted{false};
+-  bool                     expected = false;
+-  if (not attempted.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+-    return 0;
+-  }
+-
+-  int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+-  if (fd >= 0) {
+-    close(fd);
+-    return 1;
+-  }
+-  return errno == EEXIST ? 1 : -errno;
+-}
+-
+ uint32_t setup_followup_ul_grant_budget()
+ {
+   static const uint32_t budget = []() {
+@@ -724,43 +672,8 @@ mac_nr::ul_sched_t* mac_nr::get_ul_sched(const srsran_slot_cfg_t& slot_cfg)
+   return ul_sched;
+ }
+ 
+-int mac_nr::pucch_info(const srsran_slot_cfg_t& slot_cfg, const mac_interface_phy_nr::pucch_info_t& pucch_info)
++int mac_nr::pucch_info(const srsran_slot_cfg_t&, const mac_interface_phy_nr::pucch_info_t& pucch_info)
+ {
+-  if (pucch_info.uci_data.cfg.ack.count > 0 && pucch_ack_trace_enabled()) {
+-    static std::atomic<uint32_t> trace_rows{0};
+-    uint32_t                     row = trace_rows.fetch_add(1, std::memory_order_relaxed);
+-    if (row < 64) {
+-      logger.warning("PAVONIS_NR_PUCCH_ACK_TRACE row=%u slot=%u rnti=0x%x ack_count=%u valid=%u ack0=%u sr=%u "
+-                     "nof_csi=%u snr_db=%.3f",
+-                     row,
+-                     slot_cfg.idx,
+-                     pucch_info.uci_data.cfg.pucch.rnti,
+-                     pucch_info.uci_data.cfg.ack.count,
+-                     pucch_info.uci_data.value.valid ? 1U : 0U,
+-                     static_cast<unsigned>(pucch_info.uci_data.value.ack[0]),
+-                     pucch_info.uci_data.value.sr,
+-                     pucch_info.uci_data.cfg.nof_csi,
+-                     pucch_info.csi.snr_dB);
+-    }
+-  }
+-
+-  if (pucch_info.uci_data.cfg.o_sr > 0 && setup_ul_trace_enabled()) {
+-    static std::atomic<uint32_t> trace_rows{0};
+-    uint32_t                     row = trace_rows.fetch_add(1, std::memory_order_relaxed);
+-    if (row < 64) {
+-      logger.warning("PAVONIS_NR_PUCCH_SR_TRACE row=%u slot=%u rnti=0x%x valid=%u sr=%u ack_count=%u "
+-                     "nof_csi=%u snr_db=%.3f",
+-                     row,
+-                     slot_cfg.idx,
+-                     pucch_info.uci_data.cfg.pucch.rnti,
+-                     pucch_info.uci_data.value.valid ? 1U : 0U,
+-                     pucch_info.uci_data.value.sr,
+-                     pucch_info.uci_data.cfg.ack.count,
+-                     pucch_info.uci_data.cfg.nof_csi,
+-                     pucch_info.csi.snr_dB);
+-    }
+-  }
+-
+   if (not handle_uci_data(pucch_info.uci_data.cfg.pucch.rnti, pucch_info.uci_data.cfg, pucch_info.uci_data.value)) {
+     logger.error("Error handling UCI data from PUCCH reception");
+     return SRSRAN_ERROR;
+@@ -817,10 +730,6 @@ bool mac_nr::handle_uci_data(uint16_t rnti, const srsran_uci_cfg_nr_t& cfg_, con
+           logger.warning(
+               "PAVONIS_NR_SETUP_FOLLOWUP_DL_HARQ_RETX armed rnti=0x%x budget=%u", rnti, dl_retx_budget);
+         }
+-        int arm_result = arm_tx_worker_trace_on_setup_ack();
+-        if (arm_result != 0) {
+-          logger.warning("PAVONIS_NR_TX_WORKER_TRACE_ARM_ON_SETUP_ACK result=%d rnti=0x%x", arm_result, rnti);
+-        }
+         sched->ul_sr_info(rnti);
+         static std::atomic<uint32_t> marker_rows{0};
+         if (marker_rows.fetch_add(1, std::memory_order_relaxed) < 32) {
+@@ -888,24 +797,6 @@ int mac_nr::pusch_info(const srsran_slot_cfg_t& slot_cfg, mac_interface_phy_nr::
+   uint16_t rnti      = pusch_info.rnti;
+   uint32_t nof_bytes = pusch_info.pdu->N_bytes;
+ 
+-  if (setup_ul_trace_enabled()) {
+-    static std::atomic<uint32_t> trace_rows{0};
+-    uint32_t                     row = trace_rows.fetch_add(1, std::memory_order_relaxed);
+-    if (row < 64) {
+-      logger.warning("PAVONIS_NR_PUSCH_TRACE row=%u slot=%u rnti=0x%x pid=%u crc=%u bytes=%u ack_count=%u "
+-                     "uci_valid=%u snr_db=%.3f",
+-                     row,
+-                     slot_cfg.idx,
+-                     rnti,
+-                     pusch_info.pid,
+-                     pusch_info.pusch_data.tb[0].crc ? 1U : 0U,
+-                     nof_bytes,
+-                     pusch_info.uci_cfg.ack.count,
+-                     pusch_info.pusch_data.uci.valid ? 1U : 0U,
+-                     pusch_info.csi.snr_dB);
+-    }
+-  }
+-
+   // Handle UCI data
+   if (not handle_uci_data(rnti, pusch_info.uci_cfg, pusch_info.pusch_data.uci)) {
+     logger.error("Error handling UCI data from PUCCH reception");
+-- 
+2.53.0
+

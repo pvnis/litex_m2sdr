@@ -1,0 +1,50 @@
+# CP3635 - Account-Neutral Reproducibility Package
+
+## Verdict
+
+PASS for the no-network/no-RF package gate. A new append-only supervisor
+package now contains clean source snapshots, the slow and fast proven hold
+chains, exact non-secret primer configs, generic role-based SSH/SCP, a
+deterministic site materializer, source build tools, deployment, doctor,
+privacy scan, and a fail-closed operator entry point. No historical package,
+source repository, or prior checkpoint was modified.
+
+## Verification
+
+- Four Git bundles verify and unpack at exact one-commit heads.
+- The CP3406 OCUDU overlay hashes match
+  `50fee909...a0e7` and `79345305...af8` for its two primary files.
+- A fresh example site materializes all templates with no unresolved token.
+- `RENDERED_SHA256SUMS` and `portable_baseline.sha256` pass.
+- Six critical slow/fast parent-child dependency pins match rendered bytes.
+- Four primer config pins are regenerated to rendered config bytes.
+- All shell and Python sources parse.
+- Deploy closure contains 94 files, including four primer configs, with no
+  basename collision.
+- Slow and fast RF gates both close before SSH with return code 2.
+- Package privacy scan passes across source, evidence, and 3,385 sanitized
+  checkpoint files.
+- `PAVONIS_PORTABLE_CONTROLLER_SELFTEST=PASS`.
+
+The generic transport was tested through command-construction mocks and the
+complete controller self-test. It was not used to alter the established lab
+accounts; actual clean-account RF use remains subject to the staged runbook.
+
+## Artifacts
+
+- `PAVONIS_FINAL_REPRODUCIBLE_HANDOFF_20260808/README.md`
+  SHA-256 `1c2603bb98b553cc2117677a1ebffbcf5549081039c95e84957f8170f27ee05f`.
+- `PAVONIS_FINAL_REPRODUCIBLE_HANDOFF_20260808/AGENT_HANDOFF.md`
+  SHA-256 `8e2573f45c758252bbda93f79a94a0b5e5809ecf15807565252f1dcffb0b9722`.
+- `PAVONIS_FINAL_REPRODUCIBLE_HANDOFF_20260808/docs/RUNBOOK.md`
+  SHA-256 `24e9161067e98b97c99f1612768d0453fab3fc2197057e2c6f6059166d41b918`.
+- `PAVONIS_FINAL_REPRODUCIBLE_HANDOFF_20260808/docs/FILE_CHANGE_AND_SANITIZATION_INVENTORY.md`
+  SHA-256 `29c4500e5972af882e00b446390394a84feb1c0e12c3100960067e5265648b04`.
+- `PAVONIS_FINAL_REPRODUCIBLE_HANDOFF_20260808/docs/REPORT_FINAL.md`
+  SHA-256 `6225e5372410e7525f57fc8e18a7852038872f779d718ad1b26380a71d9c6404`.
+
+## Decision
+
+The package is the new human/agent handoff. Historical artifacts remain
+evidence only. No RF was required for this checkpoint.
+

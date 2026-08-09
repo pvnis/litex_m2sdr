@@ -1,0 +1,21 @@
+# Historical runtime pins used by the proven harness. A clean rebuild may have
+# different bytes because of compiler, path, and ABI provenance. Map only after
+# each replacement artifact has passed the no-RF checks in RUNBOOK.md.
+
+[artifacts]
+qcore = "f2bb11379bc91ff1f443b6f67f854181b07a76106c71c4583007e071e92102d3"
+gnb_stage = "dbc7cb7905e51b58a9621e9e6fa93fab81e1286938eb7bd543517c91cc7060b9"
+gnb_slow = "90a5db019d52b3f893572d96a8338eae67a81b1e4169e8eb12c4afab20375f8a"
+gnb_fast = "1154351c334e8916d268b6e7531d1183efb8b872d4c22fbdd9da89c4585d409a"
+srsenb = "fb830086dbb69836e44eefcbb3ce49faa885f1e7d80f31fc62c32248e7b2b089"
+rf_soapy = "142a2efc2c8309d510f6cad06b5f0280b8ed08ddaedd2a70c72affe952b3ca56"
+soapy_module_recorded = "81b8cb2e079ed050a0056768cc349b0aaf31b25ae145eca359bd24934f4ff97c"
+soapy_module_legacy_default = "b784c400abdb0ae5c3fa9a0c2f09525d9a09bca4f462b138f469c7118f44520e"
+soapy_source_recorded = "644e7858ee88d92791a495b7f4a24d762c9e819afb5337c0ef20d02e65ca4e76"
+soapy_source_legacy_default = "b5131aabe12da43a3e220956b0c8c85ebb32c35bf5f39cbfc364025491eefd89"
+m2sdr_kernel_module = "3ded84bbc2ac7ff26a8192666c4083041ae54ebdfd808b48633ccedc91261ead"
+srsenb_enb_conf = "4d0e67a967403d9b801cdd080f86cc36f2a0de507cd352299f1e01770f582094"
+srsenb_rr_conf = "975feb78150cb512d354cab0f5b721dd59c56c174dfc01d928c1a958a48cc5de"
+srsenb_sib_conf = "b781724b1c199e610e7f4d12b7963120c02d85da4389bccb9c5f8124ee0b57e9"
+srsenb_rb_conf = "5964b3011286730e294f75b913dd2b827773c50500c606b92d9c5664d559f976"
+

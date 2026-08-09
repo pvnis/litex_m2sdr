@@ -1,0 +1,59 @@
+# CP3421 - Lead-11 MCS20 valid negative
+
+## Verdict
+
+**VALID CLEAN NEGATIVE.** The accepted 11 ms transmit-lead shape carries a
+complete attach and sustained bidirectional transfer with exact unique-stream
+TX delivery, but MCS20 is not a reliable throughput improvement. It reaches
+`6.2380/10.1591 Mbit/s` DL/UL, and its bounded PUSCH prefix is only `102/128`
+CRC OK. CP3410 MCS19 remains the clean hardware maximum at
+`6.7441/14.9059 Mbit/s`.
+
+## Evidence
+
+The endpoint-authoritative 45-second, four-stream result passes in both
+directions. Cell selection passes at `13.102 dB` SNR and `-3876.611 Hz` CFO.
+The bounded PHY prefix has `79.69%` total CRC yield. Its 64QAM subset is
+`63/74` CRC OK (`85.14%`) at target code rate `0.5537`; CRC-OK and CRC-KO
+rows have similarly high median SINR (`24.98` and `25.91 dB`), so this is not
+a weak-link or no-acquisition void.
+
+The authoritative TX stop summary is clean on the established unique-stream
+criterion:
+
+- stream samples equal returned samples at `4,818,205,290`;
+- zero stream deficit, deadline breaks, timeouts, late rows, or hard errors;
+- one 480-sample call-level partial was fully retried;
+- the 11 ms lead, 100 us guard, and inside-guard policy were live.
+
+Against CP3410, MCS20 carries only `68.16%` of the clean MCS19 uplink rate, a
+`31.84%` regression. CP3412's `17.2588 Mbit/s` MCS20 observation remains a
+TX-health-invalid peak and is not promoted. MCS21 or higher is not justified:
+MCS20 is already unreliable and slower, while CP3396 MCS28 was substantially
+worse.
+
+The recollection that a USB/non-M2 LiteX SDR once achieved normal
+bidirectional throughput came from outside this Pavonis campaign. It is
+retained only as qualitative motivation and is not cited as measured evidence.
+
+## Decision
+
+Retire MCS20 as the operational ceiling. Keep MCS19 as the measured clean
+maximum and use the independently accepted 11 ms timing geometry
+(`PRACH=126564`, non-PRACH edge `-126560`) as the robust deadline margin.
+One final MCS19 run at that timing point may confirm the packaged operating
+shape; it is a robustness confirmation, not another throughput search.
+
+## Artifacts
+
+- `cp3421_summary.json`
+- `bounded_pusch_summary.json`
+- `results/attempt_20260731T010010Z/execution_summary.json`
+- `results/attempt_20260731T010010Z/sustained_analysis.json`
+- `results/attempt_20260731T010010Z/core_sustained.json`
+- `results/attempt_20260731T010010Z/ue_sustained.json`
+- `../cp1733_stage6_realue_sib1_rachcfg_summary_20260731T010010Z.json`
+- `../cp1733_20260731T010010Z_sequence.log`
+
+Hashes are recorded in the summary and checkpoint manifest. No credentials,
+private identities, payload bytes, or NAS bytes are included.

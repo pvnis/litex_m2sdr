@@ -1,0 +1,13 @@
+# Pavonis private-lab reproduction profile.
+#
+# Install only on dedicated, single-purpose lab hosts. If the service account
+# is not named "pavonis", replace that token and validate with visudo before
+# installation. The broad rule is intentional and documented: the preserved
+# proof harness runs a service-account-owned realtime-state helper as root and
+# launches qcore/srsUE through dynamic environment wrappers. Narrow command
+# aliases would therefore imply isolation that does not actually exist.
+#
+# A productized deployment must replace this with root-owned fixed-function
+# helpers and a narrow sudo policy.
+
+pavonis ALL=(root) NOPASSWD: ALL

@@ -1,0 +1,103 @@
+# CP3322 - MCS16 Reproduces Balanced Bidirectional OTA
+
+Date: 2026-07-30
+
+## Verdict
+
+**PASS for balanced-throughput reproducibility; PARTIAL only for secondary
+artifact packaging.**
+
+The exact CP3319 radio, candidate, timing, binary, configuration and traffic
+shape reproduces the result. The second valid roll delivers `3.194831 Mbit/s`
+downlink and `3.692189 Mbit/s` uplink over the LiteX-M2SDR/bladeRF OTA path.
+This promotes PUSCH maximum MCS16 into the isolated working POC profile.
+
+The frozen CP3314 MCS28 control remains unchanged.
+
+## Propagation
+
+All MCS16 gates pass:
+
+- one hard-pinned launcher activation marker;
+- one packaged PUSCH mapping with `max_ue_mcs: 16`;
+- zero 64QAM rows across the full 15,070-row PUSCH parse.
+
+This is not the filtered-environment false activation seen in CP3317.
+
+## Result
+
+The cell is healthy at `16.671 dB`; Soapy TX timeout and downlink-late counts
+are both zero. Four preconnected streams run sequentially for 45 seconds per
+direction. Receiver-authoritative results are:
+
+- Downlink: `3.194831 Mbit/s`
+- Uplink: `3.692189 Mbit/s`
+
+The densest 45-second uplink interval schedules `3.975805 Mbit/s` across
+12,720 new transmissions. Median TBS is 1,985 bytes and median positive grant
+gap is two slots. PUSCH is 12,699/13,144 CRC OK (`96.61%`), comprising
+11,162/11,599 16QAM and 1,537/1,545 QPSK rows. Median accepted SINR is
+`18.1 dB`.
+
+The outcome is effectively identical to CP3319: downlink is `1.0006x`,
+uplink `1.0036x`, and scheduled uplink `0.9897x` the first roll. Uplink is
+`8.56x` CP3314 and `22.10x` the original CP3176 wireless baseline.
+
+Short-BSR telemetry remains zero in all 16 active-window rows. The working
+result therefore does not claim the BSR issue is fixed; reliable medium-sized
+16QAM grants are sufficient to sustain balanced traffic despite it.
+
+## Packaging Classification
+
+The outer controller status is nonzero because the secondary UE-role artifact
+package returned rc1 after traffic completed. The primary radio package,
+endpoint result fetches, strict traffic analysis, duration and stream gates,
+cleanup, and post-run private user-plane socket check all pass.
+
+This is an artifact-packaging partial, not a radio or throughput failure. The
+receiver-authoritative result files and primary radio evidence are present and
+hashed below.
+
+## Decision
+
+PUSCH maximum MCS16 is now the working LiteX-M2SDR POC policy. Keep it in an
+isolated profile or hash-pinned launcher so the CP3314 MCS28 control remains
+byte-identical. The normal-throughput goal is met at roughly `3.2/3.7 Mbit/s`
+DL/UL in two consecutive valid MCS16 rolls.
+
+The ideal ZMQ result remains about `9.04x` faster in uplink, so this is a
+reproducible hardware-path operating point, not the maximum theoretical
+scheduler capability.
+
+## Artifacts
+
+- `cp3322_summary.json`
+- `artifacts/active_ul.json`
+  SHA-256:
+  `4cbcc8cff5d864e56a24146ab7ee1a328c3d0494dfe6f5ca31a7bc96ca1b61fe`
+- `artifacts/core_sustained.json`
+  SHA-256:
+  `a43a4a282af5de6ec6db75bfa89cea8911d64017532f7abe535ad4f28aed0760`
+- `artifacts/execution_summary.json`
+  SHA-256:
+  `b054031810aed901f8ef59a3666f993c6cd253f7090f0eda1f381368795533d0`
+- `artifacts/gnb-run.pusch-mcs16.yml`
+  SHA-256:
+  `464cb77e8ef1ca8c6d1bbf54478ce89e14c84ef509292ea3dec316d65db47e4f`
+- `artifacts/package_status.json`
+  SHA-256:
+  `6d852a583cd03e5ff8b7a744a7de2dd5a3c67bdf8aab93a3298f1b674af878a6`
+- `artifacts/sustained_analysis.json`
+  SHA-256:
+  `6517ebcd99ff5606c3e2008181b5e276daacbbd6bd5de65f159e01dfbf40e214`
+- `artifacts/ue_sustained.json`
+  SHA-256:
+  `2738a88fbda9317d00783751c0eeeb76adad94c0e4ee2e630abbf162db5baffd`
+
+Source radio summary:
+`cp1733_stage6_realue_sib1_rachcfg_summary_20260730T070523Z.json`, SHA-256
+`388dcec7e8193d920b3579b2a8e506ad05b28c5bd4b8d3c0518191a87492c863`.
+
+Source sequence record:
+`cp1733_20260730T070523Z_sequence.log`, SHA-256
+`58cd4367691af3f6f7c240f80512ab919bd6b2d8d2fc60d5d20f25e2c33b1e0c`.

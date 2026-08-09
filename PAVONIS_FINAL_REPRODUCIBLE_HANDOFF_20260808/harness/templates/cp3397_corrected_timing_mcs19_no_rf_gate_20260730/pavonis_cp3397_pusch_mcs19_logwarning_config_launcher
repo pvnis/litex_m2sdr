@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_BIN="${PAVONIS_GNB_BASE_BIN:-@REMOTE_HOME@/CLionProjects/ocudu/build-clion/apps/gnb/gnb}"
+BASE_SHA="${PAVONIS_GNB_BASE_SHA:-1f7fd4702de1993563de0c11bb14c71a5ac6b226b9b4e241229bdcbc0a0f2205}"
+MAX_MCS=19
+GNB_LOG_ALL_LEVEL=warning
+
+actual_base_sha="$(sha256sum "$BASE_BIN" | awk '{print $1}')"
+if [[ "$actual_base_sha" != "$BASE_SHA" ]]; then
+  printf 'CP3397_CONFIG_BASE_GNB_HASH_MISMATCH\n' >&2
+  exit 63
+fi
+
+printf 'PAVONIS_CP3397_MCS19_CONFIG_LAUNCHER_ACTIVE max_mcs=%s gnb_log_all_level=%s\n' \
+  "$MAX_MCS" "$GNB_LOG_ALL_LEVEL"
+
+if [[ "${PAVONIS_CP3397_CONFIG_LAUNCHER_VALIDATE_ONLY:-0}" == 1 ]]; then
+  printf 'PAVONIS_CP3397_CONFIG_LAUNCHER_VALIDATE_ONLY=PASS base_sha=%s\n' \
+    "$actual_base_sha"
+  exit 0
+fi
+
+args=("$@")
+config_index=-1
+for ((i = 0; i < ${#args[@]}; ++i)); do
+  if [[ "${args[$i]}" == "-c" ]]; then
+    ((i + 1 < ${#args[@]}))
+    config_index=$((i + 1))
+    break
+  fi
+done
+((config_index >= 0))
+
+source_config="${args[$config_index]}"
+[[ "$source_config" == /*.yml && -f "$source_config" ]]
+grep -q '^cell_cfg:$' "$source_config"
+if grep -q '^  pusch:$' "$source_config"; then
+  printf 'CP3397_CONFIG_PUSCH_REJECT=existing_pusch\n' >&2
+  exit 64
+fi
+
+target_dir="${source_config%.yml}.cp3397_pusch_mcs19_logwarning"
+target_config="$target_dir/gnb-run.yml"
+[[ ! -e "$target_dir" ]]
+mkdir -m 700 "$target_dir"
+awk '
+  BEGIN {
+    inserted = 0
+    log_level_replaced = 0
+  }
+  /^  all_level: info$/ {
+    print "  all_level: warning"
+    log_level_replaced++
+    next
+  }
+  /^  pdcch:/ && inserted == 0 {
+    print "  pusch:"
+    print "    max_ue_mcs: 19"
+    inserted = 1
+  }
+  { print }
+  END {
+    if (inserted != 1 || log_level_replaced != 1) {
+      exit 65
+    }
+  }
+' "$source_config" >"$target_config"
+
+[[ "$(grep -c '^  pusch:$' "$target_config")" == 1 ]]
+[[ "$(grep -c '^    max_ue_mcs: 19$' "$target_config")" == 1 ]]
+[[ "$(grep -c '^  all_level: warning$' "$target_config")" == 1 ]]
+[[ "$(grep -c '^  all_level: info$' "$target_config")" == 0 ]]
+
+source_sha="$(sha256sum "$source_config" | awk '{print $1}')"
+target_sha="$(sha256sum "$target_config" | awk '{print $1}')"
+printf 'PAVONIS_CP3397_CONFIG_ACTIVE max_mcs=%s source_sha=%s target_sha=%s target=%s\n' \
+  "$MAX_MCS" "$source_sha" "$target_sha" "$target_config"
+
+if [[ "${PAVONIS_CP3397_CONFIG_ONLY:-0}" == 1 ]]; then
+  exit 0
+fi
+
+args[$config_index]="$target_config"
+exec "$BASE_BIN" "${args[@]}"

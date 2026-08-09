@@ -1,0 +1,53 @@
+# CP3464 - 2x2 lead-13 producer repeat
+
+## Verdict
+
+**PASS / STRICT PRODUCER HEALTH, REPEATED.** The unchanged CP3463 shape again
+opens genuine `10 MHz, 2T2R` and delivers both channels with zero final sample
+loss. CP3463 and CP3464 are two consecutive strict-clean rolls.
+
+No UE or phone was started. The established 1x1 baseline remains untouched.
+
+## Result
+
+Both TX channels read back at 11.52 Msps. Runtime proves 13 ms TX lead and the
+100 us inside-guard deadline policy.
+
+| Metric | CP3463 | CP3464 |
+| --- | ---: | ---: |
+| Cumulative timeouts | 0 | 0 |
+| Deadline breaks | 0 | 0 |
+| Abandoned samples | 0 | 0 |
+| Final stream deficit | 0 | 0 |
+| Partial returns | 1 | 1 |
+| Fully recovered partial samples | 480 | 480 |
+| Downlink/release late | 0 / 0 | 0 / 0 |
+| Hard errors | 0 | 0 |
+
+Each partial short return was fully retried. The final stream deficit is zero
+in both runs.
+
+## Decision
+
+The CP3461 dual-channel loss is explained by insufficient producer lead for
+the observed stalls, and 13 ms passes the bounded acceptance gate twice. This
+does not prove arbitrary-duration immunity, but it is enough to unlock one
+isolated phone rank-2 experiment.
+
+Before that run, the 2 ms lead increase must be reflected in the coherent UE
+timing family. At 11.52 Msps, 2 ms is 23,040 samples. The phone launcher must
+add that delta to the known lead-11 PRACH/non-PRACH/edge calibration as an
+isolated profile and pass no-RF propagation/dry-run/default-closed proofs.
+
+## Evidence
+
+- `../cp3463_mimo_2x2_lead13_gnb_only_20260731/results/attempt_CP3464_20260731T071848Z/execution_summary.json`
+  - SHA-256 `4a600397cf767fb410180fbf32fee04da141f21f48e9ac9ceb01fddd1c48c73a`
+- `../cp1733_stage6_realue_sib1_rachcfg_summary_CP3464_20260731T071848Z.json`
+  - SHA-256 `56250692c14612793487ddee8224cedc3e5882cdcd8cac9eb1842fdc7e9f93d1`
+- `../cp3463_mimo_2x2_lead13_gnb_only_[gNB host]_CP3464_20260731T071848Z.tar.gz`
+  - SHA-256 `1fb932186f2394c0657f003a77a5dc6fd380f1dc42980f930b84e3eaaaa0e9ff`
+- M2SDR TX readback inside the extracted archive
+  - SHA-256 `81b353eddbcc52cdd4cb02944c3b8525818a28a890e76e1007427b809edef946`
+- `producer_health.txt`
+- `cp3464_summary.json`

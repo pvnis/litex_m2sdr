@@ -1,0 +1,2034 @@
+From ea5810fb3a34a2e8d46eee022b41daf03da7f50e Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 16:29:29 +0200
+Subject: [PATCH] soapysdr: preserve contiguous timed TX remainder handling
+
+CP2073-CP2082 isolated descriptor churn to partial untimed remainders after timed writes. Keep contiguous remainders in the active buffer, preserve timestamp continuity, and retain bounded default-off worker diagnostics used by the CP2047 acceptance gate. This is a POC workaround for unresolved ring/backpressure behavior.
+---
+ .../software/soapysdr/LiteXM2SDRDevice.hpp    |   28 +-
+ .../software/soapysdr/LiteXM2SDRStreaming.cpp | 1607 ++++++++++++++++-
+ 2 files changed, 1576 insertions(+), 59 deletions(-)
+
+diff --git a/litex_m2sdr/software/soapysdr/LiteXM2SDRDevice.hpp b/litex_m2sdr/software/soapysdr/LiteXM2SDRDevice.hpp
+index 61833d4..33eca24 100644
+--- a/litex_m2sdr/software/soapysdr/LiteXM2SDRDevice.hpp
++++ b/litex_m2sdr/software/soapysdr/LiteXM2SDRDevice.hpp
+@@ -568,6 +568,29 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
+          * point _clearConsumedTXHeaders has already wiped it.
+          */
+         bool reader_enabled = false;
++
++        /* CP1200 diagnostic counters: updated only by the TX worker inside
++         * _dmaReleaseWrite, after duplicate HAS_TIME suppression has decided
++         * the actual DMA header flags.
++         */
++        uint64_t release_summary_seq = 0;
++        uint64_t release_packets = 0;
++        uint64_t release_samples = 0;
++        uint64_t release_pre_has_time = 0;
++        uint64_t release_post_has_time = 0;
++        uint64_t release_dedup_suppressed = 0;
++        uint64_t release_post_no_time = 0;
++        uint64_t release_post_eob = 0;
++        uint64_t release_has_time_pos_ns = 0;
++        uint64_t release_has_time_zero_ns = 0;
++        uint64_t release_has_time_neg_ns = 0;
++        long long release_time_min_ns = 0;
++        long long release_time_max_ns = 0;
++        uint64_t release_slip_count = 0;
++        uint64_t release_late_count = 0;
++        uint64_t release_late_trace_count = 0;
++        long long release_slip_min_ns = 0;
++        long long release_slip_max_ns = 0;
+     };
+ 
+     RXStream _rx_stream;
+@@ -641,7 +664,9 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
+     void _dmaReleaseRead(size_t handle);
+     int  _dmaAcquireWrite(size_t &handle, uint8_t **buf, const long timeoutUs);
+     void _dmaReleaseWrite(size_t handle, size_t numElems,
+-                          int flags, long long timeNs);
++                          int flags, long long timeNs, long long sourceTimeNs,
++                          bool workerTimingValid, long long workerNowNs,
++                          long long workerSlipNs);
+     /* Walk _tx_stream.cleared_count up to hw_count, clearing the
+      * HAS_TIME / END_BURST bits in each consumed buffer's header so
+      * the LOOP-mode DMA reader doesn't push stale "late" descriptors
+@@ -659,6 +684,7 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
+     void _spawnWorker(Stream &s, bool is_rx);
+     void _stopWorker(Stream &s);
+     void _freePktPool(Stream &s);
++    void dumpPavonisState(const char *reason, int direction);
+ 
+     static LoopbackMode parseLoopbackMode(const SoapySDR::Kwargs &args);
+     static const char  *loopbackModeToString(LoopbackMode mode);
+diff --git a/litex_m2sdr/software/soapysdr/LiteXM2SDRStreaming.cpp b/litex_m2sdr/software/soapysdr/LiteXM2SDRStreaming.cpp
+index 51af996..f010efd 100644
+--- a/litex_m2sdr/software/soapysdr/LiteXM2SDRStreaming.cpp
++++ b/litex_m2sdr/software/soapysdr/LiteXM2SDRStreaming.cpp
+@@ -16,6 +16,8 @@
+ #include <cstring>
+ #include <sstream>
+ #include <algorithm>
++#include <atomic>
++#include <cerrno>
+ #include <cstdlib>
+ #include <cmath>
+ #include <cstdint>
+@@ -196,7 +198,234 @@ static bool m2sdr_env_tx_rms_log_enabled()
+            std::strcmp(v, "off") != 0;
+ }
+ 
++static bool m2sdr_env_tx_zero_after_arm_enabled()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_ZERO_AFTER_ARM");
++    return v && *v && std::strcmp(v, "0") != 0 &&
++           std::strcmp(v, "false") != 0 &&
++           std::strcmp(v, "FALSE") != 0 &&
++           std::strcmp(v, "off") != 0 &&
++           std::strcmp(v, "OFF") != 0 &&
++           std::strcmp(v, "no") != 0 &&
++           std::strcmp(v, "NO") != 0;
++}
++
++static std::atomic<uint64_t> g_tx_zero_after_arm_checks{0};
++static std::atomic<uint64_t> g_tx_zero_after_arm_enabled_checks{0};
++static std::atomic<uint64_t> g_tx_zero_after_arm_active_checks{0};
++static std::atomic<uint64_t> g_tx_zero_after_arm_probe_checks{0};
++static std::atomic<uint64_t> g_tx_zero_after_arm_probe_polls{0};
++static std::atomic<uint64_t> g_tx_zero_after_arm_probe_armed_polls{0};
++static std::atomic<uint64_t> g_tx_zero_after_arm_probe_armed_returns{0};
++static std::atomic<uint64_t> g_tx_zero_after_arm_zeroed_calls{0};
++static std::atomic<uint64_t> g_tx_zero_after_arm_zeroed_elems{0};
++static std::atomic<uint64_t> g_tx_zero_after_arm_zero_src_null{0};
++static std::atomic<int> g_tx_zero_after_arm_last_access_rc{-1};
++static std::atomic<int> g_tx_zero_after_arm_last_errno{0};
++
++static uint64_t m2sdr_env_tx_zero_after_arm_summary_period()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_ZERO_AFTER_ARM_SUMMARY_PERIOD");
++    if (!v || !*v)
++        return 1024;
++    const long n = std::strtol(v, nullptr, 10);
++    return n > 0 ? static_cast<uint64_t>(n) : 1;
++}
++
++static const char *m2sdr_getenv_or_empty(const char *name)
++{
++    const char *v = std::getenv(name);
++    return v ? v : "";
++}
++
++static void m2sdr_tx_zero_after_arm_write_summary(const char *reason, bool force = false)
++{
++    const char *path = std::getenv("M2SDR_SOAPY_TX_ZERO_AFTER_ARM_SUMMARY_PATH");
++    if (!path || !*path)
++        return;
+ 
++    static std::atomic<uint64_t> seq{0};
++    const uint64_t row = seq.fetch_add(1, std::memory_order_relaxed);
++    const uint64_t period = m2sdr_env_tx_zero_after_arm_summary_period();
++    if (!force && period > 1 && (row % period) != 0)
++        return;
++
++    FILE *f = std::fopen(path, "w");
++    if (!f) {
++        static std::atomic<bool> announced{false};
++        bool expected = false;
++        if (announced.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
++            SoapySDR_logf(SOAPY_SDR_ERROR,
++                "Unable to open M2SDR TX zero-after-arm summary path: %s", path);
++        }
++        return;
++    }
++
++    std::fprintf(f, "PAVONIS_M2SDR_TX_ZERO_AFTER_ARM_SUMMARY=1\n");
++    std::fprintf(f, "reason=%s\n", reason ? reason : "unknown");
++    std::fprintf(f, "summary_seq=%llu\n", static_cast<unsigned long long>(row));
++    std::fprintf(f, "env_M2SDR_SOAPY_TX_ZERO_AFTER_ARM=%s\n",
++                 m2sdr_getenv_or_empty("M2SDR_SOAPY_TX_ZERO_AFTER_ARM"));
++    std::fprintf(f, "env_M2SDR_SOAPY_TX_PROBE_ARM_FILE=%s\n",
++                 m2sdr_getenv_or_empty("M2SDR_SOAPY_TX_PROBE_ARM_FILE"));
++    std::fprintf(f, "env_M2SDR_SOAPY_TX_PROBE_ARM_POLL_PERIOD=%s\n",
++                 m2sdr_getenv_or_empty("M2SDR_SOAPY_TX_PROBE_ARM_POLL_PERIOD"));
++    std::fprintf(f, "env_M2SDR_SOAPY_TX_ZERO_AFTER_ARM_SUMMARY_PERIOD=%s\n",
++                 m2sdr_getenv_or_empty("M2SDR_SOAPY_TX_ZERO_AFTER_ARM_SUMMARY_PERIOD"));
++    std::fprintf(f, "checks=%llu\n",
++                 static_cast<unsigned long long>(g_tx_zero_after_arm_checks.load(std::memory_order_relaxed)));
++    std::fprintf(f, "enabled_checks=%llu\n",
++                 static_cast<unsigned long long>(g_tx_zero_after_arm_enabled_checks.load(std::memory_order_relaxed)));
++    std::fprintf(f, "active_checks=%llu\n",
++                 static_cast<unsigned long long>(g_tx_zero_after_arm_active_checks.load(std::memory_order_relaxed)));
++    std::fprintf(f, "probe_checks=%llu\n",
++                 static_cast<unsigned long long>(g_tx_zero_after_arm_probe_checks.load(std::memory_order_relaxed)));
++    std::fprintf(f, "probe_polls=%llu\n",
++                 static_cast<unsigned long long>(g_tx_zero_after_arm_probe_polls.load(std::memory_order_relaxed)));
++    std::fprintf(f, "probe_armed_polls=%llu\n",
++                 static_cast<unsigned long long>(g_tx_zero_after_arm_probe_armed_polls.load(std::memory_order_relaxed)));
++    std::fprintf(f, "probe_armed_returns=%llu\n",
++                 static_cast<unsigned long long>(g_tx_zero_after_arm_probe_armed_returns.load(std::memory_order_relaxed)));
++    std::fprintf(f, "zeroed_interleave_calls=%llu\n",
++                 static_cast<unsigned long long>(g_tx_zero_after_arm_zeroed_calls.load(std::memory_order_relaxed)));
++    std::fprintf(f, "zeroed_interleave_elems=%llu\n",
++                 static_cast<unsigned long long>(g_tx_zero_after_arm_zeroed_elems.load(std::memory_order_relaxed)));
++    std::fprintf(f, "zero_src_null_count=%llu\n",
++                 static_cast<unsigned long long>(g_tx_zero_after_arm_zero_src_null.load(std::memory_order_relaxed)));
++    std::fprintf(f, "last_probe_access_rc=%d\n",
++                 g_tx_zero_after_arm_last_access_rc.load(std::memory_order_relaxed));
++    std::fprintf(f, "last_probe_errno=%d\n",
++                 g_tx_zero_after_arm_last_errno.load(std::memory_order_relaxed));
++    std::fclose(f);
++}
++
++static void m2sdr_tx_zero_after_arm_record_zeroed(size_t elems)
++{
++    g_tx_zero_after_arm_zeroed_calls.fetch_add(1, std::memory_order_relaxed);
++    g_tx_zero_after_arm_zeroed_elems.fetch_add(elems, std::memory_order_relaxed);
++    m2sdr_tx_zero_after_arm_write_summary("zeroed_interleave");
++}
++
++static bool m2sdr_env_rx_ignore_timed_activation_enabled()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_RX_IGNORE_TIMED_ACTIVATION");
++    return v && *v && std::strcmp(v, "0") != 0 &&
++           std::strcmp(v, "false") != 0 &&
++           std::strcmp(v, "FALSE") != 0 &&
++           std::strcmp(v, "off") != 0 &&
++           std::strcmp(v, "OFF") != 0 &&
++           std::strcmp(v, "no") != 0 &&
++           std::strcmp(v, "NO") != 0;
++}
++
++static bool m2sdr_rx_ignore_timed_activation_active(const long long timeNs)
++{
++    if (!m2sdr_env_rx_ignore_timed_activation_enabled())
++        return false;
++
++    static std::atomic<bool> announced{false};
++    bool expected = false;
++    if (announced.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
++        SoapySDR_logf(SOAPY_SDR_INFO,
++            "RX_IGNORE_TIMED_ACTIVATION active: ignoring requested RX timed activation for %lld ns",
++            (long long)timeNs);
++    }
++    return true;
++}
++
++static bool m2sdr_tx_probe_armed()
++{
++    const char *path = std::getenv("M2SDR_SOAPY_TX_PROBE_ARM_FILE");
++    if (!path || !*path)
++        return true;
++    g_tx_zero_after_arm_probe_checks.fetch_add(1, std::memory_order_relaxed);
++
++    static const unsigned poll_period = []() {
++        const char *v = std::getenv("M2SDR_SOAPY_TX_PROBE_ARM_POLL_PERIOD");
++        const long n = v && *v ? std::strtol(v, nullptr, 10) : 1024;
++        return n > 0 ? static_cast<unsigned>(n) : 1024U;
++    }();
++    static std::atomic<unsigned> poll_seen{0};
++    static std::atomic<bool> armed_cached{false};
++
++    const unsigned idx = poll_seen.fetch_add(1, std::memory_order_relaxed);
++    if ((idx % poll_period) == 0) {
++        const int rc = ::access(path, F_OK);
++        const int saved_errno = rc == 0 ? 0 : errno;
++        g_tx_zero_after_arm_probe_polls.fetch_add(1, std::memory_order_relaxed);
++        g_tx_zero_after_arm_last_access_rc.store(rc, std::memory_order_relaxed);
++        g_tx_zero_after_arm_last_errno.store(saved_errno, std::memory_order_relaxed);
++        if (rc == 0)
++            g_tx_zero_after_arm_probe_armed_polls.fetch_add(1, std::memory_order_relaxed);
++        armed_cached.store(rc == 0, std::memory_order_relaxed);
++    }
++
++    const bool armed = armed_cached.load(std::memory_order_relaxed);
++    if (armed)
++        g_tx_zero_after_arm_probe_armed_returns.fetch_add(1, std::memory_order_relaxed);
++    return armed;
++}
++
++static bool m2sdr_tx_zero_after_arm_active()
++{
++    g_tx_zero_after_arm_checks.fetch_add(1, std::memory_order_relaxed);
++    if (!m2sdr_env_tx_zero_after_arm_enabled()) {
++        m2sdr_tx_zero_after_arm_write_summary("disabled");
++        return false;
++    }
++    g_tx_zero_after_arm_enabled_checks.fetch_add(1, std::memory_order_relaxed);
++    if (!m2sdr_tx_probe_armed()) {
++        m2sdr_tx_zero_after_arm_write_summary("waiting_for_arm");
++        return false;
++    }
++    g_tx_zero_after_arm_active_checks.fetch_add(1, std::memory_order_relaxed);
++
++    static std::atomic<bool> announced{false};
++    bool expected = false;
++    if (announced.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
++        SoapySDR::log(SOAPY_SDR_INFO, "TX_ZERO_AFTER_ARM active: replacing TX writeStream payloads with zeros");
++        m2sdr_tx_zero_after_arm_write_summary("active_first", true);
++    }
++    m2sdr_tx_zero_after_arm_write_summary("active");
++    return true;
++}
++
++static const void *m2sdr_zero_tx_input_buffer(const std::string &format, const size_t elems)
++{
++    if (format == SOAPY_SDR_CF32) {
++        thread_local std::vector<float> zeros;
++        if (zeros.size() < elems * 2)
++            zeros.resize(elems * 2, 0.0f);
++        return zeros.data();
++    }
++    if (format == SOAPY_SDR_CS16) {
++        thread_local std::vector<int16_t> zeros;
++        if (zeros.size() < elems * 2)
++            zeros.resize(elems * 2, 0);
++        return zeros.data();
++    }
++    if (format == SOAPY_SDR_CS8) {
++        thread_local std::vector<int8_t> zeros;
++        if (zeros.size() < elems * 2)
++            zeros.resize(elems * 2, 0);
++        return zeros.data();
++    }
++    return nullptr;
++}
++
++static const void *m2sdr_advance_tx_input_buffer(
++    const void *buf,
++    const std::string &format,
++    const size_t elems)
++{
++    if (format == SOAPY_SDR_CF32)
++        return static_cast<const float *>(buf) + elems * 2;
++    if (format == SOAPY_SDR_CS16)
++        return static_cast<const int16_t *>(buf) + elems * 2;
++    if (format == SOAPY_SDR_CS8)
++        return static_cast<const int8_t *>(buf) + elems * 2;
++    return buf;
++}
+ 
+ static void m2sdr_dump_tx_input_once(
+     const void *buf,
+@@ -213,6 +442,8 @@ static void m2sdr_dump_tx_input_once(
+     const char *path = std::getenv("M2SDR_SOAPY_TX_DUMP_PATH");
+     if (!path || !*path || !buf || numElems == 0)
+         return;
++    if (!m2sdr_tx_probe_armed())
++        return;
+ 
+     const char *limit_s = std::getenv("M2SDR_SOAPY_TX_DUMP_SAMPLES");
+     const size_t limit = limit_s && *limit_s ? std::strtoul(limit_s, nullptr, 10) : 2000000;
+@@ -333,12 +564,31 @@ static size_t m2sdr_env_tx_dma_dump_buffers()
+     const long n = std::strtol(v, nullptr, 10);
+     if (n <= 0)
+         return 0;
+-    if (n > 4096)
+-        return 4096;
++    if (n > 65536)
++        return 65536;
+     return static_cast<size_t>(n);
+ }
+ 
+ 
++static uint64_t m2sdr_env_tx_dma_dump_start_handle()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_DMA_DUMP_START_HANDLE");
++    if (!v || !*v)
++        return 0;
++    return static_cast<uint64_t>(std::strtoull(v, nullptr, 10));
++}
++
++
++static long long m2sdr_env_tx_dma_dump_start_time_ns()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_DMA_DUMP_START_TIME_NS");
++    if (!v || !*v)
++        return 0;
++    const long long n = std::strtoll(v, nullptr, 10);
++    return n > 0 ? n : 0;
++}
++
++
+ static void m2sdr_dump_tx_dma_buffer_once(
+     const uint8_t *tx_buffer,
+     const size_t write_size,
+@@ -354,11 +604,21 @@ static void m2sdr_dump_tx_dma_buffer_once(
+     const char *path = std::getenv("M2SDR_SOAPY_TX_DMA_DUMP_PATH");
+     if (!path || !*path || !tx_buffer || write_size == 0)
+         return;
++    if (!m2sdr_tx_probe_armed())
++        return;
+ 
+     const size_t limit = m2sdr_env_tx_dma_dump_buffers();
+     if (limit == 0)
+         return;
+ 
++    const uint64_t start_handle = m2sdr_env_tx_dma_dump_start_handle();
++    if (start_handle > 0 && static_cast<uint64_t>(handle) < start_handle)
++        return;
++
++    const long long start_time_ns = m2sdr_env_tx_dma_dump_start_time_ns();
++    if (start_time_ns > 0 && timeNs < start_time_ns)
++        return;
++
+     static size_t dumped_buffers = 0;
+     static bool announced = false;
+ 
+@@ -416,14 +676,18 @@ static void m2sdr_dump_tx_dma_buffer_once(
+             << ",\"bytesPerComplex\":" << bytesPerComplex
+             << ",\"sampleRate\":" << sampleRate
+             << ",\"zeroCopy\":" << (zeroCopy ? "true" : "false")
++            << ",\"dump_start_handle\":" << static_cast<unsigned long long>(start_handle)
++            << ",\"dump_start_timeNs\":" << start_time_ns
+             << "}\n";
+     }
+ 
+     if (!announced) {
+         SoapySDR_logf(
+             SOAPY_SDR_INFO,
+-            "TX_DMA_DUMP_PROBE path=%s meta=%s buffer_bytes=%zu limit_buffers=%zu",
+-            path, meta_path.c_str(), write_size, limit);
++            "TX_DMA_DUMP_PROBE path=%s meta=%s buffer_bytes=%zu limit_buffers=%zu start_handle=%llu start_time_ns=%lld",
++            path, meta_path.c_str(), write_size, limit,
++            static_cast<unsigned long long>(start_handle),
++            start_time_ns);
+         announced = true;
+     }
+ 
+@@ -450,6 +714,8 @@ static void m2sdr_log_tx_input_rms_once(
+     static size_t logged = 0;
+     if (!m2sdr_env_tx_rms_log_enabled())
+         return;
++    if (!m2sdr_tx_probe_armed())
++        return;
+ 
+     const char *limit_s = std::getenv("M2SDR_SOAPY_TX_RMS_LOG_LIMIT");
+     const size_t limit = limit_s && *limit_s ? std::strtoul(limit_s, nullptr, 10) : 64;
+@@ -517,6 +783,318 @@ static long long m2sdr_env_tx_time_offset_ns()
+     return std::strtoll(v, nullptr, 10);
+ }
+ 
++static bool m2sdr_env_tx_worker_summary_enabled()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_WORKER_SUMMARY");
++    return v && *v &&
++           std::strcmp(v, "0") != 0 &&
++           std::strcmp(v, "false") != 0 &&
++           std::strcmp(v, "FALSE") != 0 &&
++           std::strcmp(v, "off") != 0 &&
++           std::strcmp(v, "OFF") != 0 &&
++           std::strcmp(v, "no") != 0 &&
++           std::strcmp(v, "NO") != 0;
++}
++
++static uint64_t m2sdr_env_tx_worker_summary_period()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_WORKER_SUMMARY_PERIOD");
++    if (!v || !*v)
++        return 1000;
++    const long n = std::strtol(v, nullptr, 10);
++    return n > 0 ? static_cast<uint64_t>(n) : 1000;
++}
++
++static bool m2sdr_env_tx_release_summary_enabled()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_RELEASE_SUMMARY");
++    return v && *v &&
++           std::strcmp(v, "0") != 0 &&
++           std::strcmp(v, "false") != 0 &&
++           std::strcmp(v, "FALSE") != 0 &&
++           std::strcmp(v, "off") != 0 &&
++           std::strcmp(v, "OFF") != 0 &&
++           std::strcmp(v, "no") != 0 &&
++           std::strcmp(v, "NO") != 0;
++}
++
++static uint64_t m2sdr_env_tx_release_summary_period()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_RELEASE_SUMMARY_PERIOD");
++    if (!v || !*v)
++        return 1000;
++    const long n = std::strtol(v, nullptr, 10);
++    return n > 0 ? static_cast<uint64_t>(n) : 1000;
++}
++
++static bool m2sdr_env_tx_release_late_trace_enabled()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_RELEASE_LATE_TRACE");
++    return v && *v &&
++           std::strcmp(v, "0") != 0 &&
++           std::strcmp(v, "false") != 0 &&
++           std::strcmp(v, "FALSE") != 0 &&
++           std::strcmp(v, "off") != 0 &&
++           std::strcmp(v, "OFF") != 0 &&
++           std::strcmp(v, "no") != 0 &&
++           std::strcmp(v, "NO") != 0;
++}
++
++static uint64_t m2sdr_env_tx_release_late_trace_limit()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_RELEASE_LATE_TRACE_LIMIT");
++    if (!v || !*v)
++        return 16;
++    const long n = std::strtol(v, nullptr, 10);
++    if (n <= 0)
++        return 0;
++    if (n > 4096)
++        return 4096;
++    return static_cast<uint64_t>(n);
++}
++
++static long m2sdr_env_tx_full_ring_refresh_us()
++{
++    static const long value = []() {
++        const char *v = std::getenv("M2SDR_SOAPY_TX_FULL_RING_REFRESH_US");
++        if (!v || !*v)
++            return 0L;
++        const long n = std::strtol(v, nullptr, 10);
++        if (n <= 0)
++            return 0L;
++        return std::min<long>(n, 10000);
++    }();
++    return value;
++}
++
++static size_t m2sdr_env_tx_worker_pkt_count()
++{
++    static const size_t value = []() {
++        const char *v = std::getenv("M2SDR_SOAPY_TX_WORKER_PKT_COUNT");
++        if (!v || !*v)
++            return litex_m2sdr::kWorkerPktCount;
++        const long n = std::strtol(v, nullptr, 10);
++        if (n < static_cast<long>(litex_m2sdr::kWorkerPktCount))
++            return litex_m2sdr::kWorkerPktCount;
++        return static_cast<size_t>(std::min<long>(n, 512));
++    }();
++    return value;
++}
++
++static const char *m2sdr_env_tx_worker_trace_path()
++{
++    const char *path = std::getenv("M2SDR_SOAPY_TX_WORKER_TRACE_PATH");
++    return (path && *path) ? path : nullptr;
++}
++
++static uint64_t m2sdr_env_tx_worker_trace_limit()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_WORKER_TRACE_LIMIT");
++    if (!v || !*v)
++        return 65536;
++    const long n = std::strtol(v, nullptr, 10);
++    if (n <= 0)
++        return 0;
++    if (n > 1000000)
++        return 1000000;
++    return static_cast<uint64_t>(n);
++}
++
++static uint64_t m2sdr_env_tx_worker_trace_flush_period()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_WORKER_TRACE_FLUSH_PERIOD");
++    if (!v || !*v)
++        return 256;
++    const long n = std::strtol(v, nullptr, 10);
++    if (n <= 0)
++        return 0;
++    return static_cast<uint64_t>(n);
++}
++
++static bool m2sdr_env_tx_worker_trace_enabled()
++{
++    return m2sdr_env_tx_worker_trace_path() &&
++           m2sdr_env_tx_worker_trace_limit() > 0;
++}
++
++static const char *m2sdr_env_tx_worker_trace_arm_file()
++{
++    const char *path = std::getenv("M2SDR_SOAPY_TX_WORKER_TRACE_ARM_FILE");
++    return (path && *path) ? path : nullptr;
++}
++
++static bool m2sdr_tx_worker_trace_armed()
++{
++    const char *arm_file = m2sdr_env_tx_worker_trace_arm_file();
++    if (!arm_file)
++        return true;
++
++    static std::atomic<bool> armed{false};
++    if (armed.load(std::memory_order_relaxed))
++        return true;
++
++    if (::access(arm_file, F_OK) != 0)
++        return false;
++
++    bool expected = false;
++    if (armed.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
++        SoapySDR_logf(SOAPY_SDR_INFO,
++            "M2SDR TX worker trace armed by file: %s", arm_file);
++    }
++    return true;
++}
++
++static bool m2sdr_env_tx_align_has_time_remainder_enabled()
++{
++    const char *v = std::getenv("M2SDR_SOAPY_TX_ALIGN_HAS_TIME_REMAINDER");
++    return v && *v &&
++           std::strcmp(v, "0") != 0 &&
++           std::strcmp(v, "false") != 0 &&
++           std::strcmp(v, "FALSE") != 0 &&
++           std::strcmp(v, "off") != 0 &&
++           std::strcmp(v, "OFF") != 0 &&
++           std::strcmp(v, "no") != 0 &&
++           std::strcmp(v, "NO") != 0;
++}
++
++static bool m2sdr_env_tx_backfill_contiguous_time_enabled()
++{
++    static const bool enabled = []() {
++        const char *v = std::getenv("M2SDR_SOAPY_TX_BACKFILL_CONTIGUOUS_TIME");
++        return v && *v &&
++               std::strcmp(v, "0") != 0 &&
++               std::strcmp(v, "false") != 0 &&
++               std::strcmp(v, "FALSE") != 0 &&
++               std::strcmp(v, "off") != 0 &&
++               std::strcmp(v, "OFF") != 0 &&
++               std::strcmp(v, "no") != 0 &&
++               std::strcmp(v, "NO") != 0;
++    }();
++    return enabled;
++}
++
++static long long m2sdr_wall_time_ns()
++{
++    const auto now = std::chrono::system_clock::now().time_since_epoch();
++    return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
++}
++
++static FILE *m2sdr_tx_worker_trace_file()
++{
++    static bool opened = false;
++    static FILE *f = nullptr;
++    if (opened)
++        return f;
++    opened = true;
++
++    const char *path = m2sdr_env_tx_worker_trace_path();
++    if (!path)
++        return nullptr;
++
++    f = std::fopen(path, "a");
++    if (!f) {
++        SoapySDR_logf(SOAPY_SDR_ERROR,
++            "Unable to open M2SDR TX worker trace path: %s", path);
++        return nullptr;
++    }
++
++    std::fprintf(f, "# PAVONIS_M2SDR_TX_WORKER_TRACE v1\n");
++    std::fprintf(f,
++        "# wall_ns\tseq\tstage\thandle\tring_slot\tnum_elems\tmtu_elems\t"
++        "flags_pre\tflags_post\thas_time_pre\thas_time_post\teob_post\t"
++        "dedup_suppressed\tsource_time_ns\trelease_time_ns\thw_now_ns\t"
++        "slip_ns\tlate\treader_before\treader_after\tuser_before\t"
++        "user_after\thw_before\thw_after\tsw_before\tsw_after\t"
++        "cleared_before\tcleared_after\tzero_copy\tsamplerate\n");
++    std::fflush(f);
++    return f;
++}
++
++static void m2sdr_tx_worker_trace_emit(
++    const char *stage,
++    size_t handle,
++    size_t ringSlot,
++    size_t numElems,
++    size_t mtuElems,
++    int flagsPre,
++    int flagsPost,
++    bool dedupSuppressed,
++    long long sourceTimeNs,
++    long long releaseTimeNs,
++    bool timingValid,
++    long long hwNowNs,
++    long long slipNs,
++    bool late,
++    bool readerBefore,
++    bool readerAfter,
++    int64_t userBefore,
++    int64_t userAfter,
++    int64_t hwBefore,
++    int64_t hwAfter,
++    int64_t swBefore,
++    int64_t swAfter,
++    int64_t clearedBefore,
++    int64_t clearedAfter,
++    bool zeroCopy,
++    double samplerate)
++{
++    if (!m2sdr_env_tx_worker_trace_enabled())
++        return;
++    if (!m2sdr_tx_worker_trace_armed())
++        return;
++
++    static std::atomic<uint64_t> seq{0};
++    const uint64_t row = seq.fetch_add(1, std::memory_order_relaxed);
++    if (row >= m2sdr_env_tx_worker_trace_limit())
++        return;
++
++    FILE *f = m2sdr_tx_worker_trace_file();
++    if (!f)
++        return;
++
++    const bool has_time_pre = (flagsPre & SOAPY_SDR_HAS_TIME) != 0;
++    const bool has_time_post = (flagsPost & SOAPY_SDR_HAS_TIME) != 0;
++    const bool eob_post = (flagsPost & SOAPY_SDR_END_BURST) != 0;
++    std::fprintf(f,
++        "%lld\t%llu\t%s\t%zu\t%zu\t%zu\t%zu\t0x%x\t0x%x\t%d\t%d\t%d\t"
++        "%d\t%lld\t%lld\t%lld\t%lld\t%d\t%d\t%d\t%lld\t%lld\t%lld\t"
++        "%lld\t%lld\t%lld\t%lld\t%lld\t%d\t%.17g\n",
++        static_cast<long long>(m2sdr_wall_time_ns()),
++        static_cast<unsigned long long>(row),
++        stage ? stage : "unknown",
++        handle,
++        ringSlot,
++        numElems,
++        mtuElems,
++        flagsPre,
++        flagsPost,
++        has_time_pre ? 1 : 0,
++        has_time_post ? 1 : 0,
++        eob_post ? 1 : 0,
++        dedupSuppressed ? 1 : 0,
++        static_cast<long long>(sourceTimeNs),
++        static_cast<long long>(releaseTimeNs),
++        timingValid ? static_cast<long long>(hwNowNs) : 0LL,
++        timingValid ? static_cast<long long>(slipNs) : 0LL,
++        late ? 1 : 0,
++        readerBefore ? 1 : 0,
++        readerAfter ? 1 : 0,
++        static_cast<long long>(userBefore),
++        static_cast<long long>(userAfter),
++        static_cast<long long>(hwBefore),
++        static_cast<long long>(hwAfter),
++        static_cast<long long>(swBefore),
++        static_cast<long long>(swAfter),
++        static_cast<long long>(clearedBefore),
++        static_cast<long long>(clearedAfter),
++        zeroCopy ? 1 : 0,
++        samplerate);
++
++    const uint64_t flush_period = m2sdr_env_tx_worker_trace_flush_period();
++    if (flush_period == 1 || (flush_period > 1 && ((row + 1) % flush_period) == 0))
++        std::fflush(f);
++}
++
+ 
+ static long m2sdr_env_tx_copy_prime_buffers()
+ {
+@@ -532,6 +1110,38 @@ static long m2sdr_env_tx_copy_prime_buffers()
+ }
+ 
+ 
++static long m2sdr_env_tx_zero_copy_prime_buffers()
++{
++    static const long value = []() {
++        const char *v = std::getenv("M2SDR_SOAPY_TX_ZERO_COPY_PRIME_BUFFERS");
++        if (!v || !*v)
++            return 1L;
++        const long n = std::strtol(v, nullptr, 10);
++        if (n < 1)
++            return 1L;
++        return n;
++    }();
++    return value;
++}
++
++
++static bool m2sdr_env_tx_zero_stale_payload()
++{
++    static const bool value = []() {
++        const char *v = std::getenv("M2SDR_SOAPY_TX_ZERO_STALE_PAYLOAD");
++        return v && *v &&
++               std::strcmp(v, "0") != 0 &&
++               std::strcmp(v, "false") != 0 &&
++               std::strcmp(v, "FALSE") != 0 &&
++               std::strcmp(v, "off") != 0 &&
++               std::strcmp(v, "OFF") != 0 &&
++               std::strcmp(v, "no") != 0 &&
++               std::strcmp(v, "NO") != 0;
++    }();
++    return value;
++}
++
++
+ static bool m2sdr_env_disables_litepcie_zero_copy()
+ {
+     const char *v = std::getenv("M2SDR_LITEPCIE_ZERO_COPY");
+@@ -555,6 +1165,161 @@ static inline long long ns_to_samples(double sample_rate, long long ns)
+     return static_cast<long long>(std::llround(samples));
+ }
+ 
++static const char *m2sdr_direction_name(int direction)
++{
++    if (direction == SOAPY_SDR_TX)
++        return "TX";
++    if (direction == SOAPY_SDR_RX)
++        return "RX";
++    return "UNKNOWN";
++}
++
++void SoapyLiteXM2SDR::dumpPavonisState(const char *reason, int direction)
++{
++    const char *path = std::getenv("M2SDR_SOAPY_STATE_DUMP_PATH");
++    if (!path || !*path)
++        return;
++
++    FILE *f = std::fopen(path, "a");
++    if (!f)
++        return;
++
++    const char *why = reason ? reason : "unknown";
++    std::fprintf(f, "BEGIN PAVONIS_M2SDR_STATE_DUMP reason=%s direction=%s\n",
++                 why, m2sdr_direction_name(direction));
++    std::fprintf(f, "env_M2SDR_SOAPY_STATE_DUMP_PATH=%s\n", path);
++    std::fprintf(f, "nchannels=%u bitmode=%u oversampling=%u rate_mult=%.9f samples_scaling=%.9f loopback=%s\n",
++                 _nChannels,
++                 _bitMode,
++                 _oversampling,
++                 _rateMult,
++                 static_cast<double>(_samplesScaling),
++                 loopbackModeToString(_loopbackMode));
++    std::fprintf(f, "rx_opened=%u tx_opened=%u rx_format=%s tx_format=%s reader_enabled=%u\n",
++                 _rx_stream.opened ? 1U : 0U,
++                 _tx_stream.opened ? 1U : 0U,
++                 _rx_stream.format.c_str(),
++                 _tx_stream.format.c_str(),
++                 _tx_stream.reader_enabled ? 1U : 0U);
++    for (size_t ch = 0; ch < 2; ++ch) {
++        std::fprintf(f,
++                     "cached_ch%zu tx_rate=%.9f tx_freq=%.9f tx_bw=%.9f tx_att=%.9f "
++                     "rx_rate=%.9f rx_freq=%.9f rx_bw=%.9f rx_gain=%.9f rx_gain_mode=%u\n",
++                     ch,
++                     _tx_stream.samplerate,
++                     _tx_stream.frequency,
++                     _tx_stream.bandwidth,
++                     _tx_stream.gain[ch],
++                     _rx_stream.samplerate,
++                     _rx_stream.frequency,
++                     _rx_stream.bandwidth,
++                     _rx_stream.gain[ch],
++                     _rx_stream.gainMode[ch] ? 1U : 0U);
++    }
++
++    uint32_t tx_rate = 0, rx_rate = 0, tx_bw = 0, rx_bw = 0, tx_att_mdb = 0;
++    uint64_t tx_lo = 0, rx_lo = 0;
++    int32_t rx_gain = 0;
++    uint8_t rx_gain_mode = 0;
++    int rc = 0;
++    std::fprintf(f, "ad9361_temp_mdeg=%d\n", ad9361_get_temp(ad9361_phy));
++    rc = ad9361_get_tx_sampling_freq(ad9361_phy, &tx_rate);
++    std::fprintf(f, "ad9361_get_tx_sampling_freq_rc=%d value=%u\n",
++                 rc, tx_rate);
++    rc = ad9361_get_rx_sampling_freq(ad9361_phy, &rx_rate);
++    std::fprintf(f, "ad9361_get_rx_sampling_freq_rc=%d value=%u\n",
++                 rc, rx_rate);
++    rc = ad9361_get_tx_lo_freq(ad9361_phy, &tx_lo);
++    std::fprintf(f, "ad9361_get_tx_lo_freq_rc=%d value=%llu\n",
++                 rc, static_cast<unsigned long long>(tx_lo));
++    rc = ad9361_get_rx_lo_freq(ad9361_phy, &rx_lo);
++    std::fprintf(f, "ad9361_get_rx_lo_freq_rc=%d value=%llu\n",
++                 rc, static_cast<unsigned long long>(rx_lo));
++    rc = ad9361_get_tx_rf_bandwidth(ad9361_phy, &tx_bw);
++    std::fprintf(f, "ad9361_get_tx_rf_bandwidth_rc=%d value=%u\n",
++                 rc, tx_bw);
++    rc = ad9361_get_rx_rf_bandwidth(ad9361_phy, &rx_bw);
++    std::fprintf(f, "ad9361_get_rx_rf_bandwidth_rc=%d value=%u\n",
++                 rc, rx_bw);
++    for (uint32_t ch = 0; ch < 2; ++ch) {
++        tx_att_mdb = 0;
++        rx_gain = 0;
++        rx_gain_mode = 0;
++        rc = ad9361_get_tx_attenuation(ad9361_phy, ch, &tx_att_mdb);
++        std::fprintf(f, "ad9361_get_tx_attenuation_ch%u_rc=%d value_mdb=%u value_db=%.3f\n",
++                     ch,
++                     rc,
++                     tx_att_mdb,
++                     tx_att_mdb / 1000.0);
++        rc = ad9361_get_rx_rf_gain(ad9361_phy, ch, &rx_gain);
++        std::fprintf(f, "ad9361_get_rx_rf_gain_ch%u_rc=%d value_db=%d\n",
++                     ch,
++                     rc,
++                     rx_gain);
++        rc = ad9361_get_rx_gain_control_mode(ad9361_phy, ch, &rx_gain_mode);
++        std::fprintf(f, "ad9361_get_rx_gain_control_mode_ch%u_rc=%d value=%u\n",
++                     ch,
++                     rc,
++                     rx_gain_mode);
++    }
++
++    const uint32_t litex_regs[] = {
++        0x0000, 0x0004, 0x0008, 0x0010, 0x0020, 0x0100, 0x0200, 0x0300,
++        CSR_CROSSBAR_MUX_SEL_ADDR,
++        CSR_CROSSBAR_DEMUX_SEL_ADDR,
++        CSR_AD9361_CONFIG_ADDR,
++        CSR_AD9361_CTRL_ADDR,
++        CSR_AD9361_STAT_ADDR,
++        CSR_AD9361_BITMODE_ADDR,
++        CSR_AD9361_CH_EN_ADDR,
++        CSR_AD9361_PHY_CONTROL_ADDR,
++#ifdef CSR_HEADER_TX_CONTROL_ADDR
++        CSR_HEADER_TX_CONTROL_ADDR,
++#endif
++#ifdef CSR_HEADER_RX_CONTROL_ADDR
++        CSR_HEADER_RX_CONTROL_ADDR,
++#endif
++#ifdef CSR_TIMED_TX_STATE_ADDR
++        CSR_TIMED_TX_STATE_ADDR,
++#endif
++#ifdef CSR_TIMED_TX_LATE_COUNT_ADDR
++        CSR_TIMED_TX_LATE_COUNT_ADDR,
++#endif
++#ifdef CSR_TIMED_TX_UNDERRUN_COUNT_ADDR
++        CSR_TIMED_TX_UNDERRUN_COUNT_ADDR,
++#endif
++#ifdef CSR_TIMED_TX_DROP_COUNT_ADDR
++        CSR_TIMED_TX_DROP_COUNT_ADDR,
++#endif
++#ifdef CSR_TIMED_TX_TS_POP_COUNT_ADDR
++        CSR_TIMED_TX_TS_POP_COUNT_ADDR,
++#endif
++    };
++    for (uint32_t reg : litex_regs) {
++        std::fprintf(f, "litex_reg 0x%04x 0x%08x\n", reg, litex_m2sdr_readl(_dev, reg));
++    }
++
++#if USE_LITEPCIE
++    void *spi_conn = reinterpret_cast<void *>(static_cast<intptr_t>(_fd));
++#else
++    void *spi_conn = _fd;
++#endif
++    const uint16_t ad9361_regs[] = {
++        0x00c, 0x00e,
++        0x013, 0x014, 0x015, 0x016, 0x017, 0x018, 0x019, 0x01e, 0x01f,
++        0x073, 0x074, 0x075, 0x076, 0x077, 0x079, 0x07a, 0x07c, 0x07d,
++        0x08f, 0x092, 0x0a0, 0x0a3, 0x0a7, 0x3f4, 0x3f5, 0x3f6,
++    };
++    for (uint16_t reg : ad9361_regs) {
++        std::fprintf(f, "ad9361_reg 0x%03x 0x%02x\n",
++                     reg, m2sdr_ad9361_spi_read(spi_conn, reg));
++    }
++
++    std::fprintf(f, "END PAVONIS_M2SDR_STATE_DUMP reason=%s direction=%s\n",
++                 why, m2sdr_direction_name(direction));
++    std::fclose(f);
++}
++
+ /* Setup and configure a stream for RX or TX. */
+ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
+     const int direction,
+@@ -936,6 +1701,7 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
+         }
+     }
+ 
++    dumpPavonisState("setupStream", direction);
+     return direction == SOAPY_SDR_RX ? RX_STREAM : TX_STREAM;
+ }
+ 
+@@ -1047,7 +1813,7 @@ int SoapyLiteXM2SDR::activateStream(
+         _rx_stream.timed_start_pending = false;
+         _rx_stream.timed_start_ns = 0;
+         _rx_stream.timed_start_sample = 0;
+-        if (flags & SOAPY_SDR_HAS_TIME) {
++        if ((flags & SOAPY_SDR_HAS_TIME) && !m2sdr_rx_ignore_timed_activation_active(timeNs)) {
+             if (_rx_stream.samplerate <= 0.0) {
+                 SoapySDR::log(SOAPY_SDR_ERROR,
+                     "RX timed activation requested before RX sample rate was set");
+@@ -1100,6 +1866,12 @@ int SoapyLiteXM2SDR::activateStream(
+          * as it starts, causing startup-only late drops. With the reader
+          * stopped, it is safe to sanitize every slot before first release. */
+         _clearAllTXHeaderFlags();
++        if (m2sdr_env_tx_zero_stale_payload()) {
++            std::fprintf(stderr,
++                "M2SDR TX stale-payload zero-fill active: ring_buffers=%zu payload_bytes=%zu\n",
++                _dma_mmap_info.dma_tx_buf_count,
++                _dma_mmap_info.dma_tx_buf_size - TX_DMA_HEADER_SIZE);
++        }
+         /* Newer gateware exposes a real timed-TX reset that flushes the
+          * arbiter FIFOs/FSM, not just the status counters. Use it at the
+          * last quiet point before the first DMA release; old bitstreams keep
+@@ -1140,6 +1912,12 @@ int SoapyLiteXM2SDR::activateStream(
+     }
+ #endif
+ 
++    if (stream == RX_STREAM) {
++        dumpPavonisState("activateStream", SOAPY_SDR_RX);
++    } else if (stream == TX_STREAM) {
++        dumpPavonisState("activateStream", SOAPY_SDR_TX);
++    }
++
+     return 0;
+ }
+ 
+@@ -1812,7 +2590,9 @@ int SoapyLiteXM2SDR::readStream(
+ 
+         /* Read out channels from the remainder buffer. */
+         for (size_t i = 0; i < _rx_stream.channels.size(); i++) {
+-            const uint32_t chan = _rx_stream.channels[i];
++            const uint32_t chan = (_rx_stream.channels.size() == 1)
++                ? 0
++                : _rx_stream.channels[i];
+             this->deinterleave(
+                 _rx_stream.remainderBuff + (remainderOffset + chan * _bytesPerComplex),
+                 buffs[i],
+@@ -1913,8 +2693,15 @@ int SoapyLiteXM2SDR::readStream(
+         _rx_stream.remainderSamps = packet_samps;
+         _rx_stream.remainderOffset = packet_offset;
+         _rx_stream.remainderTimeNs = acquire_timeNs;
+-        flags |= acquire_flags;
+-        timeNs = acquire_timeNs;
++        if (samp_avail == 0) {
++            flags |= acquire_flags;
++            timeNs = acquire_timeNs;
++        } else {
++            /* Metadata describes the first returned sample. Do not let an
++             * appended packet replace the prefix remainder's timestamp.
++             */
++            flags |= acquire_flags & ~SOAPY_SDR_HAS_TIME;
++        }
+         ret = static_cast<int>(packet_samps);
+         break;
+     }
+@@ -1923,11 +2710,11 @@ int SoapyLiteXM2SDR::readStream(
+     const size_t n = std::min((returnedElems - samp_avail), _rx_stream.remainderSamps);
+     const uint32_t remainderOffset = _rx_stream.remainderOffset * _frameChannels * _bytesPerComplex;
+ 
+-    if (_rx_stream.time_valid) {
++    if (_rx_stream.time_valid && samp_avail == 0) {
+         timeNs = _rx_stream.remainderTimeNs +
+                  samples_to_ns(_rx_stream.samplerate, _rx_stream.remainderOffset);
+         flags |= SOAPY_SDR_HAS_TIME;
+-    } else if (_rx_stream.samplerate <= 0.0 && !_rx_stream.time_warned) {
++    } else if (samp_avail == 0 && _rx_stream.samplerate <= 0.0 && !_rx_stream.time_warned) {
+         SoapySDR::log(SOAPY_SDR_WARNING,
+             "RX sample rate not set; not providing SOAPY_SDR_HAS_TIME");
+         _rx_stream.time_warned = true;
+@@ -1935,7 +2722,9 @@ int SoapyLiteXM2SDR::readStream(
+ 
+     /* Read out channels from the new buffer. */
+     for (size_t i = 0; i < _rx_stream.channels.size(); i++) {
+-        const uint32_t chan = _rx_stream.channels[i];
++        const uint32_t chan = (_rx_stream.channels.size() == 1)
++            ? 0
++            : _rx_stream.channels[i];
+         this->deinterleave(
+             _rx_stream.remainderBuff + (remainderOffset + chan * _bytesPerComplex),
+             buffs[i],
+@@ -1972,8 +2761,156 @@ int SoapyLiteXM2SDR::writeStream(
+     size_t returnedElems = std::min(numElems, this->getStreamMTU(stream));
+ 
+     size_t samp_avail = 0;
++    const bool zero_after_arm = m2sdr_tx_zero_after_arm_active();
++    const bool align_has_time_remainder =
++        m2sdr_env_tx_align_has_time_remainder_enabled();
++    const bool backfill_contiguous_time =
++        m2sdr_env_tx_backfill_contiguous_time_enabled();
++
++    int effective_flags = flags;
+ 
+     /* If there's a remainder buffer from a previous write, process that first. */
++    if (_tx_stream.remainderHandle >= 0) {
++        const bool incoming_timed =
++            align_has_time_remainder &&
++            (flags & SOAPY_SDR_HAS_TIME) &&
++            timeNs > 0 &&
++            _tx_stream.remainderOffset > 0;
++        const bool existing_timed =
++            (_tx_stream.remainder_flags & SOAPY_SDR_HAS_TIME) != 0;
++        long long expected_time_ns = 0;
++        long long time_delta_ns = 0;
++        long long expected_sample = 0;
++        long long incoming_sample = 0;
++        long long sample_delta = 0;
++        bool release_remainder = incoming_timed && !existing_timed;
++        bool timed_discontinuity = false;
++        bool contiguous_untimed_remainder = false;
++
++        if (incoming_timed &&
++            _tx_stream.samplerate > 0.0 &&
++            _tx_stream.remainder_timeNs > 0) {
++            const long long remainder_start_sample =
++                ns_to_samples(_tx_stream.samplerate, _tx_stream.remainder_timeNs);
++            expected_sample =
++                remainder_start_sample + static_cast<long long>(_tx_stream.remainderOffset);
++            incoming_sample = ns_to_samples(_tx_stream.samplerate, timeNs);
++            sample_delta = incoming_sample - expected_sample;
++            expected_time_ns = samples_to_ns(_tx_stream.samplerate, expected_sample);
++            time_delta_ns = timeNs - expected_time_ns;
++            if (existing_timed) {
++                timed_discontinuity = sample_delta != 0;
++                release_remainder = timed_discontinuity;
++            } else {
++                const long long sub_mtu_slack =
++                    static_cast<long long>(this->getStreamMTU(stream));
++                contiguous_untimed_remainder =
++                    (sample_delta >= -sub_mtu_slack) &&
++                    (sample_delta <= sub_mtu_slack);
++                release_remainder = !contiguous_untimed_remainder;
++            }
++        }
++
++        if (incoming_timed &&
++            !existing_timed &&
++            contiguous_untimed_remainder) {
++            if (backfill_contiguous_time &&
++                _tx_stream.samplerate > 0.0 &&
++                incoming_sample > static_cast<long long>(_tx_stream.remainderOffset)) {
++                const long long descriptor_start_sample =
++                    incoming_sample - static_cast<long long>(_tx_stream.remainderOffset);
++                const long long descriptor_start_time_ns =
++                    samples_to_ns(_tx_stream.samplerate, descriptor_start_sample);
++                _tx_stream.remainder_flags |= SOAPY_SDR_HAS_TIME;
++                _tx_stream.remainder_timeNs = descriptor_start_time_ns;
++
++                static std::atomic<uint64_t> backfill_log_count{0};
++                const uint64_t log_idx =
++                    backfill_log_count.fetch_add(1, std::memory_order_relaxed);
++                if (log_idx < 16) {
++                    std::fprintf(stderr,
++                        "M2SDR TX HAS_TIME remainder backfill: idx=%llu handle=%d "
++                        "offset=%zu remaining=%zu incoming_time_ns=%lld "
++                        "descriptor_start_time_ns=%lld descriptor_start_sample=%lld\n",
++                        static_cast<unsigned long long>(log_idx),
++                        _tx_stream.remainderHandle,
++                        _tx_stream.remainderOffset,
++                        _tx_stream.remainderSamps,
++                        static_cast<long long>(timeNs),
++                        static_cast<long long>(descriptor_start_time_ns),
++                        static_cast<long long>(descriptor_start_sample));
++                    std::fflush(stderr);
++                }
++            } else {
++                static std::atomic<uint64_t> keep_log_count{0};
++                const uint64_t log_idx =
++                    keep_log_count.fetch_add(1, std::memory_order_relaxed);
++                if (log_idx < 16) {
++                    SoapySDR_logf(SOAPY_SDR_INFO,
++                        "M2SDR TX HAS_TIME remainder align: keeping contiguous untimed buffer "
++                        "handle=%d offset=%zu remaining=%zu existing_flags=0x%x incoming_flags=0x%x "
++                        "existing_time_ns=%lld incoming_time_ns=%lld expected_time_ns=%lld delta_ns=%lld "
++                        "expected_sample=%lld incoming_sample=%lld sample_delta=%lld",
++                        _tx_stream.remainderHandle,
++                        _tx_stream.remainderOffset,
++                        _tx_stream.remainderSamps,
++                        _tx_stream.remainder_flags,
++                        flags,
++                        static_cast<long long>(_tx_stream.remainder_timeNs),
++                        static_cast<long long>(timeNs),
++                        static_cast<long long>(expected_time_ns),
++                        static_cast<long long>(time_delta_ns),
++                        static_cast<long long>(expected_sample),
++                        static_cast<long long>(incoming_sample),
++                        static_cast<long long>(sample_delta));
++                }
++            }
++            /* The incoming timestamp refers to the current write position.
++             * Either it was backfilled to the descriptor start above or the
++             * legacy CP2074B path keeps this remainder untimed. */
++            effective_flags &= ~SOAPY_SDR_HAS_TIME;
++        }
++
++        if (release_remainder) {
++            static std::atomic<uint64_t> align_log_count{0};
++            const uint64_t log_idx =
++                align_log_count.fetch_add(1, std::memory_order_relaxed);
++            if (log_idx < 16) {
++                SoapySDR_logf(SOAPY_SDR_INFO,
++                    "M2SDR TX HAS_TIME remainder align: releasing partial %s buffer "
++                    "handle=%d offset=%zu remaining=%zu existing_flags=0x%x incoming_flags=0x%x "
++                    "existing_time_ns=%lld incoming_time_ns=%lld expected_time_ns=%lld delta_ns=%lld "
++                    "expected_sample=%lld incoming_sample=%lld sample_delta=%lld",
++                    timed_discontinuity ? "timed-discontinuous" : "untimed",
++                    _tx_stream.remainderHandle,
++                    _tx_stream.remainderOffset,
++                    _tx_stream.remainderSamps,
++                    _tx_stream.remainder_flags,
++                    flags,
++                    static_cast<long long>(_tx_stream.remainder_timeNs),
++                    static_cast<long long>(timeNs),
++                    static_cast<long long>(expected_time_ns),
++                    static_cast<long long>(time_delta_ns),
++                    static_cast<long long>(expected_sample),
++                    static_cast<long long>(incoming_sample),
++                    static_cast<long long>(sample_delta));
++            }
++
++            int existing_flags = _tx_stream.remainder_flags;
++            this->releaseWriteBuffer(stream,
++                                     _tx_stream.remainderHandle,
++                                     _tx_stream.remainderOffset,
++                                     existing_flags,
++                                     _tx_stream.remainder_timeNs);
++            _tx_stream.remainderHandle = -1;
++            _tx_stream.remainderOffset = 0;
++            _tx_stream.remainderSamps = 0;
++            _tx_stream.remainder_flags = 0;
++            _tx_stream.remainder_timeNs = 0;
++            _tx_stream.remainderBuff = nullptr;
++        }
++    }
++
+     if (_tx_stream.remainderHandle >= 0) {
+         const size_t n = std::min(_tx_stream.remainderSamps, returnedElems);
+         const uint32_t remainderOffset = _tx_stream.remainderOffset * _frameChannels * _bytesPerComplex;
+@@ -2004,9 +2941,23 @@ int SoapyLiteXM2SDR::writeStream(
+                 _bytesPerComplex,
+                 _tx_stream.samplerate
+             );
++            const void *tx_src = buffs[i];
++            if (zero_after_arm) {
++                const void *zero_src = m2sdr_zero_tx_input_buffer(_tx_stream.format, n);
++                if (zero_src) {
++                    tx_src = zero_src;
++                    m2sdr_tx_zero_after_arm_record_zeroed(n);
++                } else {
++                    g_tx_zero_after_arm_zero_src_null.fetch_add(1, std::memory_order_relaxed);
++                    m2sdr_tx_zero_after_arm_write_summary("zero_src_null", true);
++                }
++            }
++            const size_t frame_channel = (_tx_stream.channels.size() == 1)
++                ? 0
++                : _tx_stream.channels[i];
+             this->interleave(
+-                buffs[i],
+-                _tx_stream.remainderBuff + remainderOffset + (_tx_stream.channels[i] * _bytesPerComplex),
++                tx_src,
++                _tx_stream.remainderBuff + remainderOffset + (frame_channel * _bytesPerComplex),
+                 n,
+                 _tx_stream.format,
+                 0
+@@ -2020,12 +2971,12 @@ int SoapyLiteXM2SDR::writeStream(
+          * last partial write that closes a buffer; HAS_TIME must NOT
+          * overwrite a timestamp set by an earlier writeStream that
+          * opened this buffer — the buffer fires from the first ts). */
+-        if ((flags & SOAPY_SDR_HAS_TIME) &&
++        if ((effective_flags & SOAPY_SDR_HAS_TIME) &&
+             !(_tx_stream.remainder_flags & SOAPY_SDR_HAS_TIME)) {
+             _tx_stream.remainder_flags  |= SOAPY_SDR_HAS_TIME;
+             _tx_stream.remainder_timeNs = timeNs;
+         }
+-        _tx_stream.remainder_flags |= (flags & SOAPY_SDR_END_BURST);
++        _tx_stream.remainder_flags |= (effective_flags & SOAPY_SDR_END_BURST);
+ 
+         if (_tx_stream.remainderSamps == 0) {
+             int merged_flags = _tx_stream.remainder_flags;
+@@ -2059,11 +3010,41 @@ int SoapyLiteXM2SDR::writeStream(
+ 
+     _tx_stream.remainderHandle = handle;
+     _tx_stream.remainderSamps = ret;
+-    /* First writeStream into this fresh buffer: its flags/timeNs
+-     * become the buffer's metadata. Subsequent writes into the same
++    int buffer_flags = effective_flags;
++    long long buffer_timeNs = timeNs;
++    if (samp_avail > 0 &&
++        (flags & SOAPY_SDR_HAS_TIME) &&
++        timeNs > 0 &&
++        _tx_stream.samplerate > 0.0) {
++        const long long incoming_start_sample =
++            ns_to_samples(_tx_stream.samplerate, timeNs);
++        const long long buffer_start_sample =
++            incoming_start_sample + static_cast<long long>(samp_avail);
++        buffer_timeNs = samples_to_ns(_tx_stream.samplerate, buffer_start_sample);
++
++        static std::atomic<uint64_t> carry_log_count{0};
++        const uint64_t log_idx =
++            carry_log_count.fetch_add(1, std::memory_order_relaxed);
++        if (log_idx < 16) {
++            SoapySDR_logf(SOAPY_SDR_INFO,
++                "M2SDR TX HAS_TIME partial carry: advancing fresh buffer timestamp "
++                "handle=%zu consumed_samples=%zu incoming_time_ns=%lld buffer_time_ns=%lld "
++                "incoming_start_sample=%lld buffer_start_sample=%lld",
++                handle,
++                samp_avail,
++                static_cast<long long>(timeNs),
++                static_cast<long long>(buffer_timeNs),
++                static_cast<long long>(incoming_start_sample),
++                static_cast<long long>(buffer_start_sample));
++        }
++    }
++    /* First samples written into this fresh buffer seed its metadata.
++     * If the caller write first completed a previous partial buffer,
++     * this buffer begins at the carried sample offset, not at the
++     * original writeStream() timestamp. Later writes into the same
+      * buffer may OR in END_BURST but cannot rewrite HAS_TIME's ts. */
+-    _tx_stream.remainder_flags  = flags;
+-    _tx_stream.remainder_timeNs = timeNs;
++    _tx_stream.remainder_flags  = buffer_flags;
++    _tx_stream.remainder_timeNs = buffer_timeNs;
+ 
+     const size_t n = std::min((returnedElems - samp_avail), _tx_stream.remainderSamps);
+ 
+@@ -2074,8 +3055,8 @@ int SoapyLiteXM2SDR::writeStream(
+             n,
+             _tx_stream.format,
+             _tx_stream.channels[i],
+-            flags,
+-            timeNs
++                buffer_flags,
++                buffer_timeNs
+         );
+             m2sdr_dump_tx_input_once(
+                 buffs[i],
+@@ -2083,18 +3064,36 @@ int SoapyLiteXM2SDR::writeStream(
+                 _tx_stream.format,
+                 _tx_stream.channels[i],
+                 samp_avail,
+-                flags,
+-                timeNs,
++                buffer_flags,
++                buffer_timeNs,
+                 _frameChannels,
+                 _bytesPerComplex,
+                 _tx_stream.samplerate
+             );
++        const void *tx_src = buffs[i];
++        if (zero_after_arm) {
++            const void *zero_src = m2sdr_zero_tx_input_buffer(_tx_stream.format, samp_avail + n);
++            if (zero_src) {
++                tx_src = zero_src;
++                m2sdr_tx_zero_after_arm_record_zeroed(n);
++            } else {
++                g_tx_zero_after_arm_zero_src_null.fetch_add(1, std::memory_order_relaxed);
++                m2sdr_tx_zero_after_arm_write_summary("zero_src_null", true);
++            }
++        }
++        const size_t frame_channel = (_tx_stream.channels.size() == 1)
++            ? 0
++            : _tx_stream.channels[i];
++        /* The carried prefix was written into the previous DMA buffer. The
++         * fresh destination begins at frame zero; only the caller source must
++         * advance past that prefix. */
++        tx_src = m2sdr_advance_tx_input_buffer(tx_src, _tx_stream.format, samp_avail);
+         this->interleave(
+-            buffs[i],
+-            _tx_stream.remainderBuff + (_tx_stream.channels[i] * _bytesPerComplex),
++            tx_src,
++            _tx_stream.remainderBuff + (frame_channel * _bytesPerComplex),
+             n,
+             _tx_stream.format,
+-            samp_avail
++            0
+         );
+     }
+     /* UDP path: no mid-buffer send; submission happens in releaseWriteBuffer(). */
+@@ -2454,10 +3453,15 @@ void SoapyLiteXM2SDR::_clearAllTXHeaderFlags() {
+     static constexpr uint64_t TX_HEADER_FLAG_MASK =
+         TX_FLAG_HAS_TIME | TX_FLAG_END_BURST;
+     for (size_t i = 0; i < _dma_mmap_info.dma_tx_buf_count; ++i) {
+-        uint64_t *hdr0 = reinterpret_cast<uint64_t*>(
+-            reinterpret_cast<uint8_t*>(_tx_stream.buf) +
+-            i * _dma_mmap_info.dma_tx_buf_size);
++        uint8_t *tx_buffer = reinterpret_cast<uint8_t*>(_tx_stream.buf) +
++            i * _dma_mmap_info.dma_tx_buf_size;
++        uint64_t *hdr0 = reinterpret_cast<uint64_t*>(tx_buffer);
+         *hdr0 &= ~TX_HEADER_FLAG_MASK;
++        if (m2sdr_env_tx_zero_stale_payload()) {
++            *reinterpret_cast<uint64_t*>(tx_buffer + 8) = 0;
++            std::memset(tx_buffer + TX_DMA_HEADER_SIZE, 0,
++                _dma_mmap_info.dma_tx_buf_size - TX_DMA_HEADER_SIZE);
++        }
+     }
+ #endif
+ }
+@@ -2471,9 +3475,9 @@ void SoapyLiteXM2SDR::_clearConsumedTXHeaders() {
+      * descriptor ring) latch has_time=0 and don't push stale-timed
+      * descriptors into the arbiter's ts_fifo.
+      *
+-     * We leave the 64-bit sync word's lower bits and the per-buffer
+-     * 8-byte timestamp untouched; the FPGA only cares about
+-     * bit 63 (HAS_TIME) and bit 62 (END_BURST) for arbitration.
++     * With stale-payload zero-fill enabled, also clear a consumed slot's
++     * timestamp and payload before LOOP mode can replay it. Do not touch a
++     * slot already acquired for its next ring generation.
+      *
+      * Race: there is a window between sw_count advance (in
+      * _dmaReleaseWrite) and the FPGA's first read of the buffer
+@@ -2488,10 +3492,18 @@ void SoapyLiteXM2SDR::_clearConsumedTXHeaders() {
+     while (_tx_stream.cleared_count < _tx_stream.hw_count) {
+         const int64_t idx = _tx_stream.cleared_count;
+         const size_t buf_offset = idx % _dma_mmap_info.dma_tx_buf_count;
+-        uint64_t *hdr0 = reinterpret_cast<uint64_t*>(
+-            reinterpret_cast<uint8_t*>(_tx_stream.buf) +
+-            buf_offset * _dma_mmap_info.dma_tx_buf_size);
++        uint8_t *tx_buffer = reinterpret_cast<uint8_t*>(_tx_stream.buf) +
++            buf_offset * _dma_mmap_info.dma_tx_buf_size;
++        uint64_t *hdr0 = reinterpret_cast<uint64_t*>(tx_buffer);
+         *hdr0 &= ~TX_HEADER_FLAG_MASK;
++        const int64_t next_generation = idx +
++            static_cast<int64_t>(_dma_mmap_info.dma_tx_buf_count);
++        if (m2sdr_env_tx_zero_stale_payload() &&
++            _tx_stream.user_count <= next_generation) {
++            *reinterpret_cast<uint64_t*>(tx_buffer + 8) = 0;
++            std::memset(tx_buffer + TX_DMA_HEADER_SIZE, 0,
++                _dma_mmap_info.dma_tx_buf_size - TX_DMA_HEADER_SIZE);
++        }
+         _tx_stream.cleared_count = idx + 1;
+     }
+ #endif
+@@ -2558,6 +3570,18 @@ int SoapyLiteXM2SDR::_dmaAcquireWrite(
+         _clearConsumedTXHeaders();
+         buffers_pending = _tx_stream.user_count - _tx_stream.hw_count;
+         if (buffers_pending < 0) {
++            if (m2sdr_env_tx_zero_stale_payload()) {
++                static std::atomic<uint64_t> logged{0};
++                const uint64_t event = logged.fetch_add(1, std::memory_order_relaxed);
++                if (event < 16) {
++                    std::fprintf(stderr,
++                        "M2SDR TX stale-payload zero-fill overtake: event=%llu gap_buffers=%lld hw_count=%lld user_count=%lld\n",
++                        static_cast<unsigned long long>(event),
++                        static_cast<long long>(-buffers_pending),
++                        static_cast<long long>(_tx_stream.hw_count),
++                        static_cast<long long>(_tx_stream.user_count));
++                }
++            }
+             _clearAllTXHeaderFlags();
+             _tx_stream.user_count = _tx_stream.hw_count;
+             _tx_stream.cleared_count = _tx_stream.hw_count;
+@@ -2566,17 +3590,51 @@ int SoapyLiteXM2SDR::_dmaAcquireWrite(
+     }
+     if (buffers_pending == ((int64_t)_dma_mmap_info.dma_tx_buf_count)) {
+         if (timeoutUs == 0) return SOAPY_SDR_TIMEOUT;
+-        int ret = poll(&_tx_stream.fds, 1, timeoutUs / 1000);
+-        if (ret < 0) {
+-            throw std::runtime_error("_dmaAcquireWrite: Poll failed, " +
+-                                     std::string(strerror(errno)) + ".");
+-        } else if (ret == 0) {
+-            return SOAPY_SDR_TIMEOUT;
++        const long refresh_us = m2sdr_env_tx_full_ring_refresh_us();
++        if (refresh_us > 0) {
++            static std::atomic<bool> logged{false};
++            bool expected = false;
++            if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
++                SoapySDR_logf(SOAPY_SDR_INFO,
++                    "M2SDR TX full-ring short refresh active: interval_us=%ld",
++                    refresh_us);
++            }
++
++            const auto started = std::chrono::steady_clock::now();
++            while (buffers_pending == ((int64_t)_dma_mmap_info.dma_tx_buf_count)) {
++                long sleep_us = refresh_us;
++                if (timeoutUs > 0) {
++                    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
++                        std::chrono::steady_clock::now() - started).count();
++                    const long remaining_us = timeoutUs - static_cast<long>(elapsed);
++                    if (remaining_us <= 0)
++                        return SOAPY_SDR_TIMEOUT;
++                    sleep_us = std::min(sleep_us, remaining_us);
++                }
++                std::this_thread::sleep_for(std::chrono::microseconds(sleep_us));
++                litepcie_dma_reader(_fd, 1, &_tx_stream.hw_count, &_tx_stream.sw_count);
++                _clearConsumedTXHeaders();
++                buffers_pending = _tx_stream.user_count - _tx_stream.hw_count;
++                if (buffers_pending < 0) {
++                    _clearAllTXHeaderFlags();
++                    _tx_stream.user_count = _tx_stream.hw_count;
++                    _tx_stream.cleared_count = _tx_stream.hw_count;
++                    buffers_pending = 0;
++                }
++            }
++        } else {
++            int ret = poll(&_tx_stream.fds, 1, timeoutUs / 1000);
++            if (ret < 0) {
++                throw std::runtime_error("_dmaAcquireWrite: Poll failed, " +
++                                         std::string(strerror(errno)) + ".");
++            } else if (ret == 0) {
++                return SOAPY_SDR_TIMEOUT;
++            }
++            litepcie_dma_reader(_fd, 1, &_tx_stream.hw_count, &_tx_stream.sw_count);
++            _clearConsumedTXHeaders();
++            buffers_pending = _tx_stream.user_count - _tx_stream.hw_count;
++            assert(buffers_pending < ((int64_t)_dma_mmap_info.dma_tx_buf_count));
+         }
+-        litepcie_dma_reader(_fd, 1, &_tx_stream.hw_count, &_tx_stream.sw_count);
+-        _clearConsumedTXHeaders();
+-        buffers_pending = _tx_stream.user_count - _tx_stream.hw_count;
+-        assert(buffers_pending < ((int64_t)_dma_mmap_info.dma_tx_buf_count));
+     }
+ 
+     const int buf_offset = _tx_stream.user_count % _dma_mmap_info.dma_tx_buf_count;
+@@ -2629,7 +3687,11 @@ void SoapyLiteXM2SDR::_dmaReleaseWrite(
+     size_t handle,
+     size_t numElems,
+     int flags,
+-    long long timeNs) {
++    long long timeNs,
++    long long sourceTimeNs,
++    bool workerTimingValid,
++    long long workerNowNs,
++    long long workerSlipNs) {
+     /* Write the real per-buffer header so the FPGA-side TimedTXArbiter
+      * sees the burst flags and the sample-count timestamp before the
+      * buffer becomes visible to the DMA reader (sw_count advance
+@@ -2641,6 +3703,30 @@ void SoapyLiteXM2SDR::_dmaReleaseWrite(
+         _tx_stream.burst_end = true;
+     }
+ 
++    const bool pre_has_time = (flags & SOAPY_SDR_HAS_TIME) != 0;
++    const int flags_pre = flags;
++    bool dedup_suppressed_has_time = false;
++#if USE_LITEPCIE
++    const bool trace_zero_copy = _tx_stream.dma.zero_copy;
++    const size_t trace_ring_count = trace_zero_copy
++        ? _dma_mmap_info.dma_tx_buf_count
++        : _tx_stream.dma.mmap_dma_info.dma_tx_buf_count;
++    const size_t trace_ring_slot = trace_ring_count ? (handle % trace_ring_count) : handle;
++    const bool trace_reader_before = _tx_stream.reader_enabled;
++    const int64_t trace_user_before = _tx_stream.user_count;
++    const int64_t trace_hw_before = _tx_stream.hw_count;
++    const int64_t trace_sw_before = _tx_stream.sw_count;
++    const int64_t trace_cleared_before = _tx_stream.cleared_count;
++#else
++    const bool trace_zero_copy = false;
++    const size_t trace_ring_slot = handle;
++    const bool trace_reader_before = _tx_stream.reader_enabled;
++    const int64_t trace_user_before = _tx_stream.user_count;
++    const int64_t trace_hw_before = _tx_stream.hw_count;
++    const int64_t trace_sw_before = _tx_stream.sw_count;
++    const int64_t trace_cleared_before = 0;
++#endif
++
+     /*
+      * Some clients submit continuation buffers with SOAPY_SDR_HAS_TIME and
+      * the exact same timestamp as the burst-opening buffer.  The FPGA timed
+@@ -2654,10 +3740,116 @@ void SoapyLiteXM2SDR::_dmaReleaseWrite(
+         (flags & SOAPY_SDR_HAS_TIME) &&
+         timeNs == last_has_time_ns) {
+         flags &= ~SOAPY_SDR_HAS_TIME;
++        dedup_suppressed_has_time = true;
+     } else if (flags & SOAPY_SDR_HAS_TIME) {
+         last_has_time_ns = timeNs;
+     }
+ 
++    const size_t mtu = this->getStreamMTU(TX_STREAM);
++    const bool post_has_time = (flags & SOAPY_SDR_HAS_TIME) != 0;
++    const bool post_eob = (flags & SOAPY_SDR_END_BURST) != 0;
++    const bool release_summary_enabled = m2sdr_env_tx_release_summary_enabled();
++    const bool release_late_trace_enabled = m2sdr_env_tx_release_late_trace_enabled();
++    const bool tx_worker_trace_enabled = m2sdr_env_tx_worker_trace_enabled();
++    const bool release_accounting_enabled =
++        release_summary_enabled || release_late_trace_enabled || tx_worker_trace_enabled;
++    long long timing_now = 0;
++    long long timing_slip = 0;
++    bool timing_valid = false;
++
++    if (release_accounting_enabled &&
++        post_has_time &&
++        timeNs > 0) {
++        if (workerTimingValid) {
++            timing_now = workerNowNs;
++            timing_slip = workerSlipNs;
++            timing_valid = true;
++        } else {
++            timing_now = this->getHardwareTime("");
++            timing_slip = timing_now - timeNs;
++            timing_valid = true;
++        }
++    }
++
++    if (release_accounting_enabled) {
++        ++_tx_stream.release_packets;
++        _tx_stream.release_samples += numElems;
++        if (pre_has_time) {
++            ++_tx_stream.release_pre_has_time;
++        }
++        if (dedup_suppressed_has_time) {
++            ++_tx_stream.release_dedup_suppressed;
++        }
++        if (post_has_time) {
++            ++_tx_stream.release_post_has_time;
++            if (timeNs > 0) {
++                if (_tx_stream.release_has_time_pos_ns == 0) {
++                    _tx_stream.release_time_min_ns = timeNs;
++                    _tx_stream.release_time_max_ns = timeNs;
++                } else {
++                    _tx_stream.release_time_min_ns = std::min(_tx_stream.release_time_min_ns, timeNs);
++                    _tx_stream.release_time_max_ns = std::max(_tx_stream.release_time_max_ns, timeNs);
++                }
++                ++_tx_stream.release_has_time_pos_ns;
++
++                if (_tx_stream.release_slip_count == 0) {
++                    _tx_stream.release_slip_min_ns = timing_slip;
++                    _tx_stream.release_slip_max_ns = timing_slip;
++                } else {
++                    _tx_stream.release_slip_min_ns = std::min(_tx_stream.release_slip_min_ns, timing_slip);
++                    _tx_stream.release_slip_max_ns = std::max(_tx_stream.release_slip_max_ns, timing_slip);
++                }
++                ++_tx_stream.release_slip_count;
++                if (timing_valid && timing_now > timeNs) {
++                    ++_tx_stream.release_late_count;
++                }
++            } else if (timeNs == 0) {
++                ++_tx_stream.release_has_time_zero_ns;
++            } else {
++                ++_tx_stream.release_has_time_neg_ns;
++            }
++        } else {
++            ++_tx_stream.release_post_no_time;
++        }
++        if (post_eob) {
++            ++_tx_stream.release_post_eob;
++        }
++    }
++
++    if (release_late_trace_enabled &&
++        post_has_time &&
++        timeNs > 0 &&
++        timing_valid &&
++        timing_now > timeNs) {
++        const uint64_t limit = m2sdr_env_tx_release_late_trace_limit();
++        if (_tx_stream.release_late_trace_count < limit) {
++            const uint64_t trace_idx = _tx_stream.release_late_trace_count++;
++            std::fprintf(stderr,
++                "LiteX TX release late: trace_idx=%llu packet_seq=%llu numElems=%zu mtu=%zu "
++                "short_chunk=%d post_eob=%d pre_has_time=%d post_has_time=%d "
++                "dedup_suppressed=%d timeNs=%lld nowNs=%lld slipNs=%lld "
++                "release_late_count=%llu release_post_has_time=%llu reader_enabled=%d "
++                "samplerate=%.17g\n",
++                static_cast<unsigned long long>(trace_idx),
++                static_cast<unsigned long long>(_tx_stream.release_packets),
++                numElems,
++                mtu,
++                numElems < mtu ? 1 : 0,
++                post_eob ? 1 : 0,
++                pre_has_time ? 1 : 0,
++                post_has_time ? 1 : 0,
++                dedup_suppressed_has_time ? 1 : 0,
++                static_cast<long long>(timeNs),
++                static_cast<long long>(timing_now),
++                static_cast<long long>(timing_slip),
++                static_cast<unsigned long long>(_tx_stream.release_late_count),
++                static_cast<unsigned long long>(_tx_stream.release_post_has_time),
++                _tx_stream.reader_enabled ? 1 : 0,
++                _tx_stream.samplerate);
++            std::fflush(stderr);
++        }
++    }
++
+ #if USE_LITEPCIE
+     {
+         const size_t buf_offset = handle % _dma_mmap_info.dma_tx_buf_count;
+@@ -2675,7 +3867,6 @@ void SoapyLiteXM2SDR::_dmaReleaseWrite(
+     }
+ #endif
+ 
+-    const size_t mtu = this->getStreamMTU(TX_STREAM);
+     if (numElems < mtu) {
+         uint8_t *buf = nullptr;
+ #if USE_LITEPCIE
+@@ -2757,20 +3948,104 @@ void SoapyLiteXM2SDR::_dmaReleaseWrite(
+                 prime);
+         }
+ 
++        m2sdr_tx_worker_trace_emit(
++            "copy_submit",
++            handle,
++            trace_ring_slot,
++            numElems,
++            mtu,
++            flags_pre,
++            flags,
++            dedup_suppressed_has_time,
++            sourceTimeNs,
++            timeNs,
++            timing_valid,
++            timing_now,
++            timing_slip,
++            timing_valid && timing_now > timeNs,
++            trace_reader_before,
++            _tx_stream.reader_enabled,
++            trace_user_before,
++            _tx_stream.user_count,
++            trace_hw_before,
++            _tx_stream.hw_count,
++            trace_sw_before,
++            _tx_stream.sw_count,
++            trace_cleared_before,
++            _tx_stream.cleared_count,
++            trace_zero_copy,
++            _tx_stream.samplerate);
+         return;
+     }
+ 
++    /*
++     * Optional zero-copy ring diagnostic dump.  At this point the Soapy
++     * input samples have already been interleaved/framed, the 16-byte TX
++     * DMA header has been finalized, and partial buffers have been
++     * zero-padded.  This is the exact mmap ring slot made visible to the
++     * LitePCIe kernel reader by the sw_count update below.
++     */
++    {
++        const size_t buf_offset = handle % _dma_mmap_info.dma_tx_buf_count;
++        const size_t write_size = _dma_mmap_info.dma_tx_buf_size;
++        const uint8_t *tx_buffer = reinterpret_cast<const uint8_t*>(_tx_stream.buf) +
++                                   buf_offset * write_size;
++        m2sdr_dump_tx_dma_buffer_once(
++            tx_buffer,
++            write_size,
++            handle,
++            numElems,
++            flags,
++            timeNs,
++            _frameChannels,
++            _bytesPerComplex,
++            _tx_stream.samplerate,
++            /*zeroCopy=*/true);
++    }
++
+     struct litepcie_ioctl_mmap_dma_update mmap_dma_update;
+     mmap_dma_update.sw_count = handle + 1;
+     checked_ioctl(_fd, LITEPCIE_IOCTL_MMAP_DMA_READER_UPDATE, &mmap_dma_update);
+-    /* First releaseWrite after activation: start the FPGA DMA reader
+-     * now that slot 0 (and any preceding slots from this submission)
+-     * carry valid user headers. The kernel won't actually start a
+-     * reader that's already running, so subsequent calls are no-ops. */
+-    if (!_tx_stream.reader_enabled) {
++    /* Start only after the requested number of valid slots are published.
++     * The default of one preserves the historical first-release behavior. */
++    const size_t zero_copy_prime = std::min<size_t>(
++        static_cast<size_t>(m2sdr_env_tx_zero_copy_prime_buffers()),
++        _dma_mmap_info.dma_tx_buf_count);
++    if (!_tx_stream.reader_enabled &&
++        _tx_stream.user_count >= static_cast<int64_t>(zero_copy_prime)) {
+         litepcie_dma_reader(_fd, 1, &_tx_stream.hw_count, &_tx_stream.sw_count);
+         _tx_stream.reader_enabled = true;
++        SoapySDR_logf(SOAPY_SDR_INFO,
++            "LitePCIe TX zero-copy reader enabled after priming %zu buffers",
++            zero_copy_prime);
+     }
++    m2sdr_tx_worker_trace_emit(
++        "zero_copy_submit",
++        handle,
++        trace_ring_slot,
++        numElems,
++        mtu,
++        flags_pre,
++        flags,
++        dedup_suppressed_has_time,
++        sourceTimeNs,
++        timeNs,
++        timing_valid,
++        timing_now,
++        timing_slip,
++        timing_valid && timing_now > timeNs,
++        trace_reader_before,
++        _tx_stream.reader_enabled,
++        trace_user_before,
++        _tx_stream.user_count,
++        trace_hw_before,
++        _tx_stream.hw_count,
++        trace_sw_before,
++        _tx_stream.sw_count,
++        trace_cleared_before,
++        _tx_stream.cleared_count,
++        trace_zero_copy,
++        _tx_stream.samplerate);
+ #elif USE_LITEETH
+     if (numElems >= mtu) {
+         auto it = _tx_stream.pendingWriteBufs.find(handle);
+@@ -2782,6 +4057,33 @@ void SoapyLiteXM2SDR::_dmaReleaseWrite(
+         _tx_stream.underflow_count.fetch_add(1, std::memory_order_relaxed);
+         SoapySDR_logf(SOAPY_SDR_ERROR, "UDP write_submit failed.");
+     }
++    m2sdr_tx_worker_trace_emit(
++        "liteeth_submit",
++        handle,
++        trace_ring_slot,
++        numElems,
++        mtu,
++        flags_pre,
++        flags,
++        dedup_suppressed_has_time,
++        sourceTimeNs,
++        timeNs,
++        timing_valid,
++        timing_now,
++        timing_slip,
++        timing_valid && timing_now > timeNs,
++        trace_reader_before,
++        _tx_stream.reader_enabled,
++        trace_user_before,
++        _tx_stream.user_count,
++        trace_hw_before,
++        _tx_stream.hw_count,
++        trace_sw_before,
++        _tx_stream.sw_count,
++        trace_cleared_before,
++        trace_cleared_before,
++        trace_zero_copy,
++        _tx_stream.samplerate);
+ #endif
+ }
+ 
+@@ -2863,6 +4165,129 @@ void SoapyLiteXM2SDR::txWorkerLoop() {
+         litex_m2sdr::ThreadPriority::HIGH,
+         litex_m2sdr::ThreadPolicy::REALTIME, nullptr);
+ 
++    const bool tx_worker_summary_enabled = m2sdr_env_tx_worker_summary_enabled();
++    const bool tx_release_summary_enabled = m2sdr_env_tx_release_summary_enabled();
++    const uint64_t tx_worker_summary_period = m2sdr_env_tx_worker_summary_period();
++    const uint64_t tx_release_summary_period = m2sdr_env_tx_release_summary_period();
++    uint64_t tx_worker_summary_seq = 0;
++    uint64_t tx_worker_packets = 0;
++    uint64_t tx_worker_samples = 0;
++    uint64_t tx_worker_no_time = 0;
++    uint64_t tx_worker_has_time = 0;
++    uint64_t tx_worker_eob = 0;
++    uint64_t tx_worker_acquire_errors = 0;
++    uint64_t tx_worker_has_time_pos_ns = 0;
++    uint64_t tx_worker_has_time_zero_ns = 0;
++    uint64_t tx_worker_has_time_neg_ns = 0;
++    long long tx_worker_time_min_ns = std::numeric_limits<long long>::max();
++    long long tx_worker_time_max_ns = std::numeric_limits<long long>::min();
++    uint64_t tx_worker_slip_count = 0;
++    long long tx_worker_slip_min_ns = std::numeric_limits<long long>::max();
++    long long tx_worker_slip_max_ns = std::numeric_limits<long long>::min();
++
++    auto print_tx_worker_summary = [&](const char *reason) {
++        if (!tx_worker_summary_enabled)
++            return;
++        const long long time_min_ns =
++            tx_worker_has_time_pos_ns ? tx_worker_time_min_ns : 0;
++        const long long time_max_ns =
++            tx_worker_has_time_pos_ns ? tx_worker_time_max_ns : 0;
++        const long long slip_min_ns =
++            tx_worker_slip_count ? tx_worker_slip_min_ns : 0;
++        const long long slip_max_ns =
++            tx_worker_slip_count ? tx_worker_slip_max_ns : 0;
++        std::fprintf(stderr,
++            "LiteX TX worker summary: reason=%s seq=%llu period=%llu packets=%llu samples=%llu "
++            "has_time=%llu no_time=%llu eob=%llu has_time_pos_ns=%llu has_time_zero_ns=%llu "
++            "has_time_neg_ns=%llu time_min_ns=%lld time_max_ns=%lld tx_slip_count=%llu "
++            "late_count=%llu underflow_count=%llu acquire_errors=%llu slip_min_ns=%lld "
++            "slip_max_ns=%lld reader_enabled=%d samplerate=%.17g pkt_pool=%zu "
++            "work_fifo_max=%zu free_fifo_max=%zu\n",
++            reason,
++            static_cast<unsigned long long>(tx_worker_summary_seq++),
++            static_cast<unsigned long long>(tx_worker_summary_period),
++            static_cast<unsigned long long>(tx_worker_packets),
++            static_cast<unsigned long long>(tx_worker_samples),
++            static_cast<unsigned long long>(tx_worker_has_time),
++            static_cast<unsigned long long>(tx_worker_no_time),
++            static_cast<unsigned long long>(tx_worker_eob),
++            static_cast<unsigned long long>(tx_worker_has_time_pos_ns),
++            static_cast<unsigned long long>(tx_worker_has_time_zero_ns),
++            static_cast<unsigned long long>(tx_worker_has_time_neg_ns),
++            static_cast<long long>(time_min_ns),
++            static_cast<long long>(time_max_ns),
++            static_cast<unsigned long long>(tx_worker_slip_count),
++            static_cast<unsigned long long>(_tx_stream.late_count.load(std::memory_order_relaxed)),
++            static_cast<unsigned long long>(_tx_stream.underflow_count.load(std::memory_order_relaxed)),
++            static_cast<unsigned long long>(tx_worker_acquire_errors),
++            static_cast<long long>(slip_min_ns),
++            static_cast<long long>(slip_max_ns),
++            _tx_stream.reader_enabled ? 1 : 0,
++            _tx_stream.samplerate,
++            _tx_stream.pkt_pool.size(),
++            _tx_stream.work_fifo ? _tx_stream.work_fifo->max_size() : 0,
++            _tx_stream.free_fifo ? _tx_stream.free_fifo->max_size() : 0);
++        std::fflush(stderr);
++    };
++
++    auto reset_tx_release_summary = [&]() {
++        _tx_stream.release_summary_seq = 0;
++        _tx_stream.release_packets = 0;
++        _tx_stream.release_samples = 0;
++        _tx_stream.release_pre_has_time = 0;
++        _tx_stream.release_post_has_time = 0;
++        _tx_stream.release_dedup_suppressed = 0;
++        _tx_stream.release_post_no_time = 0;
++        _tx_stream.release_post_eob = 0;
++        _tx_stream.release_has_time_pos_ns = 0;
++        _tx_stream.release_has_time_zero_ns = 0;
++        _tx_stream.release_has_time_neg_ns = 0;
++        _tx_stream.release_time_min_ns = 0;
++        _tx_stream.release_time_max_ns = 0;
++        _tx_stream.release_slip_count = 0;
++        _tx_stream.release_late_count = 0;
++        _tx_stream.release_late_trace_count = 0;
++        _tx_stream.release_slip_min_ns = 0;
++        _tx_stream.release_slip_max_ns = 0;
++    };
++
++    auto print_tx_release_summary = [&](const char *reason) {
++        if (!tx_release_summary_enabled)
++            return;
++        std::fprintf(stderr,
++            "LiteX TX release summary: reason=%s seq=%llu packets=%llu samples=%llu "
++            "pre_has_time=%llu post_has_time=%llu dedup_suppressed=%llu post_no_time=%llu "
++            "post_eob=%llu post_has_time_pos_ns=%llu post_has_time_zero_ns=%llu "
++            "post_has_time_neg_ns=%llu post_time_min_ns=%lld post_time_max_ns=%lld "
++            "post_slip_count=%llu post_late_count=%llu post_slip_min_ns=%lld "
++            "post_slip_max_ns=%lld reader_enabled=%d samplerate=%.17g\n",
++            reason,
++            static_cast<unsigned long long>(_tx_stream.release_summary_seq++),
++            static_cast<unsigned long long>(_tx_stream.release_packets),
++            static_cast<unsigned long long>(_tx_stream.release_samples),
++            static_cast<unsigned long long>(_tx_stream.release_pre_has_time),
++            static_cast<unsigned long long>(_tx_stream.release_post_has_time),
++            static_cast<unsigned long long>(_tx_stream.release_dedup_suppressed),
++            static_cast<unsigned long long>(_tx_stream.release_post_no_time),
++            static_cast<unsigned long long>(_tx_stream.release_post_eob),
++            static_cast<unsigned long long>(_tx_stream.release_has_time_pos_ns),
++            static_cast<unsigned long long>(_tx_stream.release_has_time_zero_ns),
++            static_cast<unsigned long long>(_tx_stream.release_has_time_neg_ns),
++            static_cast<long long>(_tx_stream.release_time_min_ns),
++            static_cast<long long>(_tx_stream.release_time_max_ns),
++            static_cast<unsigned long long>(_tx_stream.release_slip_count),
++            static_cast<unsigned long long>(_tx_stream.release_late_count),
++            static_cast<long long>(_tx_stream.release_slip_min_ns),
++            static_cast<long long>(_tx_stream.release_slip_max_ns),
++            _tx_stream.reader_enabled ? 1 : 0,
++            _tx_stream.samplerate);
++        std::fflush(stderr);
++    };
++
++    reset_tx_release_summary();
++    print_tx_worker_summary("start");
++    print_tx_release_summary("start");
++
+     while (_tx_stream.worker_running.load(std::memory_order_acquire)) {
+         litex_m2sdr::StreamPacket *pkt = nullptr;
+         const bool tx_idle_fill =
+@@ -2900,7 +4325,11 @@ void SoapyLiteXM2SDR::txWorkerLoop() {
+                     _dmaReleaseWrite(idle_handle,
+                                      this->getStreamMTU(TX_STREAM),
+                                      /*flags=*/0,
+-                                     /*timeNs=*/0);
++                                     /*timeNs=*/0,
++                                     /*sourceTimeNs=*/0,
++                                     /*workerTimingValid=*/false,
++                                     /*workerNowNs=*/0,
++                                     /*workerSlipNs=*/0);
+                 }
+                 continue;
+             }
+@@ -2931,6 +4360,7 @@ void SoapyLiteXM2SDR::txWorkerLoop() {
+             break;
+         }
+         if (ret < 0 && ret != SOAPY_SDR_UNDERFLOW) {
++            ++tx_worker_acquire_errors;
+             _tx_stream.free_fifo->push(pkt, /*wait=*/true);
+             continue;
+         }
+@@ -2950,12 +4380,41 @@ void SoapyLiteXM2SDR::txWorkerLoop() {
+             std::memset(dma_buf + bytes, 0, mtu_bytes - bytes);
+         }
+ 
++        ++tx_worker_packets;
++        tx_worker_samples += pkt->samples;
++        if (pkt->flags & SOAPY_SDR_END_BURST) {
++            ++tx_worker_eob;
++        }
++        if (pkt->flags & SOAPY_SDR_HAS_TIME) {
++            ++tx_worker_has_time;
++            if (pkt->timeNs > 0) {
++                ++tx_worker_has_time_pos_ns;
++                tx_worker_time_min_ns = std::min(tx_worker_time_min_ns, pkt->timeNs);
++                tx_worker_time_max_ns = std::max(tx_worker_time_max_ns, pkt->timeNs);
++            } else if (pkt->timeNs == 0) {
++                ++tx_worker_has_time_zero_ns;
++            } else {
++                ++tx_worker_has_time_neg_ns;
++            }
++        } else {
++            ++tx_worker_no_time;
++        }
++
+         long long release_timeNs = pkt->timeNs;
++        bool worker_timing_valid = false;
++        long long worker_now_ns = 0;
++        long long worker_slip_ns = 0;
+         if ((pkt->flags & SOAPY_SDR_HAS_TIME) && pkt->timeNs > 0) {
+             const long long tx_time_offset_ns = m2sdr_env_tx_time_offset_ns();
+             release_timeNs = pkt->timeNs + tx_time_offset_ns;
+             const long long now = this->getHardwareTime("");
+             const int64_t slip = static_cast<int64_t>(now - release_timeNs);
++            worker_timing_valid = true;
++            worker_now_ns = now;
++            worker_slip_ns = slip;
++            ++tx_worker_slip_count;
++            tx_worker_slip_min_ns = std::min(tx_worker_slip_min_ns, static_cast<long long>(slip));
++            tx_worker_slip_max_ns = std::max(tx_worker_slip_max_ns, static_cast<long long>(slip));
+             const uint64_t slip_count =
+                 _tx_stream.tx_slip_count.fetch_add(1, std::memory_order_acq_rel);
+             _tx_stream.tx_slip_ring[slip_count % TXStream::TX_SLIP_RING].store(
+@@ -2984,9 +4443,30 @@ void SoapyLiteXM2SDR::txWorkerLoop() {
+                 _tx_stream.late_count.fetch_add(1, std::memory_order_relaxed);
+             }
+         }
+-        _dmaReleaseWrite(handle, pkt->samples, pkt->flags, release_timeNs);
++        _dmaReleaseWrite(handle,
++                         pkt->samples,
++                         pkt->flags,
++                         release_timeNs,
++                         pkt->timeNs,
++                         worker_timing_valid,
++                         worker_now_ns,
++                         worker_slip_ns);
++        if (tx_worker_summary_enabled &&
++            tx_worker_summary_period > 0 &&
++            (tx_worker_packets % tx_worker_summary_period) == 0) {
++            print_tx_worker_summary("period");
++        }
++        if (tx_release_summary_enabled &&
++            tx_release_summary_period > 0 &&
++            _tx_stream.release_packets > 0 &&
++            (_tx_stream.release_packets % tx_release_summary_period) == 0) {
++            print_tx_release_summary("period");
++        }
+         _tx_stream.free_fifo->push(pkt, /*wait=*/true);
+     }
++
++    print_tx_worker_summary("stop");
++    print_tx_release_summary("stop");
+ }
+ 
+ /* ===========================================================================
+@@ -2996,14 +4476,16 @@ void SoapyLiteXM2SDR::txWorkerLoop() {
+ 
+ void SoapyLiteXM2SDR::_spawnWorker(Stream &s, bool is_rx) {
+     const size_t capacity = is_rx ? _rx_buf_size : _tx_buf_size;
++    const size_t pkt_count = is_rx ? litex_m2sdr::kWorkerPktCount
++                                   : m2sdr_env_tx_worker_pkt_count();
+     _freePktPool(s);
+     s.pkt_capacity = capacity;
+-    s.pkt_pool.resize(litex_m2sdr::kWorkerPktCount);
++    s.pkt_pool.resize(pkt_count);
+     s.work_fifo = std::make_unique<litex_m2sdr::PacketsFIFO<litex_m2sdr::StreamPacket*>>(
+-        litex_m2sdr::kWorkerPktCount);
++        pkt_count);
+     s.free_fifo = std::make_unique<litex_m2sdr::PacketsFIFO<litex_m2sdr::StreamPacket*>>(
+-        litex_m2sdr::kWorkerPktCount);
+-    for (size_t i = 0; i < litex_m2sdr::kWorkerPktCount; ++i) {
++        pkt_count);
++    for (size_t i = 0; i < pkt_count; ++i) {
+         s.pkt_pool[i].data     = new uint8_t[capacity];
+         s.pkt_pool[i].capacity = capacity;
+         s.pkt_pool[i].index    = i;
+@@ -3014,6 +4496,15 @@ void SoapyLiteXM2SDR::_spawnWorker(Stream &s, bool is_rx) {
+         std::memset(s.pkt_pool[i].data, 0, capacity);
+         s.free_fifo->push(&s.pkt_pool[i]);
+     }
++    if (!is_rx && pkt_count != litex_m2sdr::kWorkerPktCount) {
++        std::fprintf(stderr,
++            "M2SDR TX worker packet pool override active: packets=%zu default=%zu capacity_bytes=%zu",
++            pkt_count,
++            litex_m2sdr::kWorkerPktCount,
++            capacity);
++        std::fputc('\n', stderr);
++        std::fflush(stderr);
++    }
+     s.overflow_count.store(0);
+     s.underflow_count.store(0);
+     s.late_count.store(0);
+-- 
+2.53.0
+

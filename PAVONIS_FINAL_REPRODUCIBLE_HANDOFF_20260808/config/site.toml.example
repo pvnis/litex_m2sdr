@@ -1,0 +1,39 @@
+# Copy outside the package, chmod 600, and replace every REPLACE value.
+# The same unprivileged service-account home is required on both lab hosts so
+# the proven hash-pinned harness can be materialized once and deployed twice.
+
+[transport]
+known_hosts = "~/.ssh/known_hosts"
+strict_host_key_checking = "yes"
+connect_timeout_seconds = 8
+# Key authentication is preferred. Set password_file only when keys are not
+# available; it must be mode 600 and is never copied into the package.
+password_file = ""
+
+[roles.ran]
+host = "REPLACE_RAN_HOST"
+user = "pavonis"
+home = "/home/pavonis"
+identity_file = "~/.ssh/pavonis_lab"
+port = 22
+
+[roles.ue]
+host = "REPLACE_UE_HOST"
+user = "pavonis"
+home = "/home/pavonis"
+identity_file = "~/.ssh/pavonis_lab"
+port = 22
+
+[network]
+core_n2_ip = "REPLACE_CORE_N2_IP"
+primer_s1_ip = "REPLACE_PRIMER_S1_IP"
+ran_interface = "REPLACE_RAN_INTERFACE"
+external_interface = "REPLACE_EXTERNAL_INTERFACE"
+
+[runtime]
+# Optional SHA-256 replacements for binaries rebuilt from the bundled source.
+# Keys are the historical pin and values are the locally rebuilt artifact pin.
+# Leave this table empty when deploying the exact recorded binaries.
+
+[runtime.pin_overrides]
+# "historical_sha256" = "replacement_sha256"

@@ -1,0 +1,71 @@
+{
+  "schema": "pavonis.final-run-evidence.v1",
+  "classification": "sanitized curated evidence",
+  "verdict": "pass",
+  "proof_boundary": "single real handset, private lab, LiteX M2SDR OTA, bidirectional IP and public internet",
+  "slow_profile": {
+    "run_id": "20260805T120946Z",
+    "attach_ms": 20637,
+    "in_network_dl_bytes_per_second": 804015,
+    "in_network_ul_bytes_per_second": 11478,
+    "public_https_dl_bytes_per_second": 988171,
+    "public_https_ul_bytes_per_second": 19861,
+    "private_gateway_ping": "3/3",
+    "public_ip_ping": "3/3",
+    "public_dns_ping": "3/3"
+  },
+  "fast_profile": {
+    "run_id": "20260805T123403Z",
+    "attach_and_data": "pass",
+    "sustained_duration_seconds": 45,
+    "in_network_dl_bytes_per_second": 2425101,
+    "in_network_ul_bytes_per_second": 54468,
+    "public_https_dl_bytes_per_second": 2622826,
+    "speed_test_dl_mbit_per_second": 25.1,
+    "speed_test_ul_mbit_per_second": 1.61,
+    "private_gateway_ping": "3/3",
+    "public_ip_ping": "3/3",
+    "public_dns_ping": "3/3"
+  },
+  "recorded_limitations": [
+    "The successful handset path still uses the bounded primer before OCUDU.",
+    "The legacy core-side CP2880 probe returns nonzero despite endpoint and public-internet success.",
+    "The fast profile varies with visible HARQ feedback latency; 25.1 Mbit/s is an observed result, not a guaranteed minimum.",
+    "The hold process is controller-session scoped unless launched inside a persistent session."
+  ],
+  "source_records": [
+    {
+      "role": "original private session record, retained outside submission",
+      "sha256": "44e7fad6ddf8e588563a644efe78b4b6c79a3c56cbe47dcc8430b83a2ab512b7"
+    },
+    {
+      "role": "original private demo summary, retained outside submission",
+      "sha256": "f288faf73d501403df8f297026ca25ea9884c4b1749fe334d0439da41855cbc1"
+    },
+    {
+      "path": "evidence/final-session/SESSION_RECORD_SANITIZED.md",
+      "sha256": "1e6767fc7aba4091f9ee2891c74b688a2d0d5c8459f664b31cf0535f42a69b74"
+    },
+    {
+      "path": "evidence/final-session/DEMO_TLDR_SANITIZED.md",
+      "sha256": "f677d6228f7310902fb82ee156cfc6b9cbc76810b4ecbe1f1c82d8fb92e4240c"
+    }
+  ],
+  "historical_hold_script_hashes": {
+    "slow_continuous": "ac784e995d2baa6e03cf71c59648cfea0c764223437d7370e7df0976caa41884",
+    "slow_filtered": "adabf67c007fd533f66d9558250c70e85229ffc1b43e80eb377fb0de371a8636",
+    "slow_runner": "f6c2fa2ca0de6c7a098994ce2b823bb3b7914adc471b8e7094b61706c1bd9601",
+    "slow_executor": "6a7eb95462feaa04243e992f6f33a71026d9d4e4332d043c06b1c1a8b492940b",
+    "fast_continuous": "b3cbcd6df9fa85bee67095282d38a342f22bcf241a93c2377b3ec20da0b38ff7",
+    "fast_filtered": "a73e880d3b8393550f99f3ab3d8aac14e7a2b6ec2c39e1d467ce0c36ed029f48",
+    "fast_runner": "c718b1f8e604cf03be887977c1de4ac4502fdbef02057606385148593d166575",
+    "fast_executor": "d7ae64d3e2e9f2b3b7739ea033f7d39638c5c012ecc9da4f7b0cd12f113981b7"
+  },
+  "frozen_cp3121_hashes": {
+    "continuous": "64740c016cc8d43d45a1e411755242c5c13e547bf5973e656d24caadbfdebb77",
+    "filtered": "6534737880b188da25cd1f88db0ee87c6e5b19db3f398cd1fc3df9424c791241",
+    "runner": "63398c363586cd9d8d22e201fda7735a353451654a167ff8c0f0ec13f52dd56c",
+    "executor": "bc80239b5b9b80efb03f28e11b0e4279120bb5af757887b5a6737e59b9c14f21"
+  }
+}
+

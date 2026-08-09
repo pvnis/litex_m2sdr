@@ -1,0 +1,206 @@
+From c523abb1105318cc0b93b73de69c8d837329672c Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 16:44:26 +0200
+Subject: [PATCH 3/3] chore: keep qcore clean under pinned clippy
+
+Apply seven behavior-neutral style fixes required by the pinned 2026 Rust toolchain so the CP3116 review branch can enforce -D warnings across all targets.
+---
+ qcore/src/cluster/mod.rs                      |  2 +-
+ qcore/src/main.rs                             | 16 +++++++---------
+ qcore/src/procedures/ue_associated/nas/mod.rs |  8 ++++----
+ .../ngap/initial_context_setup.rs             | 19 +++++++++----------
+ qcore/src/qcore.rs                            |  8 +++-----
+ qcore/src/userplane/dhcp.rs                   |  2 +-
+ qcore/src/userplane/netlink.rs                | 14 +++++++-------
+ tests/src/load_test.rs                        |  2 +-
+ tests/tests/paging.rs                         |  2 +-
+ 9 files changed, 34 insertions(+), 39 deletions(-)
+
+diff --git a/qcore/src/cluster/mod.rs b/qcore/src/cluster/mod.rs
+index bb6ea0e..d8a0abe 100644
+--- a/qcore/src/cluster/mod.rs
++++ b/qcore/src/cluster/mod.rs
+@@ -205,7 +205,7 @@ impl<H: ReplicationHandler> ClusterHandler<H> {
+                 length < MAX_LENGTH,
+                 "Illegal protocol operation - length too long"
+             );
+-            let mut buf = vec![0u8; length as usize];
++            let mut buf = vec![0u8; length];
+             connection.read_exact(&mut buf).await?;
+ 
+             // TODO Make this generic?
+diff --git a/qcore/src/main.rs b/qcore/src/main.rs
+index adb9759..cf8b76d 100644
+--- a/qcore/src/main.rs
++++ b/qcore/src/main.rs
+@@ -178,15 +178,13 @@ async fn main() -> Result<()> {
+         Err(e) => bail!("{e:#}"),
+     };
+ 
+-    if use_dhcp {
+-        if let Err(e) = (*qc).test_dhcp().await {
+-            warn!(
+-                logger,
+-                "DHCP self test failed.  Pass --no-dhcp to switch to self-managed UE IP addresses"
+-            );
+-            warn!(logger, "Error occurred {:#}", e);
+-            bail!("Self test failure");
+-        }
++    if use_dhcp && let Err(e) = (*qc).test_dhcp().await {
++        warn!(
++            logger,
++            "DHCP self test failed.  Pass --no-dhcp to switch to self-managed UE IP addresses"
++        );
++        warn!(logger, "Error occurred {:#}", e);
++        bail!("Self test failure");
+     }
+     wait_for_signal().await?;
+ 
+diff --git a/qcore/src/procedures/ue_associated/nas/mod.rs b/qcore/src/procedures/ue_associated/nas/mod.rs
+index aa71144..b13a142 100644
+--- a/qcore/src/procedures/ue_associated/nas/mod.rs
++++ b/qcore/src/procedures/ue_associated/nas/mod.rs
+@@ -75,10 +75,10 @@ impl<'a, B: NasBase> NasProcedure<'a, B> {
+                 let inner = Box::new(decode_nas_5gs_message(
+                     &ul_nas_transport.payload_container.value,
+                 )?);
+-                if let Nas5gsMessage::Gsm(_, nas_sm) = *inner {
+-                    if let Some(extracted) = filter(nas_sm) {
+-                        return Ok(extracted);
+-                    }
++                if let Nas5gsMessage::Gsm(_, nas_sm) = *inner
++                    && let Some(extracted) = filter(nas_sm)
++                {
++                    return Ok(extracted);
+                 }
+             }
+ 
+diff --git a/qcore/src/procedures/ue_associated/ngap/initial_context_setup.rs b/qcore/src/procedures/ue_associated/ngap/initial_context_setup.rs
+index b183c1c..99d567d 100644
+--- a/qcore/src/procedures/ue_associated/ngap/initial_context_setup.rs
++++ b/qcore/src/procedures/ue_associated/ngap/initial_context_setup.rs
+@@ -78,19 +78,18 @@ impl<'a, B: RanUeBase> NgapUeProcedure<'a, B> {
+         session: &mut PduSession,
+         rsp: &InitialContextSetupResponse,
+     ) -> Result<bool> {
+-        if let Some(ref list) = rsp.pdu_session_resource_setup_list_cxt_res {
+-            if let Some(matching_item) = list
++        if let Some(ref list) = rsp.pdu_session_resource_setup_list_cxt_res
++            && let Some(matching_item) = list
+                 .0
+                 .iter()
+                 .find(|item| item.pdu_session_id.0 == session.id)
+-            {
+-                return self
+-                    .connect_session_downlink(
+-                        &matching_item.pdu_session_resource_setup_response_transfer,
+-                        session,
+-                    )
+-                    .await;
+-            }
++        {
++            return self
++                .connect_session_downlink(
++                    &matching_item.pdu_session_resource_setup_response_transfer,
++                    session,
++                )
++                .await;
+         }
+         bail!("gNB did not supply resource setup response")
+     }
+diff --git a/qcore/src/qcore.rs b/qcore/src/qcore.rs
+index c74da64..777741e 100644
+--- a/qcore/src/qcore.rs
++++ b/qcore/src/qcore.rs
+@@ -351,10 +351,9 @@ impl ProcedureBase for QCore {
+                         .dispatch_ue_message(ue_id, UeMessage::TakeContext(sender))
+                         .await
+                         .is_ok()
++                        && let Ok(nas_context) = receiver.recv().await
+                     {
+-                        if let Ok(nas_context) = receiver.recv().await {
+-                            return Some(nas_context);
+-                        }
++                        return Some(nas_context);
+                     }
+ 
+                     // Continue loop to retry
+@@ -553,8 +552,7 @@ impl ProcedureBase for QCore {
+ impl ReplicationHandler for Arc<QCore> {
+     async fn store_replicated_ue_context(&self, c: UeContext5GC) {
+         if let Some(tmsi) = &c.tmsi {
+-            self.put_core_context(tmsi.0.clone(), 0, c, 10, &self.logger)
+-                .await;
++            self.put_core_context(tmsi.0, 0, c, 10, &self.logger).await;
+         }
+     }
+ 
+diff --git a/qcore/src/userplane/dhcp.rs b/qcore/src/userplane/dhcp.rs
+index ea95192..fa81d9c 100644
+--- a/qcore/src/userplane/dhcp.rs
++++ b/qcore/src/userplane/dhcp.rs
+@@ -60,7 +60,7 @@ impl DhcpClient {
+         let pending_requests = Arc::new(Mutex::new(HashMap::new()));
+         let client = DhcpClient {
+             socket,
+-            local_mac: config.local_mac.clone(),
++            local_mac: config.local_mac,
+             local_ipv4: config.local_ip,
+             pending_requests,
+             leases: Arc::new(Mutex::new(HashMap::new())),
+diff --git a/qcore/src/userplane/netlink.rs b/qcore/src/userplane/netlink.rs
+index f0b7ec0..079a14c 100644
+--- a/qcore/src/userplane/netlink.rs
++++ b/qcore/src/userplane/netlink.rs
+@@ -53,15 +53,15 @@ impl Netlink {
+             .execute();
+ 
+         while let Some(Ok(interface)) = interfaces.next().await {
+-            if let Ok(ipv4) = self.first_ipv4_address_of(interface.header.index).await {
+-                if ipv4 == *addr {
+-                    for attr in interface.attributes {
+-                        if let LinkAttribute::IfName(name) = attr {
+-                            return Some(name);
+-                        }
++            if let Ok(ipv4) = self.first_ipv4_address_of(interface.header.index).await
++                && ipv4 == *addr
++            {
++                for attr in interface.attributes {
++                    if let LinkAttribute::IfName(name) = attr {
++                        return Some(name);
+                     }
+-                    break;
+                 }
++                break;
+             }
+         }
+         None
+diff --git a/tests/src/load_test.rs b/tests/src/load_test.rs
+index 04653ba..b2ed6e3 100644
+--- a/tests/src/load_test.rs
++++ b/tests/src/load_test.rs
+@@ -46,7 +46,7 @@ pub async fn load_test(amf_ip: IpAddr, sims: SubscriberDb, logger: Logger) -> Re
+ 
+             // Context release = 3 messages.
+             gnb.send_ue_context_release_request(&ue).await?;
+-            gnb.handle_ue_context_release(&mut ue).await?;
++            gnb.handle_ue_context_release(&ue).await?;
+ 
+             let _old_ue_context = gnb.reset_ue_context(&mut ue, &amf_ip).await?;
+ 
+diff --git a/tests/tests/paging.rs b/tests/tests/paging.rs
+index 7891d2d..ab8330d 100644
+--- a/tests/tests/paging.rs
++++ b/tests/tests/paging.rs
+@@ -20,7 +20,7 @@ async fn paging() -> anyhow::Result<()> {
+         .await?;
+ 
+     // Queued packet gets replayed.
+-    let _ip_packet = gnb.recv_n3_data_packet(&mut ue).await?;
++    let _ip_packet = gnb.recv_n3_data_packet(&ue).await?;
+ 
+     ue.receive_nas_service_accept().await?;
+     ue.handle_nas_configuration_update().await?;
+-- 
+2.53.0
+

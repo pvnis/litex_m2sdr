@@ -1,0 +1,32 @@
+From e65e48f46a4dc4a923e0563414436bbaf97c3de6 Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 16:14:19 +0200
+Subject: [PATCH 6/7] tests: link PRACH stage-1 dependencies
+
+The default-off CP2064 stage-1 path references detector, support, and DFT factories. Link them into the focused lower-PHY test so the review branch remains testable without changing runtime behavior.
+---
+ .../phy/lower/processors/uplink/prach/CMakeLists.txt   | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/tests/unittests/phy/lower/processors/uplink/prach/CMakeLists.txt b/tests/unittests/phy/lower/processors/uplink/prach/CMakeLists.txt
+index 010660e217..f5ab734a8c 100644
+--- a/tests/unittests/phy/lower/processors/uplink/prach/CMakeLists.txt
++++ b/tests/unittests/phy/lower/processors/uplink/prach/CMakeLists.txt
+@@ -4,5 +4,13 @@
+ 
+ 
+ add_executable(prach_processor_test prach_processor_test.cpp)
+-target_link_libraries(prach_processor_test ocudu_lower_phy_prach_processor ocudulog GTest::gtest GTest::gtest_main)
++target_link_libraries(
++  prach_processor_test
++  ocudu_lower_phy_prach_processor
++  ocudu_prach_detector
++  ocudu_phy_support
++  ocudu_dft
++  ocudulog
++  GTest::gtest
++  GTest::gtest_main)
+ add_test(prach_processor_test prach_processor_test)
+-- 
+2.53.0
+

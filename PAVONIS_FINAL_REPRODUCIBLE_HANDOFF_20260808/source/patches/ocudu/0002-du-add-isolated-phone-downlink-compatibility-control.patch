@@ -1,0 +1,2225 @@
+From 478216ff317ad19a4eafc25351622547976bc197 Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 15:57:01 +0200
+Subject: [PATCH 2/7] du: add isolated phone downlink compatibility controls
+
+Carry the standards-valid SIB1 cadence/n0, SI power-sign, fallback aggregation and bounded-MCS controls used by the CP3114 phone proof. All overrides remain environment-gated and default to upstream behavior. Trace helpers are metadata-only and disabled by default. Refs CP2038, CP2722, CP3112, CP3114.
+---
+ .../du_high/du_high_config_translators.cpp    | 114 ++-
+ .../du_high/du_high_config_validator.cpp      |  16 +-
+ .../ocudu/support/pavonis_msg3_path_trace.h   | 138 ++++
+ .../ocudu/support/pavonis_puxch_order_trace.h | 379 +++++++++
+ .../converters/asn1_sys_info_packer.cpp       |  46 +-
+ .../p7/mac_to_fapi_fastpath_translator.cpp    | 730 ++++++++++++++++++
+ .../phy/p7/pdu_translators/pdsch.cpp          |  30 +-
+ .../ssb/ssb_processor_impl.cpp                |  31 +-
+ .../common_scheduling/sib1_scheduler.cpp      |  53 +-
+ lib/scheduler/config/csi_helper.cpp           |  56 +-
+ .../ue_scheduling/ue_cell_grid_allocator.cpp  |  10 +
+ .../ue_scheduling/ue_fallback_scheduler.cpp   |  42 +-
+ .../p7/pdu_translators/dl_pdsch_pdu_test.cpp  |  65 +-
+ .../common_scheduling/sib1_scheduler_test.cpp |  31 +-
+ 14 files changed, 1715 insertions(+), 26 deletions(-)
+ create mode 100644 include/ocudu/support/pavonis_msg3_path_trace.h
+ create mode 100644 include/ocudu/support/pavonis_puxch_order_trace.h
+
+diff --git a/apps/units/flexible_o_du/o_du_high/du_high/du_high_config_translators.cpp b/apps/units/flexible_o_du/o_du_high/du_high/du_high_config_translators.cpp
+index 5193ceb58b..65cb066495 100644
+--- a/apps/units/flexible_o_du/o_du_high/du_high/du_high_config_translators.cpp
++++ b/apps/units/flexible_o_du/o_du_high/du_high/du_high_config_translators.cpp
+@@ -25,9 +25,113 @@
+ #include "ocudu/scheduler/config/scheduler_expert_config_validator.h"
+ #include "ocudu/scheduler/config/time_domain_resource_helper.h"
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ 
+ using namespace ocudu;
+ 
++static std::optional<aggregation_level> get_pavonis_sib1_dci_aggr_lev_override()
++{
++  const char* value = std::getenv("PAVONIS_GNB_SIB1_DCI_AGGR_LEV");
++  if (value == nullptr || value[0] == '\0') {
++    return std::nullopt;
++  }
++
++  if (std::strcmp(value, "1") == 0 || std::strcmp(value, "n1") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_SIB1_DCI_AGGR_LEV active value=%s level=n1\n", value);
++    return aggregation_level::n1;
++  }
++  if (std::strcmp(value, "2") == 0 || std::strcmp(value, "n2") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_SIB1_DCI_AGGR_LEV active value=%s level=n2\n", value);
++    return aggregation_level::n2;
++  }
++  if (std::strcmp(value, "4") == 0 || std::strcmp(value, "n4") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_SIB1_DCI_AGGR_LEV active value=%s level=n4\n", value);
++    return aggregation_level::n4;
++  }
++  if (std::strcmp(value, "8") == 0 || std::strcmp(value, "n8") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_SIB1_DCI_AGGR_LEV active value=%s level=n8\n", value);
++    return aggregation_level::n8;
++  }
++  if (std::strcmp(value, "16") == 0 || std::strcmp(value, "n16") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_SIB1_DCI_AGGR_LEV active value=%s level=n16\n", value);
++    return aggregation_level::n16;
++  }
++
++  report_error("Invalid PAVONIS_GNB_SIB1_DCI_AGGR_LEV value={}. Expected 1, 2, 4, 8, 16, n1, n2, n4, n8, or n16.\n",
++               value);
++  return std::nullopt;
++}
++
++static std::optional<sch_mcs_index> get_pavonis_max_msg4_mcs_override()
++{
++  const char* value = std::getenv("PAVONIS_GNB_MAX_MSG4_MCS");
++  if (value == nullptr || value[0] == '\0') {
++    return std::nullopt;
++  }
++
++  char*               end    = nullptr;
++  const unsigned long parsed = std::strtoul(value, &end, 10);
++  if (end == value || end == nullptr || end[0] != '\0' || parsed > 9) {
++    report_error("Invalid PAVONIS_GNB_MAX_MSG4_MCS value={}. Expected an integer from 0 through 9.\n", value);
++  }
++
++  std::fprintf(stderr, "PAVONIS_GNB_MAX_MSG4_MCS active value=%lu\n", parsed);
++  return sch_mcs_index{static_cast<uint8_t>(parsed)};
++}
++
++static std::optional<sch_mcs_index> get_pavonis_max_conres_mcs_override()
++{
++  const char* value = std::getenv("PAVONIS_GNB_MAX_CONRES_MCS");
++  if (value == nullptr || value[0] == '\0') {
++    return std::nullopt;
++  }
++
++  char*               end    = nullptr;
++  const unsigned long parsed = std::strtoul(value, &end, 10);
++  if (end == value || end == nullptr || end[0] != '\0' || parsed > 9) {
++    report_error("Invalid PAVONIS_GNB_MAX_CONRES_MCS value={}. Expected an integer from 0 through 9.\n", value);
++  }
++
++  std::fprintf(stderr, "PAVONIS_GNB_MAX_CONRES_MCS active value=%lu\n", parsed);
++  return sch_mcs_index{static_cast<uint8_t>(parsed)};
++}
++
++static std::optional<aggregation_level> get_pavonis_fallback_dl_dci_aggr_lev_override()
++{
++  const char* value = std::getenv("PAVONIS_GNB_FALLBACK_DL_DCI_AGGR_LEV");
++  if (value == nullptr || value[0] == '\0') {
++    return std::nullopt;
++  }
++
++  if (std::strcmp(value, "1") == 0 || std::strcmp(value, "n1") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_FALLBACK_DL_DCI_AGGR_LEV active value=%s level=n1\n", value);
++    return aggregation_level::n1;
++  }
++  if (std::strcmp(value, "2") == 0 || std::strcmp(value, "n2") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_FALLBACK_DL_DCI_AGGR_LEV active value=%s level=n2\n", value);
++    return aggregation_level::n2;
++  }
++  if (std::strcmp(value, "4") == 0 || std::strcmp(value, "n4") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_FALLBACK_DL_DCI_AGGR_LEV active value=%s level=n4\n", value);
++    return aggregation_level::n4;
++  }
++  if (std::strcmp(value, "8") == 0 || std::strcmp(value, "n8") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_FALLBACK_DL_DCI_AGGR_LEV active value=%s level=n8\n", value);
++    return aggregation_level::n8;
++  }
++  if (std::strcmp(value, "16") == 0 || std::strcmp(value, "n16") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_FALLBACK_DL_DCI_AGGR_LEV active value=%s level=n16\n", value);
++    return aggregation_level::n16;
++  }
++
++  report_error(
++      "Invalid PAVONIS_GNB_FALLBACK_DL_DCI_AGGR_LEV value={}. Expected 1, 2, 4, 8, 16, n1, n2, n4, n8, or n16.\n",
++      value);
++  return std::nullopt;
++}
++
+ static tdd_ul_dl_config_common generate_tdd_pattern(subcarrier_spacing scs, const du_high_unit_tdd_ul_dl_config& config)
+ {
+   tdd_ul_dl_config_common out;
+@@ -1109,6 +1213,14 @@ static scheduler_expert_config generate_scheduler_expert_config(const du_high_un
+ {
+   scheduler_expert_config out_cfg = config_helpers::make_default_scheduler_expert_config();
+ 
++  if (const auto max_msg4_mcs = get_pavonis_max_msg4_mcs_override(); max_msg4_mcs.has_value()) {
++    out_cfg.ue.max_msg4_mcs = max_msg4_mcs.value();
++  }
++  out_cfg.ue.max_conres_mcs = get_pavonis_max_conres_mcs_override();
++  if (const auto aggr_lev = get_pavonis_fallback_dl_dci_aggr_lev_override(); aggr_lev.has_value()) {
++    out_cfg.ue.fallback_dl_dci_aggr_lev = aggr_lev.value();
++  }
++
+   const du_high_unit_base_cell_config& cell = config.cells_cfg.front().cell;
+ 
+   // UE parameters.
+@@ -1187,7 +1299,7 @@ static scheduler_expert_config generate_scheduler_expert_config(const du_high_un
+ 
+   // SI parameters.
+   out_cfg.si.sib1_mcs_index    = pdsch.fixed_sib1_mcs;
+-  out_cfg.si.sib1_dci_aggr_lev = aggregation_level::n4;
++  out_cfg.si.sib1_dci_aggr_lev = get_pavonis_sib1_dci_aggr_lev_override().value_or(aggregation_level::n4);
+ 
+   // Logging and tracing.
+   out_cfg.log_broadcast_messages       = config.loggers.broadcast_enabled;
+diff --git a/apps/units/flexible_o_du/o_du_high/du_high/du_high_config_validator.cpp b/apps/units/flexible_o_du/o_du_high/du_high/du_high_config_validator.cpp
+index 10a71fe3ad..78c21f82f4 100644
+--- a/apps/units/flexible_o_du/o_du_high/du_high/du_high_config_validator.cpp
++++ b/apps/units/flexible_o_du/o_du_high/du_high/du_high_config_validator.cpp
+@@ -14,9 +14,16 @@
+ #include "ocudu/ran/transform_precoding/transform_precoding_helpers.h"
+ #include "ocudu/rlc/rlc_config.h"
+ #include <algorithm>
++#include <cstdlib>
+ 
+ using namespace ocudu;
+ 
++static bool pavonis_allow_extended_ra_resp_window()
++{
++  const char* value = std::getenv("PAVONIS_ALLOW_EXTENDED_RA_RESP_WINDOW");
++  return value != nullptr && value[0] != '\0' && value[0] != '0';
++}
++
+ static bool validate_pcap_configs(const du_high_unit_config& config)
+ {
+   if (config.pcaps.mac.enabled) {
+@@ -1341,7 +1348,9 @@ static bool validate_cells_unit_config(span<const du_high_unit_cell_config> conf
+     unsigned max_ra_resp_window = is_unlicensed ? 40 : 10;
+     unsigned ra_resp_window_ms =
+         cell.cell.prach_cfg.ra_resp_window.value() >> to_numerology_value(cell.cell.common_scs);
+-    if (ra_resp_window_ms > max_ra_resp_window) {
++    const bool pavonis_extended_ra_window =
++        !is_unlicensed && ra_resp_window_ms <= 40 && pavonis_allow_extended_ra_resp_window();
++    if (ra_resp_window_ms > max_ra_resp_window && !pavonis_extended_ra_window) {
+       fmt::print("RA Response Window ({}sl -> {}ms) must be smaller than {}ms in {} bands.\n",
+                  cell.cell.prach_cfg.ra_resp_window,
+                  ra_resp_window_ms,
+@@ -1349,6 +1358,11 @@ static bool validate_cells_unit_config(span<const du_high_unit_cell_config> conf
+                  is_unlicensed ? "unlicensed" : "licensed");
+       return false;
+     }
++    if (pavonis_extended_ra_window) {
++      fmt::print("PAVONIS_ALLOW_EXTENDED_RA_RESP_WINDOW active: allowing RA Response Window {}sl -> {}ms on licensed band.\n",
++                 cell.cell.prach_cfg.ra_resp_window,
++                 ra_resp_window_ms);
++    }
+   }
+ 
+   // Checks parameter collisions between cells that can lead to problems.
+diff --git a/include/ocudu/support/pavonis_msg3_path_trace.h b/include/ocudu/support/pavonis_msg3_path_trace.h
+new file mode 100644
+index 0000000000..05d7b3777b
+--- /dev/null
++++ b/include/ocudu/support/pavonis_msg3_path_trace.h
+@@ -0,0 +1,138 @@
++// SPDX-FileCopyrightText: Copyright (C) 2026
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++
++#pragma once
++
++#include "ocudu/ran/slot_point.h"
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <climits>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace ocudu {
++namespace pavonis {
++
++inline bool msg3_path_trace_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_MSG3_PATH_TRACE");
++    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
++           std::strcmp(value, "false") != 0 && std::strcmp(value, "off") != 0;
++  }();
++  return enabled;
++}
++
++inline unsigned msg3_path_trace_limit()
++{
++  static const unsigned limit = []() {
++    const char* value = std::getenv("PAVONIS_MSG3_PATH_TRACE_LIMIT");
++    if (value == nullptr || value[0] == '\0') {
++      return 1024U;
++    }
++
++    char* end = nullptr;
++    errno     = 0;
++    unsigned long parsed = std::strtoul(value, &end, 10);
++    if (errno != 0 || end == value || *end != '\0') {
++      std::fprintf(stderr, "PAVONIS_MSG3_PATH_TRACE_LIMIT invalid value=%s; using 1024\n", value);
++      return 1024U;
++    }
++    return static_cast<unsigned>(std::min<unsigned long>(parsed, UINT_MAX));
++  }();
++  return limit;
++}
++
++inline unsigned long long msg3_path_trace_steady_ns()
++{
++  return static_cast<unsigned long long>(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++          .count());
++}
++
++inline bool msg3_path_trace_take()
++{
++  if (!msg3_path_trace_enabled()) {
++    return false;
++  }
++
++  const unsigned limit = msg3_path_trace_limit();
++  if (limit == 0) {
++    return false;
++  }
++
++  static std::atomic<unsigned> count{0};
++  const unsigned              row = count.fetch_add(1, std::memory_order_relaxed);
++  if (row < limit) {
++    return true;
++  }
++  if (row == limit) {
++    std::fprintf(stderr,
++                 "PAVONIS_MSG3_PATH_TRACE event=trace_limit_reached steady_ns=%llu limit=%u\n",
++                 msg3_path_trace_steady_ns(),
++                 limit);
++  }
++  return false;
++}
++
++inline void msg3_path_trace_write(const char* event,
++                                  slot_point  slot,
++                                  size_t      payload_len,
++                                  uint64_t    payload_hash,
++                                  int         lcid,
++                                  int         harq_id,
++                                  const char* outcome)
++{
++  const bool valid = slot.valid();
++  std::fprintf(stderr,
++               "PAVONIS_MSG3_PATH_TRACE event=%s steady_ns=%llu slot_valid=%u slot_abs=%u sfn=%u slot=%u "
++               "payload_len=%zu payload_fnv64=%016llx lcid=%d harq_id=%d outcome=%s\n",
++               event,
++               msg3_path_trace_steady_ns(),
++               valid ? 1U : 0U,
++               valid ? slot.to_uint() : 0U,
++               valid ? slot.sfn() : 0U,
++               valid ? slot.slot_index() : 0U,
++               payload_len,
++               static_cast<unsigned long long>(payload_hash),
++               lcid,
++               harq_id,
++               outcome);
++}
++
++inline void
++msg3_path_trace_event(const char* event, slot_point slot, int lcid, int harq_id, const char* outcome)
++{
++  if (!msg3_path_trace_take()) {
++    return;
++  }
++  msg3_path_trace_write(event, slot, 0, 0, lcid, harq_id, outcome);
++}
++
++template <typename Range>
++inline void msg3_path_trace_payload_event(const char*  event,
++                                          slot_point   slot,
++                                          const Range& payload,
++                                          int          lcid,
++                                          int          harq_id,
++                                          const char*  outcome)
++{
++  if (!msg3_path_trace_take()) {
++    return;
++  }
++
++  uint64_t hash = 1469598103934665603ULL;
++  size_t   len  = 0;
++  for (auto byte : payload) {
++    hash ^= static_cast<uint8_t>(byte);
++    hash *= 1099511628211ULL;
++    ++len;
++  }
++  msg3_path_trace_write(event, slot, len, hash, lcid, harq_id, outcome);
++}
++
++} // namespace pavonis
++} // namespace ocudu
+diff --git a/include/ocudu/support/pavonis_puxch_order_trace.h b/include/ocudu/support/pavonis_puxch_order_trace.h
+new file mode 100644
+index 0000000000..2813ef5c6a
+--- /dev/null
++++ b/include/ocudu/support/pavonis_puxch_order_trace.h
+@@ -0,0 +1,379 @@
++// SPDX-FileCopyrightText: Copyright (C) 2026
++// SPDX-License-Identifier: BSD-3-Clause-Open-MPI
++
++#pragma once
++
++#include <algorithm>
++#include <array>
++#include <atomic>
++#include <cerrno>
++#include <chrono>
++#include <climits>
++#include <cstdarg>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++
++namespace ocudu {
++namespace pavonis {
++
++inline bool puxch_order_trace_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_PUXCH_ORDER_TRACE");
++    return (value != nullptr) && (value[0] != '\0') && (std::strcmp(value, "0") != 0);
++  }();
++  return enabled;
++}
++
++inline unsigned puxch_order_trace_limit()
++{
++  static const unsigned limit = []() {
++    const char* value = std::getenv("PAVONIS_PUXCH_ORDER_TRACE_LIMIT");
++    if ((value == nullptr) || (value[0] == '\0')) {
++      return 500U;
++    }
++
++    char* end = nullptr;
++    errno     = 0;
++    unsigned long parsed = std::strtoul(value, &end, 10);
++    if ((errno != 0) || (end == value) || ((end != nullptr) && (*end != '\0'))) {
++      std::fprintf(stderr, "PAVONIS_PUXCH_ORDER_TRACE_LIMIT invalid value=%s; using 500\n", value);
++      return 500U;
++    }
++
++    return (parsed > UINT_MAX) ? UINT_MAX : static_cast<unsigned>(parsed);
++  }();
++  return limit;
++}
++
++inline bool puxch_order_trace_late_arm_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_PUXCH_ORDER_TRACE_LATE_ARM");
++    return (value != nullptr) && (value[0] != '\0') && (std::strcmp(value, "0") != 0);
++  }();
++  return enabled;
++}
++
++inline std::atomic<bool>& puxch_order_trace_armed_state()
++{
++  static std::atomic<bool> armed{false};
++  return armed;
++}
++
++inline unsigned long long puxch_order_trace_steady_ns()
++{
++  return static_cast<unsigned long long>(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++          .count());
++}
++
++inline bool puxch_order_trace_take()
++{
++  if (!puxch_order_trace_enabled()) {
++    return false;
++  }
++
++  if (puxch_order_trace_late_arm_enabled() &&
++      !puxch_order_trace_armed_state().load(std::memory_order_acquire)) {
++    return false;
++  }
++
++  const unsigned limit = puxch_order_trace_limit();
++  if (limit == 0) {
++    return false;
++  }
++
++  static std::atomic<unsigned> count{0};
++  unsigned                    index = count.fetch_add(1, std::memory_order_relaxed);
++  if (index < limit) {
++    return true;
++  }
++
++  if (index == limit) {
++    std::fprintf(stderr,
++                 "PAVONIS_PUXCH_ORDER_TRACE event=trace_limit_reached steady_ns=%llu limit=%u\n",
++                 puxch_order_trace_steady_ns(),
++                 limit);
++  }
++  return false;
++}
++
++inline void puxch_order_trace_arm(const char* event)
++{
++  if (!puxch_order_trace_enabled() || !puxch_order_trace_late_arm_enabled()) {
++    return;
++  }
++
++  bool expected = false;
++  if (puxch_order_trace_armed_state().compare_exchange_strong(
++          expected, true, std::memory_order_release, std::memory_order_relaxed)) {
++    std::fprintf(stderr,
++                 "PAVONIS_PUXCH_ORDER_TRACE event=trace_armed steady_ns=%llu trigger=%s\n",
++                 puxch_order_trace_steady_ns(),
++                 event);
++  }
++}
++
++inline void puxch_order_trace_event(const char* event, const char* format, ...)
++{
++  if (!puxch_order_trace_take()) {
++    return;
++  }
++
++  char    details[512];
++  va_list args;
++  va_start(args, format);
++  std::vsnprintf(details, sizeof(details), format, args);
++  va_end(args);
++
++  std::fprintf(stderr,
++               "PAVONIS_PUXCH_ORDER_TRACE event=%s steady_ns=%llu %s\n",
++               event,
++               puxch_order_trace_steady_ns(),
++               details);
++}
++
++inline bool ul_symbol_msg3_target_capture_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_UL_SYMBOL_MSG3_TARGET_CAPTURE");
++    return (value != nullptr) && (value[0] != '\0') && (std::strcmp(value, "0") != 0);
++  }();
++  return enabled;
++}
++
++inline bool ul_symbol_msg3_target_late_arm_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_UL_SYMBOL_MSG3_TARGET_LATE_ARM");
++    return (value != nullptr) && (value[0] != '\0') && (std::strcmp(value, "0") != 0);
++  }();
++  return enabled;
++}
++
++inline std::atomic<bool>& ul_symbol_msg3_target_armed_state()
++{
++  static std::atomic<bool> armed{false};
++  return armed;
++}
++
++inline bool ul_symbol_msg3_target_arm_on_dl_after_ul_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_UL_SYMBOL_MSG3_TARGET_ARM_ON_DL_AFTER_UL");
++    return (value != nullptr) && (value[0] != '\0') && (std::strcmp(value, "0") != 0);
++  }();
++  return enabled;
++}
++
++inline std::atomic<bool>& ul_symbol_msg3_target_ul_primed_state()
++{
++  static std::atomic<bool> primed{false};
++  return primed;
++}
++
++inline void ul_symbol_msg3_target_arm(const char* event)
++{
++  if (!ul_symbol_msg3_target_capture_enabled() || !ul_symbol_msg3_target_late_arm_enabled()) {
++    return;
++  }
++
++  bool expected = false;
++  if (ul_symbol_msg3_target_armed_state().compare_exchange_strong(
++          expected, true, std::memory_order_release, std::memory_order_relaxed)) {
++    std::fprintf(stderr, "PAVONIS_UL_SYMBOL_MSG3_TARGET event=target_armed trigger=%s\n", event);
++  }
++}
++
++inline void ul_symbol_msg3_target_note_ul_information_transfer()
++{
++  if (!ul_symbol_msg3_target_capture_enabled() || !ul_symbol_msg3_target_late_arm_enabled()) {
++    return;
++  }
++
++  if (!ul_symbol_msg3_target_arm_on_dl_after_ul_enabled()) {
++    ul_symbol_msg3_target_arm("ul_information_transfer");
++    return;
++  }
++
++  bool expected = false;
++  if (ul_symbol_msg3_target_ul_primed_state().compare_exchange_strong(
++          expected, true, std::memory_order_release, std::memory_order_relaxed)) {
++    std::fprintf(stderr, "PAVONIS_UL_SYMBOL_MSG3_TARGET event=target_primed trigger=ul_information_transfer\n");
++  }
++}
++
++inline void ul_symbol_msg3_target_note_dl_nas_transport()
++{
++  if (!ul_symbol_msg3_target_capture_enabled() || !ul_symbol_msg3_target_late_arm_enabled() ||
++      !ul_symbol_msg3_target_arm_on_dl_after_ul_enabled() ||
++      !ul_symbol_msg3_target_ul_primed_state().load(std::memory_order_acquire)) {
++    return;
++  }
++
++  ul_symbol_msg3_target_arm("dl_nas_transport_after_ul_information_transfer");
++}
++
++inline unsigned ul_symbol_msg3_target_capture_max_targets()
++{
++  static const unsigned limit = []() {
++    const char* value = std::getenv("PAVONIS_UL_SYMBOL_MSG3_TARGET_MAX");
++    if ((value == nullptr) || (value[0] == '\0')) {
++      return 8U;
++    }
++
++    char* end = nullptr;
++    errno     = 0;
++    unsigned long parsed = std::strtoul(value, &end, 10);
++    if ((errno != 0) || (end == value) || ((end != nullptr) && (*end != '\0')) || (parsed == 0)) {
++      std::fprintf(stderr, "PAVONIS_UL_SYMBOL_MSG3_TARGET_MAX invalid value=%s; using 8\n", value);
++      return 8U;
++    }
++    return static_cast<unsigned>(parsed > 8U ? 8U : parsed);
++  }();
++  return limit;
++}
++
++struct ul_symbol_msg3_target_entry {
++  std::atomic<unsigned> system_slot_plus_one{0};
++  std::atomic<unsigned> symbol_start{0};
++  std::atomic<unsigned> symbol_stop{0};
++  std::atomic<unsigned> temp_crnti{0};
++  std::atomic<unsigned> remaining_slots{0};
++};
++
++struct ul_symbol_msg3_target_state {
++  std::array<ul_symbol_msg3_target_entry, 8> entries{};
++  std::atomic<unsigned>                      published{0};
++};
++
++inline ul_symbol_msg3_target_state& ul_symbol_msg3_targets()
++{
++  static ul_symbol_msg3_target_state state{};
++  return state;
++}
++
++inline void ul_symbol_msg3_target_publish(unsigned system_slot,
++                                          unsigned sfn,
++                                          unsigned slot,
++                                          unsigned symbol_start,
++                                          unsigned symbol_stop,
++                                          unsigned temp_crnti)
++{
++  if (!ul_symbol_msg3_target_capture_enabled()) {
++    return;
++  }
++
++  if (ul_symbol_msg3_target_late_arm_enabled() &&
++      !ul_symbol_msg3_target_armed_state().load(std::memory_order_acquire)) {
++    return;
++  }
++
++  ul_symbol_msg3_target_state& state = ul_symbol_msg3_targets();
++  const unsigned index = state.published.fetch_add(1, std::memory_order_relaxed);
++  if (index >= ul_symbol_msg3_target_capture_max_targets()) {
++    if (index == ul_symbol_msg3_target_capture_max_targets()) {
++      std::fprintf(stderr,
++                   "PAVONIS_UL_SYMBOL_MSG3_TARGET event=target_limit_reached limit=%u\n",
++                   ul_symbol_msg3_target_capture_max_targets());
++    }
++    return;
++  }
++
++  ul_symbol_msg3_target_entry& entry = state.entries[index];
++  entry.symbol_start.store(symbol_start, std::memory_order_relaxed);
++  entry.symbol_stop.store(symbol_stop, std::memory_order_relaxed);
++  entry.temp_crnti.store(temp_crnti, std::memory_order_relaxed);
++  entry.remaining_slots.store(256U, std::memory_order_relaxed);
++  entry.system_slot_plus_one.store(system_slot + 1U, std::memory_order_release);
++  std::fprintf(stderr,
++               "PAVONIS_UL_SYMBOL_MSG3_TARGET event=target_publish idx=%u system_slot=%u sfn=%u slot=%u "
++               "symbol_start=%u symbol_stop=%u temp_crnti=0x%x\n",
++               index,
++               system_slot,
++               sfn,
++               slot,
++               symbol_start,
++               symbol_stop,
++               temp_crnti);
++}
++
++inline int ul_symbol_msg3_target_match(unsigned system_slot, unsigned symbol)
++{
++  if (!ul_symbol_msg3_target_capture_enabled()) {
++    return -1;
++  }
++
++  ul_symbol_msg3_target_state& state = ul_symbol_msg3_targets();
++  const unsigned count = std::min(state.published.load(std::memory_order_acquire),
++                                  ul_symbol_msg3_target_capture_max_targets());
++  for (unsigned index = 0; index != count; ++index) {
++    ul_symbol_msg3_target_entry& entry = state.entries[index];
++    const unsigned encoded_system_slot = entry.system_slot_plus_one.load(std::memory_order_acquire);
++    if (encoded_system_slot != (system_slot + 1U)) {
++      if ((encoded_system_slot != 0) && (symbol == 0)) {
++        unsigned remaining = entry.remaining_slots.load(std::memory_order_relaxed);
++        bool     decremented = false;
++        while (remaining != 0) {
++          if (entry.remaining_slots.compare_exchange_weak(
++                  remaining, remaining - 1U, std::memory_order_relaxed, std::memory_order_relaxed)) {
++            decremented = true;
++            break;
++          }
++        }
++        if (decremented && (remaining == 1U)) {
++          unsigned expected = encoded_system_slot;
++          if (entry.system_slot_plus_one.compare_exchange_strong(
++                  expected, 0U, std::memory_order_release, std::memory_order_relaxed)) {
++            std::fprintf(stderr,
++                         "PAVONIS_UL_SYMBOL_MSG3_TARGET event=target_expired idx=%u target_system_slot=%u "
++                         "current_system_slot=%u\n",
++                         index,
++                         encoded_system_slot - 1U,
++                         system_slot);
++          }
++        }
++      }
++      continue;
++    }
++    if ((symbol >= entry.symbol_start.load(std::memory_order_relaxed)) &&
++        (symbol < entry.symbol_stop.load(std::memory_order_relaxed))) {
++      return static_cast<int>(index);
++    }
++  }
++  return -1;
++}
++
++inline bool ul_symbol_msg3_target_complete_if_last(int      target_index,
++                                                    unsigned system_slot,
++                                                    unsigned symbol,
++                                                    bool     last_channel)
++{
++  if ((target_index < 0) || !last_channel) {
++    return false;
++  }
++
++  ul_symbol_msg3_target_entry& entry = ul_symbol_msg3_targets().entries[static_cast<unsigned>(target_index)];
++  if ((symbol + 1U) < entry.symbol_stop.load(std::memory_order_relaxed)) {
++    return false;
++  }
++
++  unsigned expected = system_slot + 1U;
++  if (entry.system_slot_plus_one.compare_exchange_strong(
++          expected, 0U, std::memory_order_release, std::memory_order_relaxed)) {
++    std::fprintf(stderr,
++                 "PAVONIS_UL_SYMBOL_MSG3_TARGET event=target_complete idx=%d system_slot=%u "
++                 "symbol=%u temp_crnti=0x%x\n",
++                 target_index,
++                 system_slot,
++                 symbol,
++                 entry.temp_crnti.load(std::memory_order_relaxed));
++    return true;
++  }
++  return false;
++}
++
++} // namespace pavonis
++} // namespace ocudu
+diff --git a/lib/du/du_high/du_manager/converters/asn1_sys_info_packer.cpp b/lib/du/du_high/du_manager/converters/asn1_sys_info_packer.cpp
+index 089b598782..42ab55dfb3 100644
+--- a/lib/du/du_high/du_manager/converters/asn1_sys_info_packer.cpp
++++ b/lib/du/du_high/du_manager/converters/asn1_sys_info_packer.cpp
+@@ -13,10 +13,30 @@
+ #include "ocudu/du/du_high/du_manager/cbs/cbs_encoder.h"
+ #include "ocudu/ran/band_helper.h"
+ #include "ocudu/ran/sib/system_info_config.h"
++#include <cstdio>
++#include <cstdlib>
+ 
+ using namespace ocudu;
+ using namespace odu;
+ 
++static bool pavonis_mib_intra_freq_reselection_allowed()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_GNB_MIB_INTRAFREQ_RESELECTION_ALLOWED");
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++  }();
++  return enabled;
++}
++
++static bool pavonis_srsenb_sib1_compat()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_GNB_SRSENB_SIB1_COMPAT");
++    return value != nullptr && value[0] == '1' && value[1] == '\0';
++  }();
++  return enabled;
++}
++
+ byte_buffer asn1_packer::pack_mib(const du_cell_config& du_cfg)
+ {
+   using namespace asn1::rrc_nr;
+@@ -49,7 +69,13 @@ byte_buffer asn1_packer::pack_mib(const du_cell_config& du_cfg)
+   mib.pdcch_cfg_sib1.coreset_zero      = cs0_idx->value();
+   mib.pdcch_cfg_sib1.search_space_zero = ss0_idx->value();
+   mib.cell_barred.value                = mib_s::cell_barred_opts::not_barred;
+-  mib.intra_freq_resel.value           = mib_s::intra_freq_resel_opts::not_allowed;
++  const bool pavonis_intra_freq_reselection_allowed = pavonis_mib_intra_freq_reselection_allowed();
++  if (pavonis_intra_freq_reselection_allowed) {
++    std::fprintf(stderr, "PAVONIS_GNB_MIB_INTRAFREQ_RESELECTION_ALLOWED active\n");
++  }
++  mib.intra_freq_resel.value = pavonis_intra_freq_reselection_allowed
++                                     ? mib_s::intra_freq_resel_opts::allowed
++                                     : mib_s::intra_freq_resel_opts::not_allowed;
+ 
+   byte_buffer         buf;
+   asn1::bit_ref       bref{buf};
+@@ -74,9 +100,20 @@ static asn1::rrc_nr::dl_cfg_common_sib_s make_asn1_rrc_dl_cfg_common_sib(const d
+   out.freq_info_dl.offset_to_point_a = cfg.freq_info_dl.offset_to_point_a;
+   out.freq_info_dl.scs_specific_carrier_list =
+       odu::make_asn1_rrc_scs_specific_carrier_list(cfg.freq_info_dl.scs_carrier_list);
++  if (pavonis_srsenb_sib1_compat()) {
++    for (auto& carrier : out.freq_info_dl.scs_specific_carrier_list) {
++      carrier.tx_direct_current_location_present = false;
++      carrier.ext                                = false;
++    }
++  }
+ 
+   // > initialDownlinkBWP BWP-DownlinkCommon.
+   out.init_dl_bwp = odu::make_asn1_init_dl_bwp(cfg);
++  if (pavonis_srsenb_sib1_compat()) {
++    auto& pdcch                                  = out.init_dl_bwp.pdcch_cfg_common.setup();
++    pdcch.search_space_other_sys_info_present    = true;
++    pdcch.search_space_other_sys_info            = 1;
++  }
+ 
+   // BCCH-Config.
+   out.bcch_cfg.mod_period_coeff.value = bcch_cfg_s::mod_period_coeff_opts::n4;
+@@ -273,7 +310,9 @@ static asn1::rrc_nr::serving_cell_cfg_common_sib_s make_asn1_rrc_cell_serving_ce
+   asn1::number_to_enum(cell.ssb_periodicity_serving_cell, ssb_periodicity_to_value(du_cfg.ran.ssb_cfg.ssb_period));
+   cell.ss_pbch_block_pwr = du_cfg.ran.ssb_cfg.ssb_block_power;
+ 
+-  const n_ta_offset ta_offset = band_helper::get_ta_offset(du_cfg.ran.dl_carrier.band);
++  const n_ta_offset ta_offset = pavonis_srsenb_sib1_compat()
++                                    ? n_ta_offset::n0
++                                    : band_helper::get_ta_offset(du_cfg.ran.dl_carrier.band);
+   switch (ta_offset) {
+     case n_ta_offset::n0:
+       cell.n_timing_advance_offset_present = true;
+@@ -497,6 +536,9 @@ static asn1::rrc_nr::sib1_s make_asn1_rrc_cell_sib1(const du_cell_config& du_cfg
+ 
+ byte_buffer asn1_packer::pack_sib1(const du_cell_config& du_cfg, std::string* js_str)
+ {
++  if (pavonis_srsenb_sib1_compat()) {
++    std::fprintf(stderr, "PAVONIS_GNB_SRSENB_SIB1_COMPAT active\n");
++  }
+   byte_buffer          buf;
+   asn1::bit_ref        bref{buf};
+   asn1::rrc_nr::sib1_s sib1 = make_asn1_rrc_cell_sib1(du_cfg);
+diff --git a/lib/fapi_adaptor/mac/p7/mac_to_fapi_fastpath_translator.cpp b/lib/fapi_adaptor/mac/p7/mac_to_fapi_fastpath_translator.cpp
+index 8341acbf28..743e5c4e89 100644
+--- a/lib/fapi_adaptor/mac/p7/mac_to_fapi_fastpath_translator.cpp
++++ b/lib/fapi_adaptor/mac/p7/mac_to_fapi_fastpath_translator.cpp
+@@ -16,13 +16,740 @@
+ #include "ocudu/fapi/p7/builders/tx_data_request_builder.h"
+ #include "ocudu/fapi/p7/builders/ul_dci_request_builder.h"
+ #include "ocudu/fapi/p7/builders/ul_tti_request_builder.h"
++#include "ocudu/ran/pdcch/pdcch_context_formatter.h"
+ #include "ocudu/fapi/p7/p7_last_request_notifier.h"
+ #include "ocudu/fapi/p7/p7_requests_gateway.h"
+ #include "ocudu/scheduler/result/sched_result.h"
++#include "fmt/format.h"
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
+ 
+ using namespace ocudu;
+ using namespace fapi_adaptor;
+ 
++namespace {
++
++constexpr const char* pavonis_si_trace_enable_env = "PAVONIS_GNB_SI_OCCASION_TRACE";
++constexpr const char* pavonis_si_trace_path_env   = "PAVONIS_GNB_SI_OCCASION_TRACE_PATH";
++constexpr const char* pavonis_si_trace_limit_env  = "PAVONIS_GNB_SI_OCCASION_TRACE_LIMIT";
++constexpr const char* pavonis_si_trace_default_path = "/tmp/pavonis_gnb_si_occasion_trace.tsv";
++constexpr unsigned    pavonis_si_trace_default_limit = 4096;
++constexpr unsigned    pavonis_si_trace_max_limit     = 100000;
++constexpr const char* pavonis_rar_fapi_trace_enable_env = "PAVONIS_GNB_RAR_FAPI_TRACE";
++constexpr const char* pavonis_rar_fapi_trace_path_env   = "PAVONIS_GNB_RAR_FAPI_TRACE_PATH";
++constexpr const char* pavonis_rar_fapi_trace_limit_env  = "PAVONIS_GNB_RAR_FAPI_TRACE_LIMIT";
++constexpr const char* pavonis_rar_fapi_trace_default_path = "/tmp/pavonis_gnb_rar_fapi_trace.tsv";
++constexpr unsigned    pavonis_rar_fapi_trace_default_limit = 1024;
++constexpr unsigned    pavonis_rar_fapi_trace_max_limit     = 100000;
++
++static bool pavonis_env_enabled(const char* value)
++{
++  if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
++      std::strcmp(value, "off") == 0) {
++    return false;
++  }
++  return true;
++}
++
++static unsigned pavonis_read_uint_env(const char* name, unsigned default_value, unsigned max_value)
++{
++  const char* value = std::getenv(name);
++  if (value == nullptr || value[0] == '\0') {
++    return default_value;
++  }
++
++  char* end = nullptr;
++  errno     = 0;
++  unsigned long parsed = std::strtoul(value, &end, 10);
++  if (errno != 0 || end == value || *end != '\0') {
++    std::fprintf(stderr, "%s invalid value=%s; using %u\n", name, value, default_value);
++    return default_value;
++  }
++
++  return static_cast<unsigned>(std::min<unsigned long>(parsed, max_value));
++}
++
++static int pavonis_read_power_offset_ss_env_db()
++{
++  const char* value = std::getenv("PAVONIS_GNB_POWER_CONTROL_OFFSET_SS_DB");
++  if (value == nullptr || value[0] == '\0') {
++    return -999;
++  }
++
++  char* end = nullptr;
++  errno     = 0;
++  long parsed = std::strtol(value, &end, 10);
++  if (errno != 0 || end == value || *end != '\0') {
++    return -998;
++  }
++  return static_cast<int>(parsed);
++}
++
++struct pavonis_si_trace_state {
++  bool        enabled;
++  const char* path;
++  unsigned    limit;
++  bool        power_sign_compat;
++  int         power_offset_ss_env_db;
++  FILE*       file = nullptr;
++  unsigned    rows = 0;
++  bool        last_si_slot_valid = false;
++  uint32_t    last_si_slot       = 0;
++};
++
++struct pavonis_rar_fapi_trace_state {
++  bool        enabled;
++  const char* path;
++  unsigned    limit;
++  bool        power_sign_compat;
++  int         power_offset_ss_env_db;
++  FILE*       file = nullptr;
++  unsigned    rows = 0;
++};
++
++static pavonis_si_trace_state& pavonis_si_trace()
++{
++  static pavonis_si_trace_state state = []() {
++    pavonis_si_trace_state init{};
++    init.enabled = pavonis_env_enabled(std::getenv(pavonis_si_trace_enable_env));
++    init.path    = std::getenv(pavonis_si_trace_path_env);
++    if (init.path == nullptr || init.path[0] == '\0') {
++      init.path = pavonis_si_trace_default_path;
++    }
++    init.limit                  = pavonis_read_uint_env(pavonis_si_trace_limit_env, pavonis_si_trace_default_limit, pavonis_si_trace_max_limit);
++    init.power_sign_compat      = pavonis_env_enabled(std::getenv("PAVONIS_GNB_SI_PDSCH_POWER_SIGN_COMPAT"));
++    init.power_offset_ss_env_db = pavonis_read_power_offset_ss_env_db();
++    if (init.enabled) {
++      std::fprintf(stderr,
++                   "%s active path=%s limit=%u power_sign_compat=%u power_offset_ss_env_db=%d\n",
++                   pavonis_si_trace_enable_env,
++                   init.path,
++                   init.limit,
++                   init.power_sign_compat ? 1U : 0U,
++                   init.power_offset_ss_env_db);
++    }
++    return init;
++  }();
++  return state;
++}
++
++static pavonis_rar_fapi_trace_state& pavonis_rar_fapi_trace()
++{
++  static pavonis_rar_fapi_trace_state state = []() {
++    pavonis_rar_fapi_trace_state init{};
++    init.enabled = pavonis_env_enabled(std::getenv(pavonis_rar_fapi_trace_enable_env));
++    init.path    = std::getenv(pavonis_rar_fapi_trace_path_env);
++    if (init.path == nullptr || init.path[0] == '\0') {
++      init.path = pavonis_rar_fapi_trace_default_path;
++    }
++    init.limit                  = pavonis_read_uint_env(pavonis_rar_fapi_trace_limit_env,
++                                      pavonis_rar_fapi_trace_default_limit,
++                                      pavonis_rar_fapi_trace_max_limit);
++    init.power_sign_compat      = pavonis_env_enabled(std::getenv("PAVONIS_GNB_SI_PDSCH_POWER_SIGN_COMPAT"));
++    init.power_offset_ss_env_db = pavonis_read_power_offset_ss_env_db();
++    if (init.enabled) {
++      std::fprintf(stderr,
++                   "%s active path=%s limit=%u power_sign_compat=%u power_offset_ss_env_db=%d\n",
++                   pavonis_rar_fapi_trace_enable_env,
++                   init.path,
++                   init.limit,
++                   init.power_sign_compat ? 1U : 0U,
++                   init.power_offset_ss_env_db);
++    }
++    return init;
++  }();
++  return state;
++}
++
++static long long pavonis_steady_wall_ns()
++{
++  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
++      .count();
++}
++
++static bool pavonis_open_si_trace_if_needed(pavonis_si_trace_state& state)
++{
++  if (!state.enabled || state.rows >= state.limit) {
++    return false;
++  }
++  if (state.file != nullptr) {
++    return true;
++  }
++
++  state.file = std::fopen(state.path, "w");
++  if (state.file == nullptr) {
++    std::fprintf(stderr, "%s failed to open path=%s\n", pavonis_si_trace_enable_env, state.path);
++    state.enabled = false;
++    return false;
++  }
++
++  std::fprintf(state.file,
++               "wall_ns\trow\tevent\tsector_id\tslot_abs\tsfn\tslot_index\tslot_mod160\tis_si_lattice\t"
++               "delta_si_slots\ttotal_pdus\tsi_pdcch_count\tsi_pdsch_count\tpdu_index\trnti\tpdcch_context\t"
++               "pdcch_bwp_start\tpdcch_bwp_len\tpdcch_sym_start\tpdcch_sym_len\tpdcch_cce\tpdcch_al\t"
++               "pdcch_al_cces\tpdcch_payload_bits\tpdcch_payload_hex\tpdcch_power_profile\t"
++               "pdcch_power_offset_ss_db\tpdcch_dmrs_power_db\tpdcch_data_power_db\tpdsch_bwp_start\t"
++               "pdsch_bwp_len\tpdsch_vrb_start\tpdsch_vrb_len\tpdsch_sym_start\tpdsch_sym_len\tpdsch_mcs\t"
++               "pdsch_rv\tpdsch_tbs_bytes\tpdsch_mapping\tpdsch_power_profile\tpdsch_power_offset_db\t"
++               "pdsch_power_offset_ss_db\tpower_sign_compat\tpower_offset_ss_env_db\n");
++  std::fflush(state.file);
++  return true;
++}
++
++static bool pavonis_open_rar_fapi_trace_if_needed(pavonis_rar_fapi_trace_state& state)
++{
++  if (!state.enabled || state.rows >= state.limit) {
++    return false;
++  }
++  if (state.file != nullptr) {
++    return true;
++  }
++
++  state.file = std::fopen(state.path, "w");
++  if (state.file == nullptr) {
++    std::fprintf(stderr, "%s failed to open path=%s\n", pavonis_rar_fapi_trace_enable_env, state.path);
++    state.enabled = false;
++    return false;
++  }
++
++  std::fprintf(state.file,
++               "wall_ns\trow\tevent\tsector_id\tslot_abs\tsfn\tslot_index\tslot_mod160\t"
++               "total_pdus\trar_pdcch_count\trar_pdsch_count\tpdu_index\trnti\tpdcch_context\t"
++               "pdcch_bwp_start\tpdcch_bwp_len\tpdcch_sym_start\tpdcch_sym_len\tpdcch_cce\tpdcch_al\t"
++               "pdcch_al_cces\tpdcch_payload_bits\tpdcch_payload_hex\tpdcch_power_profile\t"
++               "pdcch_power_offset_ss_db\tpdcch_dmrs_power_db\tpdcch_data_power_db\tpdsch_bwp_start\t"
++               "pdsch_bwp_len\tpdsch_vrb_start\tpdsch_vrb_len\tpdsch_sym_start\tpdsch_sym_len\tpdsch_mcs\t"
++               "pdsch_rv\tpdsch_tbs_bytes\tpdsch_mapping\tpdsch_power_profile\tpdsch_power_offset_db\t"
++               "pdsch_power_offset_ss_db\ttx_pdu_index\ttx_cw_index\ttx_payload_bytes\ttx_payload_hex_prefix\t"
++               "power_sign_compat\tpower_offset_ss_env_db\n");
++  std::fflush(state.file);
++  return true;
++}
++
++static const char* pavonis_pdsch_mapping_name(const fapi::dl_pdsch_pdu& pdu)
++{
++  if (std::holds_alternative<fapi::dl_pdsch_pdu::non_interleaved_common_ss>(pdu.mapping)) {
++    return "non_interleaved_common_ss";
++  }
++  if (std::holds_alternative<fapi::dl_pdsch_pdu::non_interleaved_other>(pdu.mapping)) {
++    return "non_interleaved_other";
++  }
++  if (std::holds_alternative<fapi::dl_pdsch_pdu::interleaved_common_type0_coreset0>(pdu.mapping)) {
++    return "interleaved_common_type0_coreset0";
++  }
++  if (std::holds_alternative<fapi::dl_pdsch_pdu::interleaved_common_any_coreset0_present>(pdu.mapping)) {
++    return "interleaved_common_any_coreset0_present";
++  }
++  if (std::holds_alternative<fapi::dl_pdsch_pdu::interleaved_other>(pdu.mapping)) {
++    return "interleaved_other";
++  }
++  return "unknown";
++}
++
++static std::string pavonis_transport_block_hex_prefix(const shared_transport_block& pdu, size_t max_bytes)
++{
++  static constexpr char hex[] = "0123456789abcdef";
++  const span<const uint8_t> buffer = pdu.get_buffer();
++  const size_t              len    = std::min(buffer.size(), max_bytes);
++  std::string               out;
++  out.reserve(len * 2 + (buffer.size() > len ? 3 : 0));
++  for (size_t i = 0; i != len; ++i) {
++    out.push_back(hex[(buffer[i] >> 4U) & 0x0fU]);
++    out.push_back(hex[buffer[i] & 0x0fU]);
++  }
++  if (buffer.size() > len) {
++    out.append("...");
++  }
++  return out;
++}
++
++static void pavonis_write_si_trace_summary(pavonis_si_trace_state& state,
++                                           const fapi::dl_tti_request& msg,
++                                           unsigned sector_id,
++                                           unsigned si_pdcch_count,
++                                           unsigned si_pdsch_count,
++                                           int      delta_si_slots)
++{
++  if (!pavonis_open_si_trace_if_needed(state)) {
++    return;
++  }
++
++  std::fprintf(state.file,
++               "%lld\t%u\tslot_summary\t%u\t%u\t%u\t%u\t%u\t%u\t%d\t%zu\t%u\t%u\t-1\t-1\t-\t"
++               "-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-\t-\t-999\t-999.000\t-999.000\t"
++               "-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-\t-\t-999\t-999\t%u\t%d\n",
++               pavonis_steady_wall_ns(),
++               state.rows++,
++               sector_id,
++               msg.slot.to_uint(),
++               msg.slot.sfn(),
++               msg.slot.slot_index(),
++               msg.slot.to_uint() % 160U,
++               (msg.slot.to_uint() % 160U) == 1U ? 1U : 0U,
++               delta_si_slots,
++               msg.pdus.size(),
++               si_pdcch_count,
++               si_pdsch_count,
++               state.power_sign_compat ? 1U : 0U,
++               state.power_offset_ss_env_db);
++  std::fflush(state.file);
++}
++
++static void pavonis_write_si_trace_pdcch(pavonis_si_trace_state& state,
++                                         const fapi::dl_tti_request& msg,
++                                         unsigned sector_id,
++                                         unsigned pdu_index,
++                                         const fapi::dl_pdcch_pdu& pdu,
++                                         unsigned si_pdcch_count,
++                                         unsigned si_pdsch_count,
++                                         int      delta_si_slots)
++{
++  if (!pavonis_open_si_trace_if_needed(state)) {
++    return;
++  }
++
++  const fapi::dl_dci_pdu& dci = pdu.dl_dci;
++  const char*             power_profile = "none";
++  int                     power_offset_ss_db = -999;
++  double                  dmrs_power_db = -999.0;
++  double                  data_power_db = -999.0;
++  if (const auto* profile_nr = std::get_if<fapi::dl_dci_pdu::power_profile_nr>(&dci.power_config)) {
++    power_profile      = "nr";
++    power_offset_ss_db = static_cast<int>(profile_nr->power_control_offset_ss);
++  } else if (const auto* profile_sss = std::get_if<fapi::dl_dci_pdu::power_profile_sss>(&dci.power_config)) {
++    power_profile = "sss";
++    dmrs_power_db = static_cast<double>(profile_sss->dmrs_power_offset_db) * 0.001;
++    data_power_db = static_cast<double>(profile_sss->data_power_offset_db) * 0.001;
++  }
++
++  const std::string context     = dci.context.has_value() ? fmt::format("{}", dci.context.value()) : "-";
++  const std::string payload_hex = fmt::format("{:x}", dci.payload);
++
++  std::fprintf(state.file,
++               "%lld\t%u\tsi_pdcch\t%u\t%u\t%u\t%u\t%u\t%u\t%d\t%zu\t%u\t%u\t%u\t%u\t%s\t"
++               "%u\t%u\t%u\t%u\t%u\t%u\t%u\t%zu\t%s\t%s\t%d\t%.3f\t%.3f\t"
++               "-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-\t-\t-999\t-999\t%u\t%d\n",
++               pavonis_steady_wall_ns(),
++               state.rows++,
++               sector_id,
++               msg.slot.to_uint(),
++               msg.slot.sfn(),
++               msg.slot.slot_index(),
++               msg.slot.to_uint() % 160U,
++               (msg.slot.to_uint() % 160U) == 1U ? 1U : 0U,
++               delta_si_slots,
++               msg.pdus.size(),
++               si_pdcch_count,
++               si_pdsch_count,
++               pdu_index,
++               to_value(dci.rnti),
++               context.c_str(),
++               pdu.coreset_bwp.start(),
++               pdu.coreset_bwp.length(),
++               pdu.symbols.start(),
++               pdu.symbols.length(),
++               dci.cce_index,
++               to_aggregation_level_index(dci.dci_aggregation_level),
++               to_nof_cces(dci.dci_aggregation_level),
++               dci.payload.size(),
++               payload_hex.c_str(),
++               power_profile,
++               power_offset_ss_db,
++               dmrs_power_db,
++               data_power_db,
++               state.power_sign_compat ? 1U : 0U,
++               state.power_offset_ss_env_db);
++  std::fflush(state.file);
++}
++
++static void pavonis_write_si_trace_pdsch(pavonis_si_trace_state& state,
++                                         const fapi::dl_tti_request& msg,
++                                         unsigned sector_id,
++                                         unsigned pdu_index,
++                                         const fapi::dl_pdsch_pdu& pdu,
++                                         unsigned si_pdcch_count,
++                                         unsigned si_pdsch_count,
++                                         int      delta_si_slots)
++{
++  if (!pavonis_open_si_trace_if_needed(state)) {
++    return;
++  }
++
++  const char* power_profile = "none";
++  int         power_offset_db = -999;
++  int         power_offset_ss_db = -999;
++  if (const auto* profile_nr = std::get_if<fapi::dl_pdsch_pdu::power_profile_nr>(&pdu.power_config)) {
++    power_profile      = "nr";
++    power_offset_db    = profile_nr->power_control_offset_profile_nr;
++    power_offset_ss_db = fapi::to_int(profile_nr->power_control_offset_ss_profile_nr);
++  } else if (std::holds_alternative<fapi::dl_pdsch_pdu::power_profile_sss>(pdu.power_config)) {
++    power_profile = "sss";
++  }
++
++  int pdsch_mcs = -1;
++  int pdsch_rv  = -1;
++  int pdsch_tbs = -1;
++  if (!pdu.cws.empty()) {
++    pdsch_mcs = static_cast<int>(pdu.cws.front().mcs_index.value());
++    pdsch_rv  = static_cast<int>(pdu.cws.front().rv_index);
++    pdsch_tbs = static_cast<int>(pdu.cws.front().tb_size.value());
++  }
++
++  std::fprintf(state.file,
++               "%lld\t%u\tsi_pdsch\t%u\t%u\t%u\t%u\t%u\t%u\t%d\t%zu\t%u\t%u\t%u\t%u\t-\t"
++               "-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-\t-\t-999\t-999.000\t-999.000\t"
++               "%u\t%u\t%u\t%u\t%u\t%u\t%d\t%d\t%d\t%s\t%s\t%d\t%d\t%u\t%d\n",
++               pavonis_steady_wall_ns(),
++               state.rows++,
++               sector_id,
++               msg.slot.to_uint(),
++               msg.slot.sfn(),
++               msg.slot.slot_index(),
++               msg.slot.to_uint() % 160U,
++               (msg.slot.to_uint() % 160U) == 1U ? 1U : 0U,
++               delta_si_slots,
++               msg.pdus.size(),
++               si_pdcch_count,
++               si_pdsch_count,
++               pdu_index,
++               to_value(pdu.rnti),
++               pdu.bwp.start(),
++               pdu.bwp.length(),
++               pdu.resource_alloc.vrbs.start(),
++               pdu.resource_alloc.vrbs.length(),
++               pdu.symbols.start(),
++               pdu.symbols.length(),
++               pdsch_mcs,
++               pdsch_rv,
++               pdsch_tbs,
++               pavonis_pdsch_mapping_name(pdu),
++               power_profile,
++               power_offset_db,
++               power_offset_ss_db,
++               state.power_sign_compat ? 1U : 0U,
++               state.power_offset_ss_env_db);
++  std::fflush(state.file);
++}
++
++static void pavonis_write_rar_fapi_trace_summary(pavonis_rar_fapi_trace_state& state,
++                                                 const fapi::dl_tti_request& msg,
++                                                 unsigned sector_id,
++                                                 unsigned rar_pdcch_count,
++                                                 unsigned rar_pdsch_count)
++{
++  if (!pavonis_open_rar_fapi_trace_if_needed(state)) {
++    return;
++  }
++
++  std::fprintf(state.file,
++               "%lld\t%u\tdl_tti_summary\t%u\t%u\t%u\t%u\t%u\t%zu\t%u\t%u\t-1\t-1\t-\t"
++               "-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-\t-\t-999\t-999.000\t-999.000\t"
++               "-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-\t-\t-999\t-999\t-1\t-1\t-1\t-\t%u\t%d\n",
++               pavonis_steady_wall_ns(),
++               state.rows++,
++               sector_id,
++               msg.slot.to_uint(),
++               msg.slot.sfn(),
++               msg.slot.slot_index(),
++               msg.slot.to_uint() % 160U,
++               msg.pdus.size(),
++               rar_pdcch_count,
++               rar_pdsch_count,
++               state.power_sign_compat ? 1U : 0U,
++               state.power_offset_ss_env_db);
++  std::fflush(state.file);
++}
++
++static void pavonis_write_rar_fapi_trace_pdcch(pavonis_rar_fapi_trace_state& state,
++                                               const fapi::dl_tti_request& msg,
++                                               unsigned sector_id,
++                                               unsigned pdu_index,
++                                               const fapi::dl_pdcch_pdu& pdu,
++                                               unsigned rar_pdcch_count,
++                                               unsigned rar_pdsch_count)
++{
++  if (!pavonis_open_rar_fapi_trace_if_needed(state)) {
++    return;
++  }
++
++  const fapi::dl_dci_pdu& dci = pdu.dl_dci;
++  const char*             power_profile = "none";
++  int                     power_offset_ss_db = -999;
++  double                  dmrs_power_db = -999.0;
++  double                  data_power_db = -999.0;
++  if (const auto* profile_nr = std::get_if<fapi::dl_dci_pdu::power_profile_nr>(&dci.power_config)) {
++    power_profile      = "nr";
++    power_offset_ss_db = static_cast<int>(profile_nr->power_control_offset_ss);
++  } else if (const auto* profile_sss = std::get_if<fapi::dl_dci_pdu::power_profile_sss>(&dci.power_config)) {
++    power_profile = "sss";
++    dmrs_power_db = static_cast<double>(profile_sss->dmrs_power_offset_db) * 0.001;
++    data_power_db = static_cast<double>(profile_sss->data_power_offset_db) * 0.001;
++  }
++
++  const std::string context     = dci.context.has_value() ? fmt::format("{}", dci.context.value()) : "-";
++  const std::string payload_hex = fmt::format("{:x}", dci.payload);
++
++  std::fprintf(state.file,
++               "%lld\t%u\trar_pdcch\t%u\t%u\t%u\t%u\t%u\t%zu\t%u\t%u\t%u\t%u\t%s\t"
++               "%u\t%u\t%u\t%u\t%u\t%u\t%u\t%zu\t%s\t%s\t%d\t%.3f\t%.3f\t"
++               "-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-\t-\t-999\t-999\t-1\t-1\t-1\t-\t%u\t%d\n",
++               pavonis_steady_wall_ns(),
++               state.rows++,
++               sector_id,
++               msg.slot.to_uint(),
++               msg.slot.sfn(),
++               msg.slot.slot_index(),
++               msg.slot.to_uint() % 160U,
++               msg.pdus.size(),
++               rar_pdcch_count,
++               rar_pdsch_count,
++               pdu_index,
++               to_value(dci.rnti),
++               context.c_str(),
++               pdu.coreset_bwp.start(),
++               pdu.coreset_bwp.length(),
++               pdu.symbols.start(),
++               pdu.symbols.length(),
++               dci.cce_index,
++               to_aggregation_level_index(dci.dci_aggregation_level),
++               to_nof_cces(dci.dci_aggregation_level),
++               dci.payload.size(),
++               payload_hex.c_str(),
++               power_profile,
++               power_offset_ss_db,
++               dmrs_power_db,
++               data_power_db,
++               state.power_sign_compat ? 1U : 0U,
++               state.power_offset_ss_env_db);
++  std::fflush(state.file);
++}
++
++static void pavonis_write_rar_fapi_trace_pdsch(pavonis_rar_fapi_trace_state& state,
++                                               const fapi::dl_tti_request& msg,
++                                               unsigned sector_id,
++                                               unsigned pdu_index,
++                                               const fapi::dl_pdsch_pdu& pdu,
++                                               unsigned rar_pdcch_count,
++                                               unsigned rar_pdsch_count)
++{
++  if (!pavonis_open_rar_fapi_trace_if_needed(state)) {
++    return;
++  }
++
++  const char* power_profile = "none";
++  int         power_offset_db = -999;
++  int         power_offset_ss_db = -999;
++  if (const auto* profile_nr = std::get_if<fapi::dl_pdsch_pdu::power_profile_nr>(&pdu.power_config)) {
++    power_profile      = "nr";
++    power_offset_db    = profile_nr->power_control_offset_profile_nr;
++    power_offset_ss_db = fapi::to_int(profile_nr->power_control_offset_ss_profile_nr);
++  } else if (std::holds_alternative<fapi::dl_pdsch_pdu::power_profile_sss>(pdu.power_config)) {
++    power_profile = "sss";
++  }
++
++  int pdsch_mcs = -1;
++  int pdsch_rv  = -1;
++  int pdsch_tbs = -1;
++  if (!pdu.cws.empty()) {
++    pdsch_mcs = static_cast<int>(pdu.cws.front().mcs_index.value());
++    pdsch_rv  = static_cast<int>(pdu.cws.front().rv_index);
++    pdsch_tbs = static_cast<int>(pdu.cws.front().tb_size.value());
++  }
++
++  std::fprintf(state.file,
++               "%lld\t%u\trar_pdsch\t%u\t%u\t%u\t%u\t%u\t%zu\t%u\t%u\t%u\t%u\t-\t"
++               "-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-\t-\t-999\t-999.000\t-999.000\t"
++               "%u\t%u\t%u\t%u\t%u\t%u\t%d\t%d\t%d\t%s\t%s\t%d\t%d\t-1\t-1\t-1\t-\t%u\t%d\n",
++               pavonis_steady_wall_ns(),
++               state.rows++,
++               sector_id,
++               msg.slot.to_uint(),
++               msg.slot.sfn(),
++               msg.slot.slot_index(),
++               msg.slot.to_uint() % 160U,
++               msg.pdus.size(),
++               rar_pdcch_count,
++               rar_pdsch_count,
++               pdu_index,
++               to_value(pdu.rnti),
++               pdu.bwp.start(),
++               pdu.bwp.length(),
++               pdu.resource_alloc.vrbs.start(),
++               pdu.resource_alloc.vrbs.length(),
++               pdu.symbols.start(),
++               pdu.symbols.length(),
++               pdsch_mcs,
++               pdsch_rv,
++               pdsch_tbs,
++               pavonis_pdsch_mapping_name(pdu),
++               power_profile,
++               power_offset_db,
++               power_offset_ss_db,
++               state.power_sign_compat ? 1U : 0U,
++               state.power_offset_ss_env_db);
++  std::fflush(state.file);
++}
++
++static void pavonis_trace_rar_fapi_tx_data_if_enabled(slot_point                     slot,
++                                                      unsigned                       sector_id,
++                                                      uint16_t                       pdu_index,
++                                                      unsigned                       cw_index,
++                                                      const shared_transport_block&  payload)
++{
++  pavonis_rar_fapi_trace_state& state = pavonis_rar_fapi_trace();
++  if (!state.enabled || state.rows >= state.limit) {
++    return;
++  }
++  if (!pavonis_open_rar_fapi_trace_if_needed(state)) {
++    return;
++  }
++
++  const span<const uint8_t> buffer = payload.get_buffer();
++  const std::string         hex    = pavonis_transport_block_hex_prefix(payload, 96);
++  std::fprintf(state.file,
++               "%lld\t%u\ttx_data_rar\t%u\t%u\t%u\t%u\t%u\t-1\t-1\t-1\t%u\t-1\t-\t"
++               "-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-\t-\t-999\t-999.000\t-999.000\t"
++               "-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-1\t-\t-\t-999\t-999\t%u\t%u\t%zu\t%s\t%u\t%d\n",
++               pavonis_steady_wall_ns(),
++               state.rows++,
++               sector_id,
++               slot.to_uint(),
++               slot.sfn(),
++               slot.slot_index(),
++               slot.to_uint() % 160U,
++               pdu_index,
++               pdu_index,
++               cw_index,
++               buffer.size(),
++               hex.c_str(),
++               state.power_sign_compat ? 1U : 0U,
++               state.power_offset_ss_env_db);
++  std::fflush(state.file);
++}
++
++static void pavonis_trace_si_occasion_if_enabled(const fapi::dl_tti_request& msg, unsigned sector_id)
++{
++  pavonis_si_trace_state& state = pavonis_si_trace();
++  if (!state.enabled || state.rows >= state.limit) {
++    return;
++  }
++
++  unsigned si_pdcch_count = 0;
++  unsigned si_pdsch_count = 0;
++  for (const auto& pdu : msg.pdus) {
++    if (const auto* pdcch = std::get_if<fapi::dl_pdcch_pdu>(&pdu.pdu)) {
++      si_pdcch_count += (pdcch->dl_dci.rnti == rnti_t::SI_RNTI) ? 1U : 0U;
++      continue;
++    }
++    if (const auto* pdsch = std::get_if<fapi::dl_pdsch_pdu>(&pdu.pdu)) {
++      si_pdsch_count += (pdsch->rnti == rnti_t::SI_RNTI) ? 1U : 0U;
++      continue;
++    }
++  }
++
++  const bool is_si_lattice = (msg.slot.to_uint() % 160U) == 1U;
++  if (!is_si_lattice && si_pdcch_count == 0 && si_pdsch_count == 0) {
++    return;
++  }
++
++  int delta_si_slots = -1;
++  if (state.last_si_slot_valid) {
++    const uint32_t current_slot = msg.slot.to_uint();
++    const uint32_t hyper_slots  = msg.slot.nof_slots_per_hyper_system_frame();
++    delta_si_slots = static_cast<int>((current_slot + hyper_slots - state.last_si_slot) % hyper_slots);
++  }
++  state.last_si_slot       = msg.slot.to_uint();
++  state.last_si_slot_valid = true;
++
++  pavonis_write_si_trace_summary(state, msg, sector_id, si_pdcch_count, si_pdsch_count, delta_si_slots);
++  if (state.rows >= state.limit) {
++    return;
++  }
++
++  for (unsigned pdu_index = 0, nof_pdus = msg.pdus.size(); pdu_index != nof_pdus; ++pdu_index) {
++    const auto& pdu = msg.pdus[pdu_index];
++    if (const auto* pdcch = std::get_if<fapi::dl_pdcch_pdu>(&pdu.pdu)) {
++      if (pdcch->dl_dci.rnti == rnti_t::SI_RNTI) {
++        pavonis_write_si_trace_pdcch(state, msg, sector_id, pdu_index, *pdcch, si_pdcch_count, si_pdsch_count, delta_si_slots);
++      }
++    } else if (const auto* pdsch = std::get_if<fapi::dl_pdsch_pdu>(&pdu.pdu)) {
++      if (pdsch->rnti == rnti_t::SI_RNTI) {
++        pavonis_write_si_trace_pdsch(state, msg, sector_id, pdu_index, *pdsch, si_pdcch_count, si_pdsch_count, delta_si_slots);
++      }
++    }
++
++    if (state.rows >= state.limit) {
++      return;
++    }
++  }
++}
++
++static bool pavonis_is_rar_rnti(rnti_t rnti, span<const rar_information> rars)
++{
++  for (const auto& rar : rars) {
++    if (rar.pdsch_cfg.rnti == rnti) {
++      return true;
++    }
++  }
++  return false;
++}
++
++static void pavonis_trace_rar_fapi_dl_tti_if_enabled(const fapi::dl_tti_request& msg,
++                                                     unsigned sector_id,
++                                                     span<const rar_information> rars)
++{
++  pavonis_rar_fapi_trace_state& state = pavonis_rar_fapi_trace();
++  if (!state.enabled || state.rows >= state.limit || rars.empty()) {
++    return;
++  }
++
++  unsigned rar_pdcch_count = 0;
++  unsigned rar_pdsch_count = 0;
++  for (const auto& pdu : msg.pdus) {
++    if (const auto* pdcch = std::get_if<fapi::dl_pdcch_pdu>(&pdu.pdu)) {
++      rar_pdcch_count += pavonis_is_rar_rnti(pdcch->dl_dci.rnti, rars) ? 1U : 0U;
++      continue;
++    }
++    if (const auto* pdsch = std::get_if<fapi::dl_pdsch_pdu>(&pdu.pdu)) {
++      rar_pdsch_count += pavonis_is_rar_rnti(pdsch->rnti, rars) ? 1U : 0U;
++      continue;
++    }
++  }
++
++  if (rar_pdcch_count == 0 && rar_pdsch_count == 0) {
++    return;
++  }
++
++  pavonis_write_rar_fapi_trace_summary(state, msg, sector_id, rar_pdcch_count, rar_pdsch_count);
++  if (state.rows >= state.limit) {
++    return;
++  }
++
++  for (unsigned pdu_index = 0, nof_pdus = msg.pdus.size(); pdu_index != nof_pdus; ++pdu_index) {
++    const auto& pdu = msg.pdus[pdu_index];
++    if (const auto* pdcch = std::get_if<fapi::dl_pdcch_pdu>(&pdu.pdu)) {
++      if (pavonis_is_rar_rnti(pdcch->dl_dci.rnti, rars)) {
++        pavonis_write_rar_fapi_trace_pdcch(state, msg, sector_id, pdu_index, *pdcch, rar_pdcch_count, rar_pdsch_count);
++      }
++    } else if (const auto* pdsch = std::get_if<fapi::dl_pdsch_pdu>(&pdu.pdu)) {
++      if (pavonis_is_rar_rnti(pdsch->rnti, rars)) {
++        pavonis_write_rar_fapi_trace_pdsch(state, msg, sector_id, pdu_index, *pdsch, rar_pdcch_count, rar_pdsch_count);
++      }
++    }
++
++    if (state.rows >= state.limit) {
++      return;
++    }
++  }
++}
++
++} // namespace
++
+ mac_to_fapi_fastpath_translator::mac_to_fapi_fastpath_translator(
+     const mac_to_fapi_fastpath_translator_config& config,
+     mac_to_fapi_fastpath_translator_dependencies  dependencies) :
+@@ -158,6 +885,8 @@ void mac_to_fapi_fastpath_translator::on_new_downlink_scheduler_results(const ma
+                                cell_nof_prbs);
+ 
+   log_dl_tti_request(msg, sector_id, fapi_logger);
++  pavonis_trace_si_occasion_if_enabled(msg, sector_id);
++  pavonis_trace_rar_fapi_dl_tti_if_enabled(msg, sector_id, span<const rar_information>(dl_res.dl_res->rar_grants));
+ 
+   // Send the message.
+   p7_gateway.send_dl_tti_request(msg);
+@@ -198,6 +927,7 @@ void mac_to_fapi_fastpath_translator::on_new_downlink_data(const mac_dl_data_res
+   // Add RAR PDUs to the Tx_Data.request message.
+   for (const auto& pdu : dl_data.rar_pdus) {
+     builder.add_pdu(fapi_pdu_index, pdu.cw_index, pdu.pdu);
++    pavonis_trace_rar_fapi_tx_data_if_enabled(dl_data.slot, sector_id, fapi_pdu_index, pdu.cw_index, pdu.pdu);
+     if (pdu.cw_index == 0) {
+       ++fapi_pdu_index;
+     }
+diff --git a/lib/fapi_adaptor/phy/p7/pdu_translators/pdsch.cpp b/lib/fapi_adaptor/phy/p7/pdu_translators/pdsch.cpp
+index bbcaf6a3dd..616ea06715 100644
+--- a/lib/fapi_adaptor/phy/p7/pdu_translators/pdsch.cpp
++++ b/lib/fapi_adaptor/phy/p7/pdu_translators/pdsch.cpp
+@@ -7,6 +7,9 @@
+ #include "ocudu/ocudulog/logger.h"
+ #include "ocudu/ran/resource_allocation/vrb_to_prb.h"
+ #include "ocudu/ran/sch/sch_dmrs_power.h"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ 
+ using namespace ocudu;
+ using namespace fapi_adaptor;
+@@ -53,17 +56,42 @@ static float get_power_control_offset_ss_dB(fapi::power_control_offset_ss power_
+   return +6.0F;
+ }
+ 
++static bool is_pavonis_si_pdsch_power_sign_compat_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_GNB_SI_PDSCH_POWER_SIGN_COMPAT");
++    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
++        std::strcmp(value, "off") == 0) {
++      return false;
++    }
++    if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 || std::strcmp(value, "on") == 0) {
++      std::fprintf(stderr, "PAVONIS_GNB_SI_PDSCH_POWER_SIGN_COMPAT active\n");
++      return true;
++    }
++
++    report_error("Invalid PAVONIS_GNB_SI_PDSCH_POWER_SIGN_COMPAT value={}. Expected 0/1, false/true, or off/on.\n",
++                 value);
++    return false;
++  }();
++  return enabled;
++}
++
+ /// Fills the power related parameters in the PDSCH PDU.
+ static void fill_power_values(pdsch_processor::pdu_t& proc_pdu, const fapi::dl_pdsch_pdu& fapi_pdu)
+ {
+   if (const auto* profile_nr = std::get_if<fapi::dl_pdsch_pdu::power_profile_nr>(&fapi_pdu.power_config)) {
+-    proc_pdu.ratio_pdsch_data_to_sss_dB =
++    float profile_nr_power_dB =
+         get_power_control_offset_ss_dB(profile_nr->power_control_offset_ss_profile_nr) +
+         static_cast<float>(profile_nr->power_control_offset_profile_nr);
++    proc_pdu.ratio_pdsch_data_to_sss_dB = profile_nr_power_dB;
+ 
+     // Determine the PDSCH DMRS power from the PDSCH data power as per TS38.214 Table 4.1-1.
+     proc_pdu.ratio_pdsch_dmrs_to_sss_dB =
+         proc_pdu.ratio_pdsch_data_to_sss_dB + get_sch_to_dmrs_ratio_dB(fapi_pdu.num_dmrs_cdm_grps_no_data);
++    if (fapi_pdu.rnti == rnti_t::SI_RNTI && is_pavonis_si_pdsch_power_sign_compat_enabled()) {
++      proc_pdu.ratio_pdsch_data_to_sss_dB = -profile_nr_power_dB;
++      proc_pdu.ratio_pdsch_dmrs_to_sss_dB = -profile_nr_power_dB;
++    }
+   } else if (const auto* profile_sss = std::get_if<fapi::dl_pdsch_pdu::power_profile_sss>(&fapi_pdu.power_config)) {
+     proc_pdu.ratio_pdsch_dmrs_to_sss_dB = profile_sss->dmrs_power_offset_sss_db;
+     proc_pdu.ratio_pdsch_data_to_sss_dB = profile_sss->data_power_offset_sss_db;
+diff --git a/lib/phy/upper/channel_processors/ssb/ssb_processor_impl.cpp b/lib/phy/upper/channel_processors/ssb/ssb_processor_impl.cpp
+index 3c4908b1b2..fccdc2249f 100644
+--- a/lib/phy/upper/channel_processors/ssb/ssb_processor_impl.cpp
++++ b/lib/phy/upper/channel_processors/ssb/ssb_processor_impl.cpp
+@@ -5,11 +5,34 @@
+ #include "ssb_processor_impl.h"
+ #include "ocudu/ran/cyclic_prefix.h"
+ #include "ocudu/support/math/math_utils.h"
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
+ 
+ using namespace ocudu;
+ 
++static float get_pavonis_ssb_amplitude_scale()
++{
++  static const float scale = []() {
++    const char* value = std::getenv("PAVONIS_GNB_SSB_AMPLITUDE_DB");
++    if (value == nullptr || value[0] == '\0' || std::strcmp(value, "0") == 0) {
++      return 1.0F;
++    }
++    if (std::strcmp(value, "6") == 0 || std::strcmp(value, "+6") == 0) {
++      std::fprintf(stderr, "PAVONIS_GNB_SSB_AMPLITUDE_DB active value=6\n");
++      return convert_dB_to_amplitude(6.0F);
++    }
++
++    report_error("Invalid PAVONIS_GNB_SSB_AMPLITUDE_DB value={}. Expected 0 or 6.\n", value);
++    return 1.0F;
++  }();
++  return scale;
++}
++
+ void ssb_processor_impl::process(resource_grid_writer& grid, const pdu_t& pdu)
+ {
++  const float ssb_amplitude = get_pavonis_ssb_amplitude_scale();
++
+   // Calculate derivative parameters.
+   unsigned l_start_in_burst = ssb_get_l_first(pdu.pattern_case, pdu.ssb_idx);
+   unsigned l_start          = (l_start_in_burst % get_nsymb_per_slot(cyclic_prefix::NORMAL));
+@@ -45,7 +68,7 @@ void ssb_processor_impl::process(resource_grid_writer& grid, const pdu_t& pdu)
+   modulator_config.ssb_idx              = pdu.ssb_idx;
+   modulator_config.ssb_first_subcarrier = k_start;
+   modulator_config.ssb_first_symbol     = l_start;
+-  modulator_config.amplitude            = 1.0F;
++  modulator_config.amplitude            = ssb_amplitude;
+   modulator_config.ports                = pdu.ports;
+ 
+   // Modulate PBCH.
+@@ -59,7 +82,7 @@ void ssb_processor_impl::process(resource_grid_writer& grid, const pdu_t& pdu)
+   dmrs_config.ssb_first_subcarrier = k_start;
+   dmrs_config.ssb_first_symbol     = l_start;
+   dmrs_config.hrf                  = pdu.slot.is_odd_hrf();
+-  dmrs_config.amplitude            = 1.0F;
++  dmrs_config.amplitude            = ssb_amplitude;
+   dmrs_config.ports                = pdu.ports;
+ 
+   // Put DMRS for PBCH.
+@@ -70,7 +93,7 @@ void ssb_processor_impl::process(resource_grid_writer& grid, const pdu_t& pdu)
+   pss_config.phys_cell_id         = pdu.phys_cell_id;
+   pss_config.ssb_first_symbol     = l_start;
+   pss_config.ssb_first_subcarrier = k_start;
+-  pss_config.amplitude            = convert_dB_to_amplitude(pdu.beta_pss);
++  pss_config.amplitude            = ssb_amplitude * convert_dB_to_amplitude(pdu.beta_pss);
+   pss_config.ports                = pdu.ports;
+ 
+   // Put PSS.
+@@ -81,7 +104,7 @@ void ssb_processor_impl::process(resource_grid_writer& grid, const pdu_t& pdu)
+   sss_config.phys_cell_id         = pdu.phys_cell_id;
+   sss_config.ssb_first_symbol     = l_start;
+   sss_config.ssb_first_subcarrier = k_start;
+-  sss_config.amplitude            = 1.0F;
++  sss_config.amplitude            = ssb_amplitude;
+   sss_config.ports                = pdu.ports;
+ 
+   // Put SSS.
+diff --git a/lib/scheduler/common_scheduling/sib1_scheduler.cpp b/lib/scheduler/common_scheduling/sib1_scheduler.cpp
+index 92269210bf..c50273ed56 100644
+--- a/lib/scheduler/common_scheduling/sib1_scheduler.cpp
++++ b/lib/scheduler/common_scheduling/sib1_scheduler.cpp
+@@ -13,12 +13,54 @@
+ #include "../support/sch_pdu_builder.h"
+ #include "ocudu/ran/sib/sib_configuration.h"
+ #include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <optional>
+ 
+ using namespace ocudu;
+ 
+ /// SIB1 new transmission period in milliseconds, as per TS 38.331, 5.2.1.
+ static constexpr std::chrono::milliseconds sib1_newtx_period{160};
+ 
++static std::optional<unsigned> get_pavonis_sib1_retx_period_ms()
++{
++  static const std::optional<unsigned> period_ms = []() -> std::optional<unsigned> {
++    const char* value = std::getenv("PAVONIS_GNB_SIB1_RETX_PERIOD_MS");
++    if (value == nullptr || value[0] == '\0') {
++      return std::nullopt;
++    }
++
++    char* end    = nullptr;
++    long  parsed = std::strtol(value, &end, 10);
++    if (end == value || end == nullptr || *end != '\0' || parsed != 20) {
++      report_error("Invalid PAVONIS_GNB_SIB1_RETX_PERIOD_MS value={}. Expected 20.\n", value);
++      return std::nullopt;
++    }
++
++    std::fprintf(stderr, "PAVONIS_GNB_SIB1_RETX_PERIOD_MS active value=%ld\n", parsed);
++    return static_cast<unsigned>(parsed);
++  }();
++  return period_ms;
++}
++
++static bool get_pavonis_sib1_use_n0()
++{
++  static const bool use_n0 = []() {
++    const char* value = std::getenv("PAVONIS_GNB_SIB1_USE_N0");
++    if (value == nullptr || value[0] == '\0' || (value[0] == '0' && value[1] == '\0')) {
++      return false;
++    }
++    if (value[0] != '1' || value[1] != '\0') {
++      report_error("Invalid PAVONIS_GNB_SIB1_USE_N0 value={}. Expected 0 or 1.\n", value);
++      return false;
++    }
++
++    std::fprintf(stderr, "PAVONIS_GNB_SIB1_USE_N0 active value=1\n");
++    return true;
++  }();
++  return use_n0;
++}
++
+ //  ------   Public methods   ------ .
+ 
+ sib1_scheduler::sib1_scheduler(const cell_configuration& cfg_,
+@@ -39,6 +81,10 @@ sib1_scheduler::sib1_scheduler(const cell_configuration& cfg_,
+   // Compute derived SIB1 parameters.
+   sib1_rtx_period = std::chrono::milliseconds{std::max(ssb_periodicity_to_value(cfg_.ssb_cfg.ssb_period),
+                                                        sib1_rtx_periodicity_to_value(expert_cfg.sib1_retx_period))};
++  if (const auto override_period_ms = get_pavonis_sib1_retx_period_ms(); override_period_ms.has_value()) {
++    sib1_rtx_period = std::chrono::milliseconds{override_period_ms.value()};
++  }
++  const bool use_n0 = get_pavonis_sib1_use_n0();
+ 
+   // Only the first L_max SSB beams can be used.
+   for (size_t i_ssb = 0; i_ssb != L_max; ++i_ssb) {
+@@ -47,8 +93,11 @@ sib1_scheduler::sib1_scheduler(const cell_configuration& cfg_,
+     }
+     // NOTE:
+     // - [Implementation defined] Use (n0 + 1) slot to avoid collisions between SSB and SIB1.
+-    sib1_type0_pdcch_css_slots[i_ssb] = precompute_type0_pdcch_css_n0_plus_1(
+-        searchspace0.value(), coreset0->value(), cell_cfg, cell_cfg.scs_common, i_ssb);
++    sib1_type0_pdcch_css_slots[i_ssb] =
++        use_n0 ? precompute_type0_pdcch_css_n0(
++                     searchspace0.value(), coreset0->value(), cell_cfg, cell_cfg.scs_common, i_ssb) :
++                 precompute_type0_pdcch_css_n0_plus_1(
++                     searchspace0.value(), coreset0->value(), cell_cfg, cell_cfg.scs_common, i_ssb);
+   }
+ 
+   // Define a BWP configuration limited by CORESET#0 RBs.
+diff --git a/lib/scheduler/config/csi_helper.cpp b/lib/scheduler/config/csi_helper.cpp
+index fd190e0a0c..b3c45df913 100644
+--- a/lib/scheduler/config/csi_helper.cpp
++++ b/lib/scheduler/config/csi_helper.cpp
+@@ -6,10 +6,62 @@
+ #include "ocudu/ran/csi_rs/csi_meas_config.h"
+ #include "ocudu/ran/slot_point.h"
+ #include "ocudu/scheduler/config/pucch_resource_builder_params.h"
++#include <cerrno>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <optional>
+ 
+ using namespace ocudu;
+ using namespace csi_helper;
+ 
++static std::optional<int8_t> get_pavonis_power_control_offset_ss_db_override()
++{
++  const char* value = std::getenv("PAVONIS_GNB_POWER_CONTROL_OFFSET_SS_DB");
++  if (value == nullptr || value[0] == '\0') {
++    return std::nullopt;
++  }
++
++  if (std::strcmp(value, "-3") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_POWER_CONTROL_OFFSET_SS_DB active value=-3\n");
++    return static_cast<int8_t>(-3);
++  }
++  if (std::strcmp(value, "0") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_POWER_CONTROL_OFFSET_SS_DB active value=0\n");
++    return static_cast<int8_t>(0);
++  }
++  if (std::strcmp(value, "3") == 0 || std::strcmp(value, "+3") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_POWER_CONTROL_OFFSET_SS_DB active value=3\n");
++    return static_cast<int8_t>(3);
++  }
++  if (std::strcmp(value, "6") == 0 || std::strcmp(value, "+6") == 0) {
++    std::fprintf(stderr, "PAVONIS_GNB_POWER_CONTROL_OFFSET_SS_DB active value=6\n");
++    return static_cast<int8_t>(6);
++  }
++
++  report_error("Invalid PAVONIS_GNB_POWER_CONTROL_OFFSET_SS_DB value={}. Expected -3, 0, 3, or 6.\n", value);
++  return std::nullopt;
++}
++
++static std::optional<int8_t> get_pavonis_power_control_offset_db_override()
++{
++  const char* value = std::getenv("PAVONIS_GNB_POWER_CONTROL_OFFSET_DB");
++  if (value == nullptr || value[0] == '\0') {
++    return std::nullopt;
++  }
++
++  char* end = nullptr;
++  errno     = 0;
++  long parsed = std::strtol(value, &end, 10);
++  if (errno != 0 || end == value || *end != '\0' || parsed < -8 || parsed > 15) {
++    report_error("Invalid PAVONIS_GNB_POWER_CONTROL_OFFSET_DB value={}. Expected integer range -8..15.\n", value);
++    return std::nullopt;
++  }
++
++  std::fprintf(stderr, "PAVONIS_GNB_POWER_CONTROL_OFFSET_DB active value=%ld\n", parsed);
++  return static_cast<int8_t>(parsed);
++}
++
+ /// Get CRBs across which a CSI resource spans as per TS 38.331, "CSI-FrequencyOccupation".
+ ///
+ /// \param nof_crbs Number of CRBs used for the CSI-RS.
+@@ -271,8 +323,8 @@ static nzp_csi_rs_resource make_common_nzp_csi_rs_resource(const csi_meas_config
+   res.res_mapping.freq_density  = csi_rs_freq_density_type::three;
+   res.res_mapping.freq_band_rbs = get_csi_freq_occupation_rbs(params.nof_rbs, params.nof_rbs);
+ 
+-  res.pwr_ctrl_offset       = params.csi_params.pwr_ctrl_offset;
+-  res.pwr_ctrl_offset_ss_db = 0;
++  res.pwr_ctrl_offset       = get_pavonis_power_control_offset_db_override().value_or(params.csi_params.pwr_ctrl_offset);
++  res.pwr_ctrl_offset_ss_db = get_pavonis_power_control_offset_ss_db_override().value_or(0);
+   res.scrambling_id         = params.pci;
+ 
+   res.csi_res_period = params.csi_params.csi_rs_period;
+diff --git a/lib/scheduler/ue_scheduling/ue_cell_grid_allocator.cpp b/lib/scheduler/ue_scheduling/ue_cell_grid_allocator.cpp
+index 45aa299ae6..45811380ef 100644
+--- a/lib/scheduler/ue_scheduling/ue_cell_grid_allocator.cpp
++++ b/lib/scheduler/ue_scheduling/ue_cell_grid_allocator.cpp
+@@ -8,6 +8,7 @@
+ #include "grant_params_selector.h"
+ #include "ocudu/scheduler/result/dci_info.h"
+ #include "ocudu/support/error_handling.h"
++#include "ocudu/support/pavonis_puxch_order_trace.h"
+ 
+ using namespace ocudu;
+ 
+@@ -804,6 +805,15 @@ void ue_cell_grid_allocator::set_pusch_params(ul_grant_info& grant, const vrb_in
+       report_fatal_error("Unsupported PDCCH UL DCI format");
+   }
+ 
++  if (ocudu::pavonis::ul_symbol_msg3_target_capture_enabled()) {
++    ocudu::pavonis::ul_symbol_msg3_target_publish(pusch_alloc.slot.system_slot(),
++                                                   pusch_alloc.slot.sfn(),
++                                                   pusch_alloc.slot.slot_index(),
++                                                   static_cast<unsigned>(pusch_cfg.symbols.start()),
++                                                   static_cast<unsigned>(pusch_cfg.symbols.stop()),
++                                                   to_value(u.crnti));
++  }
++
+   // Check if there is any UCI grant allocated on the PUCCH that can be moved to the PUSCH.
+   uci_alloc.multiplex_uci_on_pusch(
+       msg, pusch_alloc, ue_cell_cfg, u.crnti, pusch_cfg.aperiodic_csi and pusch_cfg.nof_csi_part1_bits != 0);
+diff --git a/lib/scheduler/ue_scheduling/ue_fallback_scheduler.cpp b/lib/scheduler/ue_scheduling/ue_fallback_scheduler.cpp
+index 2f4f1c7561..7b602da8ca 100644
+--- a/lib/scheduler/ue_scheduling/ue_fallback_scheduler.cpp
++++ b/lib/scheduler/ue_scheduling/ue_fallback_scheduler.cpp
+@@ -3,6 +3,7 @@
+ // Portions of this file may implement 3GPP specifications, which may be subject to additional licensing requirements.
+ 
+ #include "ue_fallback_scheduler.h"
++#include "ocudu/support/pavonis_msg3_path_trace.h"
+ #include "../pdcch_scheduling/pdcch_resource_allocator.h"
+ #include "../pucch_scheduling/pucch_allocator.h"
+ #include "../support/csi_rs_helpers.h"
+@@ -20,6 +21,7 @@
+ #include "ocudu/scheduler/config/pusch_td_resource_indices.h"
+ #include "ocudu/scheduler/result/pusch_info.h"
+ #include "ocudu/support/format/custom_formattable.h"
++#include "ocudu/support/pavonis_puxch_order_trace.h"
+ #include <algorithm>
+ 
+ using namespace ocudu;
+@@ -116,7 +118,9 @@ void ue_fallback_scheduler::stop()
+ 
+ void ue_fallback_scheduler::handle_dl_buffer_state_indication(du_ue_index_t ue_index)
+ {
++  pavonis::msg3_path_trace_event("fallback_dl_bo", slot_point(), -1, -1, "received");
+   if (not ues.contains(ue_index)) {
++    pavonis::msg3_path_trace_event("fallback_dl_bo", slot_point(), -1, -1, "ue_not_found");
+     logger.error("ue={}: DL Buffer Occupancy update discarded. UE is not found in the scheduler",
+                  fmt::underlying(ue_index));
+     return;
+@@ -141,12 +145,15 @@ void ue_fallback_scheduler::handle_dl_buffer_state_indication(du_ue_index_t ue_i
+ 
+ void ue_fallback_scheduler::handle_conres_indication(du_ue_index_t ue_index)
+ {
++  pavonis::msg3_path_trace_event("fallback_conres", slot_point(), -1, -1, "received");
+   if (not ues.contains(ue_index)) {
++    pavonis::msg3_path_trace_event("fallback_conres", slot_point(), -1, -1, "ue_not_found");
+     logger.error("ue={}: ConRes CE discarded. Cause: UE is not found in the scheduler", fmt::underlying(ue_index));
+     return;
+   }
+   auto& u = ues[ue_index];
+   if (not u.get_pcell().is_in_fallback_mode()) {
++    pavonis::msg3_path_trace_event("fallback_conres", slot_point(), -1, -1, "not_fallback");
+     // Note: In Test mode, the UE can skip fallback mode. However, since it was created via UL-CCCH, there is still an
+     // attempt to schedule the ConRes CE. If we want to change this log to warning, we need to create test mode UEs
+     // in a different manner.
+@@ -156,6 +163,7 @@ void ue_fallback_scheduler::handle_conres_indication(du_ue_index_t ue_index)
+ 
+   // Mark the start of the conRes timer.
+   u.drx_controller().on_con_res_start();
++  pavonis::msg3_path_trace_event("fallback_conres", slot_point(), -1, -1, "pending");
+ 
+   auto ue_it = std::find_if(pending_dl_ues_new_tx.begin(),
+                             pending_dl_ues_new_tx.end(),
+@@ -384,6 +392,7 @@ ue_fallback_scheduler::schedule_dl_srb(cell_resource_allocator&              res
+       if (conres_msg3_slot_diff < 0 or
+           divide_ceil<uint32_t, uint32_t>(static_cast<uint32_t>(conres_msg3_slot_diff),
+                                           pdsch_alloc.slot.nof_slots_per_subframe()) > ra_conres_timer_subframes) {
++        pavonis::msg3_path_trace_event("fallback_pdsch", pdsch_alloc.slot, -1, -1, "conres_expired");
+         // If the slot difference is larger than the RA ConRes timer, then it's too late to schedule the ConRes.
+         logger.debug(
+             "rnti={}: Fallback PDSCH allocation in slot {} aborted. Cause: ra-ContentionResolutionTimer expired",
+@@ -438,6 +447,8 @@ ue_fallback_scheduler::schedule_dl_srb(cell_resource_allocator&              res
+       if (not is_retx) {
+         store_harq_tx(u.ue_index, h_dl.value());
+       }
++      pavonis::msg3_path_trace_event(
++          "fallback_pdsch", pdsch_alloc.slot, -1, -1, is_retx ? "retx_allocated" : "new_tx_allocated");
+       return dl_sched_outcome::success;
+     }
+ 
+@@ -591,8 +602,13 @@ ue_fallback_scheduler::alloc_grant(ue&                                   u,
+       fixed_mcs = map_cqi_to_mcs(expert_cfg.initial_cqi, pdsch_cfg.mcs_table);
+       ocudu_assert(fixed_mcs.has_value(), "Invalid Initial CQI {}", expert_cfg.initial_cqi);
+     }
++    const bool limit_to_conres_mcs = only_conres_bytes > 0 and expert_cfg.max_conres_mcs.has_value();
+     std::tuple<unsigned, sch_mcs_index, units::bytes> result =
+-        select_tbs(pdsch_cfg, units::bytes{pending_bytes}, unused_crbs, fixed_mcs);
++        select_tbs(pdsch_cfg,
++                   units::bytes{limit_to_conres_mcs ? min_pending_bytes : pending_bytes},
++                   unused_crbs,
++                   limit_to_conres_mcs ? std::nullopt : fixed_mcs,
++                   limit_to_conres_mcs ? *expert_cfg.max_conres_mcs : expert_cfg.max_msg4_mcs);
+     unsigned chosen_tbs = std::get<2>(result).value();
+     if (chosen_tbs == 0) {
+       logger.info("rnti={}: Fallback newTx allocation postponed. Cause: Unable to compute valid TBS for available RBs",
+@@ -614,10 +630,11 @@ ue_fallback_scheduler::alloc_grant(ue&                                   u,
+     }
+     if (chosen_tbs < pending_bytes) {
+       // We will need to break down the pending bytes in multiple grants.
+-      if (only_conres_bytes > 0 and only_srb0_bytes > 0) {
++      if (only_conres_bytes > 0 and only_srb0_bytes > 0 and not limit_to_conres_mcs) {
+         // In case of both ConResCE and SRB0 are pending, we recompute the MCS, this time, just for scheduling ConRes
+         // CE.
+-        result     = select_tbs(pdsch_cfg, units::bytes{min_pending_bytes}, unused_crbs, std::nullopt);
++        result = select_tbs(
++            pdsch_cfg, units::bytes{min_pending_bytes}, unused_crbs, std::nullopt, expert_cfg.max_msg4_mcs);
+         chosen_tbs = std::get<2>(result).value();
+         if (chosen_tbs == 0) {
+           logger.info(
+@@ -636,8 +653,8 @@ ue_fallback_scheduler::alloc_grant(ue&                                   u,
+ 
+   // Allocate PDCCH resources.
+   cell_slot_resource_allocator& pdcch_alloc = res_alloc[slot_offset];
+-  pdcch_dl_information*         pdcch =
+-      pdcch_sch.alloc_dl_pdcch_common(pdcch_alloc, u.crnti, ss_cfg.get_id(), aggregation_level::n4);
++  pdcch_dl_information*         pdcch = pdcch_sch.alloc_dl_pdcch_common(
++      pdcch_alloc, u.crnti, ss_cfg.get_id(), expert_cfg.fallback_dl_dci_aggr_lev);
+   if (pdcch == nullptr) {
+     logger.debug("rnti={}: Postponed PDU scheduling for slot={}. Cause: No space in PDCCH.", u.crnti, pdcch_alloc.slot);
+     // If there is no PDCCH space on this slot for this UE, then this slot should be avoided by the other UEs too.
+@@ -719,7 +736,8 @@ std::tuple<unsigned, sch_mcs_index, units::bytes>
+ ue_fallback_scheduler::select_tbs(const pdsch_config_params&          pdsch_cfg,
+                                   units::bytes                        pending_bytes,
+                                   const crb_interval&                 unused_crbs,
+-                                  const std::optional<sch_mcs_index>& fixed_mcs) const
++                                  const std::optional<sch_mcs_index>& fixed_mcs,
++                                  sch_mcs_index                       max_mcs) const
+ {
+   sch_mcs_index  chosen_mcs_idx = 0;
+   sch_prbs_tbs   prbs_tbs{};
+@@ -797,7 +815,7 @@ ue_fallback_scheduler::select_tbs(const pdsch_config_params&          pdsch_cfg,
+                               unused_crbs.length());
+       chosen_mcs_idx                       = next_mcs_idx;
+       ++next_mcs_idx;
+-    } while (next_mcs_idx <= expert_cfg.max_msg4_mcs and prbs_tbs.tbs_bytes < pending_bytes);
++    } while (next_mcs_idx <= max_mcs and prbs_tbs.tbs_bytes < pending_bytes);
+   }
+ 
+   if (prbs_tbs.nof_prbs == 0) {
+@@ -1301,6 +1319,16 @@ void ue_fallback_scheduler::fill_ul_srb_grant(ue&
+                           vrbs,
+                           not is_retx);
+ 
++  if (ocudu::pavonis::ul_symbol_msg3_target_capture_enabled()) {
++    const slot_point pusch_slot = pdcch_slot + k2 + cell_cfg.ntn_cs_koffset;
++    ocudu::pavonis::ul_symbol_msg3_target_publish(pusch_slot.system_slot(),
++                                                   pusch_slot.sfn(),
++                                                   pusch_slot.slot_index(),
++                                                   static_cast<unsigned>(pusch_params.symbols.start()),
++                                                   static_cast<unsigned>(pusch_params.symbols.stop()),
++                                                   to_value(u.crnti));
++  }
++
+   // Save set PDCCH and PUSCH PDU parameters in HARQ process.
+   h_ul->save_grant_params(ul_harq_alloc_context{pdcch.dci.type}, msg.pusch_cfg);
+ 
+diff --git a/tests/unittests/fapi_adaptor/phy/p7/pdu_translators/dl_pdsch_pdu_test.cpp b/tests/unittests/fapi_adaptor/phy/p7/pdu_translators/dl_pdsch_pdu_test.cpp
+index 51f546234e..1c4e8124c1 100644
+--- a/tests/unittests/fapi_adaptor/phy/p7/pdu_translators/dl_pdsch_pdu_test.cpp
++++ b/tests/unittests/fapi_adaptor/phy/p7/pdu_translators/dl_pdsch_pdu_test.cpp
+@@ -7,6 +7,8 @@
+ #include "ocudu/fapi_adaptor/precoding_matrix_table_generator.h"
+ #include "ocudu/ran/pdcch/dci_format.h"
+ #include "ocudu/ran/sch/sch_constants.h"
++#include <cstdlib>
++#include <cstring>
+ #include <gtest/gtest.h>
+ #include <random>
+ 
+@@ -44,6 +46,13 @@ static float calculate_ratio_pdsch_dmrs_to_sss_dB(float ratio_pdsch_data_to_sss_
+   return ratio_pdsch_data_to_sss_dB + beta_dmrs_values[num_dmrs_cdm_grps_no_data];
+ }
+ 
++static bool is_pavonis_si_pdsch_power_sign_compat_env_enabled()
++{
++  const char* value = std::getenv("PAVONIS_GNB_SI_PDSCH_POWER_SIGN_COMPAT");
++  return value != nullptr && (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
++                              std::strcmp(value, "on") == 0);
++}
++
+ static rb_allocation make_freq_allocation(fapi::dl_pdsch_pdu::vrb_to_prb_mapping_t pdu_mapping,
+                                           unsigned                                 bwp_start,
+                                           unsigned                                 bwp_size,
+@@ -111,7 +120,7 @@ TEST(fapi_to_phy_pdsch_conversion_test, valid_pdu_conversion_success)
+   // Random generators.
+   std::uniform_int_distribution<unsigned> sfn_dist(0, 1023);
+   std::uniform_int_distribution<unsigned> slot_dist(0, 159);
+-  std::uniform_int_distribution<unsigned> rnti_dist(1, 65535);
++  std::uniform_int_distribution<unsigned> rnti_dist(1, 65534);
+   std::uniform_int_distribution<unsigned> bwp_size_dist(1, 275);
+   std::uniform_int_distribution<unsigned> bwp_start_dist(0, 274);
+   std::uniform_int_distribution<unsigned> nid_pdsch_dist(0, 1023);
+@@ -264,3 +273,57 @@ TEST(fapi_to_phy_pdsch_conversion_test, valid_pdu_conversion_success)
+     }
+   }
+ }
++
++static pdsch_processor::pdu_t convert_profile_nr_pdsch_for_rnti(rnti_t rnti)
++{
++  auto                               pm_tools = generate_precoding_matrix_tables(1, 0);
++  const precoding_matrix_repository& pm_repo  = *std::get<std::unique_ptr<precoding_matrix_repository>>(pm_tools);
++
++  fapi::dl_pdsch_pdu         fapi_pdu;
++  fapi::dl_pdsch_pdu_builder builder(fapi_pdu);
++
++  dmrs_symbol_mask dl_dmrs_symbol(14);
++  dl_dmrs_symbol.from_uint64(1U << 2U);
++  fapi::dmrs_ports_mask dmrs_ports(11);
++  dmrs_ports.from_uint64(0);
++
++  builder.set_ue_specific_parameters(rnti)
++      .set_bwp_parameters(crb_interval::start_and_len(0, 52), subcarrier_spacing::kHz15, cyclic_prefix::NORMAL)
++      .set_codeword_generation_parameters(1, 1, fapi::pdsch_ref_point_type::point_a)
++      .set_dmrs_parameters(dl_dmrs_symbol, dmrs_config_type::type1, 1, 0, 2, dmrs_ports)
++      .set_codeword_parameters(units::bytes{50})
++      .set_number_of_csi_puds(0);
++
++  builder.add_codeword().set_codeword_parameters(
++      modulation_scheme::QPSK, sch_mcs_index(5), pdsch_mcs_table::qam64, 0, units::bytes{80});
++  builder.set_frequency_allocation_type_1(vrb_interval::start_and_len(0, 8),
++                                          vrb_to_prb::mapping_type::non_interleaved);
++  builder.set_time_allocation_parameters(ofdm_symbol_range::start_and_len(2, 12));
++  builder.set_profile_nr_tx_power_info_parameters(0, fapi::power_control_offset_ss::dB6);
++  builder.set_ldpc_base_graph(ldpc_base_graph_type::BG1);
++  builder.get_tx_precoding_and_beamforming_pdu_builder().set_pmi(0).set_prg_parameters(51);
++  builder.set_vrb_to_prb_non_interleaved_common_ss_parameters();
++
++  pdsch_processor::pdu_t proc_pdu;
++  convert_pdsch_fapi_to_phy(proc_pdu, fapi_pdu, slot_point(subcarrier_spacing::kHz15, 0, 1), {}, pm_repo);
++  return proc_pdu;
++}
++
++TEST(fapi_to_phy_pdsch_conversion_test, pavonis_si_rnti_power_sign_compatibility)
++{
++  const bool compat_enabled = is_pavonis_si_pdsch_power_sign_compat_env_enabled();
++
++  const pdsch_processor::pdu_t si_pdu     = convert_profile_nr_pdsch_for_rnti(rnti_t::SI_RNTI);
++  const pdsch_processor::pdu_t non_si_pdu = convert_profile_nr_pdsch_for_rnti(to_rnti(0x4601));
++
++  if (compat_enabled) {
++    ASSERT_FLOAT_EQ(-6.0F, si_pdu.ratio_pdsch_data_to_sss_dB);
++    ASSERT_FLOAT_EQ(-6.0F, si_pdu.ratio_pdsch_dmrs_to_sss_dB);
++  } else {
++    ASSERT_FLOAT_EQ(6.0F, si_pdu.ratio_pdsch_data_to_sss_dB);
++    ASSERT_FLOAT_EQ(3.0F, si_pdu.ratio_pdsch_dmrs_to_sss_dB);
++  }
++
++  ASSERT_FLOAT_EQ(6.0F, non_si_pdu.ratio_pdsch_data_to_sss_dB);
++  ASSERT_FLOAT_EQ(3.0F, non_si_pdu.ratio_pdsch_dmrs_to_sss_dB);
++}
+diff --git a/tests/unittests/scheduler/common_scheduling/sib1_scheduler_test.cpp b/tests/unittests/scheduler/common_scheduling/sib1_scheduler_test.cpp
+index 5ef41e9167..beda0bd305 100644
+--- a/tests/unittests/scheduler/common_scheduling/sib1_scheduler_test.cpp
++++ b/tests/unittests/scheduler/common_scheduling/sib1_scheduler_test.cpp
+@@ -14,7 +14,9 @@
+ #include "ocudu/scheduler/config/serving_cell_config_factory.h"
+ #include "ocudu/scheduler/config/time_domain_resource_helper.h"
+ #include "ocudu/support/ocudu_test.h"
++#include <cstdlib>
+ #include <gtest/gtest.h>
++#include <optional>
+ 
+ using namespace ocudu;
+ 
+@@ -351,7 +353,9 @@ void test_sib1_scheduler(subcarrier_spacing                         scs_common,
+ ///
+ /// \param[in] sib1_rtx_period period set for the SIB1 retransmissions.
+ /// \param[in] ssb_period period set for the SSB.
+-void test_sib1_periodicity(sib1_rtx_periodicity sib1_rtx_period, ssb_periodicity ssb_period)
++void test_sib1_periodicity(sib1_rtx_periodicity   sib1_rtx_period,
++                           ssb_periodicity        ssb_period,
++                           std::optional<unsigned> expected_period_override_ms = std::nullopt)
+ {
+   // Instantiate the sib_test_bench and the SIB1 scheduler.
+   const uint8_t  L_max = 4U;
+@@ -360,10 +364,8 @@ void test_sib1_periodicity(sib1_rtx_periodicity sib1_rtx_period, ssb_periodicity
+   sib1_scheduler sib1_sched{t_bench.cfg, t_bench.pdcch_sch, t_bench.cfg_msg.si_scheduling.sib1_payload_size};
+ 
+   // Determine the expected SIB1 retx periodicity.
+-  const unsigned expected_sib1_period_ms =
+-      sib1_rtx_periodicity_to_value(sib1_rtx_period) > ssb_periodicity_to_value(ssb_period)
+-          ? sib1_rtx_periodicity_to_value(sib1_rtx_period)
+-          : ssb_periodicity_to_value(ssb_period);
++  const unsigned expected_sib1_period_ms = expected_period_override_ms.value_or(
++      std::max(sib1_rtx_periodicity_to_value(sib1_rtx_period), ssb_periodicity_to_value(ssb_period)));
+ 
+   // SIB1 periodicity in slots.
+   const unsigned expected_sib1_period_slots = expected_sib1_period_ms * t_bench.sl_tx.nof_slots_per_subframe();
+@@ -642,6 +644,25 @@ TEST(sib1_scheduler_test, test_sib1_periodicity)
+   test_sib1_periodicity(sib1_rtx_periodicity::ms80, ssb_periodicity::ms160);
+ }
+ 
++TEST(sib1_scheduler_test, pavonis_sib1_20ms_override)
++{
++  ASSERT_NE(std::getenv("PAVONIS_GNB_SIB1_RETX_PERIOD_MS"), nullptr);
++  ASSERT_STREQ(std::getenv("PAVONIS_GNB_SIB1_RETX_PERIOD_MS"), "20");
++  test_sib1_periodicity(sib1_rtx_periodicity::ms160, ssb_periodicity::ms10, 20U);
++}
++
++TEST(sib1_scheduler_test, pavonis_sib1_n0_20ms_override)
++{
++  ASSERT_NE(std::getenv("PAVONIS_GNB_SIB1_RETX_PERIOD_MS"), nullptr);
++  ASSERT_STREQ(std::getenv("PAVONIS_GNB_SIB1_RETX_PERIOD_MS"), "20");
++  ASSERT_NE(std::getenv("PAVONIS_GNB_SIB1_USE_N0"), nullptr);
++  ASSERT_STREQ(std::getenv("PAVONIS_GNB_SIB1_USE_N0"), "1");
++
++  std::array<unsigned, MAX_NUM_BEAMS> sib1_slots = {0};
++  test_sib1_scheduler(
++      subcarrier_spacing::kHz15, sib1_slots, 96U, 0b1000, 4U, 10, ocudu::duplex_mode::FDD);
++}
++
+ TEST(sib1_scheduler_test, test_sib1_ssb_collision_for_15khz_scs)
+ {
+   // TEST SIB1/SSB collision on the resource grid.
+-- 
+2.53.0
+

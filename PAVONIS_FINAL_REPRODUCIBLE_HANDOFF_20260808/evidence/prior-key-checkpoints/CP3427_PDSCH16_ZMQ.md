@@ -1,0 +1,98 @@
+# CP3427 - PDSCH MCS16 no-RF sensitivity
+
+## Verdict
+
+**PASS. PDSCH MCS9 was a causal downlink ceiling.**
+
+Changing only PDSCH `max_ue_mcs` from 9 to 16 raises receiver-authoritative
+ZMQ downlink from `7.599795` to `14.860932 Mbit/s`, a `95.54%` gain. Uplink
+remains in the prior MCS16 ZMQ class at `15.448868 Mbit/s`.
+
+This unlocks one sole-variable M2SDR OTA gate. Bandwidth, MIMO, and
+producer-stall headroom remain queued.
+
+## Isolation
+
+The CP3324 harness was cloned mechanically. Its pinned gNB launcher, base gNB,
+private UE role, private core role, persistent traffic tools, 10 MHz FDD
+geometry, PUSCH MCS16 policy, 45-second duration, and four-stream sequential
+traffic are unchanged and hash-verified.
+
+The gNB config diff is exactly:
+
+```diff
+   pdsch:
+-    max_ue_mcs: 9
++    max_ue_mcs: 16
+```
+
+No SDR was opened and no RF was transmitted.
+
+## Sustained result
+
+| Metric | CP3324 MCS9 | CP3427 MCS16 |
+|---|---:|---:|
+| DL receiver | 7.599795 Mbit/s | 14.860932 Mbit/s |
+| UL receiver | 15.475241 Mbit/s | 15.448868 Mbit/s |
+| DL gain | baseline | +95.54% |
+
+The core accepted `15.236012 Mbit/s` of downlink writes. Only `2,109,072`
+bytes remained undrained at stop, versus roughly 8.6-10.0 MB in the slower
+MCS9 hardware runs.
+
+## Scheduler proof
+
+The 1 GB debug log remained on the core host and was processed there by a
+bounded parser. Only its compact JSON was fetched.
+
+In the best 45-second active downlink window:
+
+- PDSCH rows: `43,721`;
+- newTx: `43,721`;
+- retransmissions: `0`;
+- scheduled new-data rate: `15.544161 Mbit/s`;
+- scheduled-slot utilization: `97.1578%`;
+- MCS16 rows: `37,163`;
+- MCS15 rows: `6,558`;
+- median TBS: `2112 bytes`;
+- median allocation: `52 PRBs`;
+- median scheduled-slot gap: `1`;
+- median HARQ-process reuse gap: `8`.
+
+The receiver delivers 95.61% of scheduled new-data bytes. This is a clean
+scheduler/transport result, not a gain manufactured by retry traffic.
+
+## Decision
+
+Prepare a fresh M2SDR config from the final CP3424 MCS19/lead11 operating
+point, changing only PDSCH max MCS9 to 16. The no-RF gate must prove config,
+launcher, timing env, binary, and benchmark normalization before one bounded
+OTA run.
+
+The OTA run will judge:
+
+1. exact TX health and attach;
+2. receiver-authoritative DL above the CP3410/CP3424 class;
+3. bounded UE PDSCH MCS/TBS/CRC evidence;
+4. UL remaining in the MCS19 operating class.
+
+## Artifacts
+
+- `gnb_zmq_fdd_band3_10mhz_pdsch16.yml`
+  - SHA-256
+    `a631607aa87a579ada86975645fb6269d9bab217ab37f37e8e3f2f37bf1b9622`
+- `core_sustained.json`
+  - SHA-256
+    `4e7471eb3bb910f6d7cb50057c7209e9cfea8bf834062511a3ab2dd6dd2a4d4d`
+- `ue_sustained.json`
+  - SHA-256
+    `808844b4b9301edfa7f7d85307a3f321ec9bacf0d5a6f0f30bdb0c5ce5d2dda9`
+- `cp3427_dl_scheduler.json`
+  - SHA-256
+    `7200ec16d68f6950cbfefcdcd7a9d495077c56c6c17736da43e1a302dccef9ff`
+- `parse_dl_scheduler.py`
+  - SHA-256
+    `db2b06c25cadf6f9ef41bb523d7d09418ea5caca88bc82160cef61dc1e7c7a3b`
+- `run_20260731T022502Z.log`
+  - SHA-256
+    `daf1045e4c130f44f08498205a15766b6063727e0d7c0ff96e2e3a004da98c83`

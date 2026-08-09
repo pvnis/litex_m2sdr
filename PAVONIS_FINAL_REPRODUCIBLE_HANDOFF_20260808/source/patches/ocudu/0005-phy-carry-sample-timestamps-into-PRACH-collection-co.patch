@@ -1,0 +1,35 @@
+From c7db8207cb215da548373f488cc0eaff480066ba Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 16:04:18 +0200
+Subject: [PATCH 5/7] phy: carry sample timestamps into PRACH collection
+ context
+
+Complete the bounded timing-compensation API by recording the baseband timestamp on each PRACH symbol context. Default collection behavior is unchanged. Refs CP1624, CP2129.
+---
+ .../lower/processors/uplink/prach/prach_processor_baseband.h   | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/include/ocudu/phy/lower/processors/uplink/prach/prach_processor_baseband.h b/include/ocudu/phy/lower/processors/uplink/prach/prach_processor_baseband.h
+index 962b806c1a..099fac534f 100644
+--- a/include/ocudu/phy/lower/processors/uplink/prach/prach_processor_baseband.h
++++ b/include/ocudu/phy/lower/processors/uplink/prach/prach_processor_baseband.h
+@@ -6,6 +6,7 @@
+ 
+ #include "ocudu/adt/complex.h"
+ #include "ocudu/adt/span.h"
++#include "ocudu/gateways/baseband/baseband_gateway_timestamp.h"
+ #include "ocudu/ran/slot_point.h"
+ 
+ namespace ocudu {
+@@ -27,6 +28,8 @@ public:
+     slot_point slot;
+     /// Current symbol index within the slot.
+     unsigned symbol;
++    /// Timestamp of the first sample in the current OFDM symbol, adjusted to the lower PHY SFN0 reference.
++    baseband_gateway_timestamp timestamp = 0;
+     /// Sector identifier.
+     unsigned sector;
+   };
+-- 
+2.53.0
+

@@ -1,0 +1,426 @@
+From 8619e19fc4a61a6206555de34987bad519dde2fe Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 16:21:24 +0200
+Subject: [PATCH 1/3] rf: add opt-in M2SDR primer transport controls
+
+The CP2985/CP3114 phone chain requires bounded Soapy timing and stream-state accommodations before handing the live core from the primer RAN to OCUDU. Keep the transport behavior default-off so ordinary srsRAN radio semantics remain unchanged.
+---
+ lib/src/phy/rf/rf_soapy_imp.c | 151 ++++++++++++++++++++++++----------
+ lib/src/radio/radio.cc        |  16 +++-
+ 2 files changed, 123 insertions(+), 44 deletions(-)
+
+diff --git a/lib/src/phy/rf/rf_soapy_imp.c b/lib/src/phy/rf/rf_soapy_imp.c
+index 642e07a29..6585774e0 100644
+--- a/lib/src/phy/rf/rf_soapy_imp.c
++++ b/lib/src/phy/rf/rf_soapy_imp.c
+@@ -20,6 +20,7 @@
+  */
+ 
+ #include <pthread.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/time.h>
+ #include <unistd.h>
+@@ -61,6 +62,7 @@ typedef struct {
+   size_t           rx_mtu, tx_mtu;
+   size_t           num_rx_channels;
+   size_t           num_tx_channels;
++  size_t           physical_channel_offset;
+ 
+   srsran_rf_error_handler_t soapy_error_handler;
+   void*                     soapy_error_handler_arg;
+@@ -76,6 +78,17 @@ typedef struct {
+   uint32_t num_stream_curruption;
+ } rf_soapy_handler_t;
+ 
++static size_t rf_soapy_physical_channel(const rf_soapy_handler_t* handler, size_t logical_channel)
++{
++  return handler->physical_channel_offset + logical_channel;
++}
++
++static size_t rf_soapy_rx_gain_control_channel(const rf_soapy_handler_t* handler, size_t logical_channel)
++{
++  // LiteX 1R1T mode maps logical RX0 onto the selected physical RX path.
++  return handler->physical_channel_offset == 1 ? logical_channel : rf_soapy_physical_channel(handler, logical_channel);
++}
++
+ cf_t zero_mem[64 * 1024];
+ 
+ static void log_overflow(rf_soapy_handler_t* h)
+@@ -195,7 +208,8 @@ const char* rf_soapy_devname(void* h)
+ 
+ static bool rf_soapy_rx_wait_lo_locked(rf_soapy_handler_t* handler)
+ {
+-  char* ret = SoapySDRDevice_readChannelSensor(handler->device, SOAPY_SDR_RX, 0, "lo_locked");
++  char* ret = SoapySDRDevice_readChannelSensor(
++      handler->device, SOAPY_SDR_RX, rf_soapy_physical_channel(handler, 0), "lo_locked");
+   if (ret != NULL) {
+     return (strcmp(ret, "true") == 0 ? true : false);
+   }
+@@ -205,7 +219,8 @@ static bool rf_soapy_rx_wait_lo_locked(rf_soapy_handler_t* handler)
+ void rf_soapy_calibrate_tx(void* h)
+ {
+   rf_soapy_handler_t* handler   = (rf_soapy_handler_t*)h;
+-  double              actual_bw = SoapySDRDevice_getBandwidth(handler->device, SOAPY_SDR_TX, 0);
++  double actual_bw =
++      SoapySDRDevice_getBandwidth(handler->device, SOAPY_SDR_TX, rf_soapy_physical_channel(handler, 0));
+   char                str_buf[25];
+   snprintf(str_buf, sizeof(str_buf), "%f", actual_bw);
+   str_buf[24] = 0;
+@@ -293,6 +308,19 @@ float rf_soapy_get_rssi(void* h)
+ int rf_soapy_open_multi(char* args, void** h, uint32_t num_requested_channels)
+ {
+   size_t length;
++  size_t physical_channel_offset = 0;
++
++  const char* physical_channel_env = getenv("PAVONIS_SRSRAN_SOAPY_PHYSICAL_CHANNEL");
++  if (physical_channel_env != NULL && physical_channel_env[0] != '\0') {
++    if (strcmp(physical_channel_env, "0") == 0) {
++      physical_channel_offset = 0;
++    } else if (strcmp(physical_channel_env, "1") == 0 && num_requested_channels == 1) {
++      physical_channel_offset = 1;
++    } else {
++      ERROR("PAVONIS_SRSRAN_SOAPY_PHYSICAL_CHANNEL must be 0, or 1 for a single-channel stream.");
++      return SRSRAN_ERROR;
++    }
++  }
+ 
+   // Let Soapy pick the device if no arguments are passed
+   SoapySDRKwargs* soapy_args =
+@@ -358,6 +386,10 @@ int rf_soapy_open_multi(char* args, void** h, uint32_t num_requested_channels)
+   handler->tx_stream_active = false;
+   handler->rx_stream_active = false;
+   handler->devname          = DEVNAME_SOAPY;
++  handler->physical_channel_offset = physical_channel_offset;
++  printf("PAVONIS_SRSRAN_SOAPY_PHYSICAL_CHANNEL active=%zu requested_channels=%u\n",
++         handler->physical_channel_offset,
++         num_requested_channels);
+ 
+   // create stream args from device args
+   SoapySDRKwargs stream_args = {};
+@@ -371,7 +403,7 @@ int rf_soapy_open_multi(char* args, void** h, uint32_t num_requested_channels)
+     handler->num_rx_channels = SRSRAN_MIN(num_available_channels, num_requested_channels);
+     size_t rx_channels[handler->num_rx_channels];
+     for (int i = 0; i < handler->num_rx_channels; i++) {
+-      rx_channels[i] = i;
++      rx_channels[i] = rf_soapy_physical_channel(handler, i);
+     }
+     printf("Setting up Rx stream with %zd channel(s)\n", handler->num_rx_channels);
+ #if SOAPY_SDR_API_VERSION < 0x00080000
+@@ -399,7 +431,7 @@ int rf_soapy_open_multi(char* args, void** h, uint32_t num_requested_channels)
+     handler->num_tx_channels = SRSRAN_MIN(num_available_channels, num_requested_channels);
+     size_t tx_channels[handler->num_tx_channels];
+     for (int i = 0; i < handler->num_tx_channels; i++) {
+-      tx_channels[i] = i;
++      tx_channels[i] = rf_soapy_physical_channel(handler, i);
+     }
+     printf("Setting up Tx stream with %zd channel(s)\n", handler->num_tx_channels);
+ #if SOAPY_SDR_API_VERSION < 0x00080000
+@@ -436,16 +468,19 @@ int rf_soapy_open_multi(char* args, void** h, uint32_t num_requested_channels)
+ 
+   // list channel sensors
+   for (uint32_t i = 0; i < handler->num_rx_channels; ++i) {
+-    list = SoapySDRDevice_listChannelSensors(handler->device, SOAPY_SDR_RX, i, &list_length);
+-    printf("Available sensors for Rx channel %d: \n", i);
++    size_t physical_channel = rf_soapy_physical_channel(handler, i);
++    list = SoapySDRDevice_listChannelSensors(handler->device, SOAPY_SDR_RX, physical_channel, &list_length);
++    printf("Available sensors for Rx channel %zu: \n", physical_channel);
+     for (int j = 0; j < list_length; j++) {
+       printf(" - %s\n", list[j]);
+     }
+   }
+ 
+   // Set static radio info
+-  SoapySDRRange tx_range    = SoapySDRDevice_getGainRange(handler->device, SOAPY_SDR_TX, 0);
+-  SoapySDRRange rx_range    = SoapySDRDevice_getGainRange(handler->device, SOAPY_SDR_RX, 0);
++  SoapySDRRange tx_range =
++      SoapySDRDevice_getGainRange(handler->device, SOAPY_SDR_TX, rf_soapy_physical_channel(handler, 0));
++  SoapySDRRange rx_range =
++      SoapySDRDevice_getGainRange(handler->device, SOAPY_SDR_RX, rf_soapy_physical_channel(handler, 0));
+   handler->info.min_tx_gain = tx_range.minimum;
+   handler->info.max_tx_gain = tx_range.maximum;
+   handler->info.min_rx_gain = rx_range.minimum;
+@@ -472,9 +507,10 @@ int rf_soapy_open_multi(char* args, void** h, uint32_t num_requested_channels)
+     if (rx_ant_ptr) {
+       copy_subdev_string(rx_ant_str, rx_ant_ptr + strlen(rx_ant_arg));
+       for (int i = 0; i < handler->num_rx_channels; i++) {
+-        printf("Setting Rx channel %d antenna to %s\n", i, rx_ant_str);
+-        if (SoapySDRDevice_setAntenna(handler->device, SOAPY_SDR_RX, i, rx_ant_str) != 0) {
+-          ERROR("Failed to set Rx antenna for channel %d.", i);
++        size_t physical_channel = rf_soapy_physical_channel(handler, i);
++        printf("Setting Rx channel %zu antenna to %s\n", physical_channel, rx_ant_str);
++        if (SoapySDRDevice_setAntenna(handler->device, SOAPY_SDR_RX, physical_channel, rx_ant_str) != 0) {
++          ERROR("Failed to set Rx antenna for channel %zu.", physical_channel);
+         }
+       }
+       remove_substring(args, rx_ant_arg);
+@@ -488,9 +524,10 @@ int rf_soapy_open_multi(char* args, void** h, uint32_t num_requested_channels)
+     if (tx_ant_ptr) {
+       copy_subdev_string(tx_ant_str, tx_ant_ptr + strlen(tx_ant_arg));
+       for (int i = 0; i < handler->num_rx_channels; i++) {
+-        printf("Setting Tx channel %d antenna to %s\n", i, tx_ant_str);
+-        if (SoapySDRDevice_setAntenna(handler->device, SOAPY_SDR_TX, i, tx_ant_str) != 0) {
+-          ERROR("Failed to set Tx antenna for channel %d.", i);
++        size_t physical_channel = rf_soapy_physical_channel(handler, i);
++        printf("Setting Tx channel %zu antenna to %s\n", physical_channel, tx_ant_str);
++        if (SoapySDRDevice_setAntenna(handler->device, SOAPY_SDR_TX, physical_channel, tx_ant_str) != 0) {
++          ERROR("Failed to set Tx antenna for channel %zu.", physical_channel);
+         }
+       }
+       remove_substring(args, tx_ant_arg);
+@@ -522,25 +559,34 @@ int rf_soapy_open_multi(char* args, void** h, uint32_t num_requested_channels)
+ #endif
+ 
+   // list gains and AGC mode
+-  bool has_agc = SoapySDRDevice_hasGainMode(handler->device, SOAPY_SDR_RX, 0);
+-  list         = SoapySDRDevice_listGains(handler->device, SOAPY_SDR_RX, 0, &list_length);
+-  printf("State of gain elements for Rx channel 0 (AGC %s):\n", has_agc ? "supported" : "not supported");
++  size_t first_channel = rf_soapy_physical_channel(handler, 0);
++  bool has_agc = SoapySDRDevice_hasGainMode(handler->device, SOAPY_SDR_RX, first_channel);
++  list         = SoapySDRDevice_listGains(handler->device, SOAPY_SDR_RX, first_channel, &list_length);
++  printf("State of gain elements for Rx channel %zu (AGC %s):\n",
++         first_channel,
++         has_agc ? "supported" : "not supported");
+   for (int i = 0; i < list_length; i++) {
+-    printf(" - %s: %.2f dB\n", list[i], SoapySDRDevice_getGainElement(handler->device, SOAPY_SDR_RX, 0, list[i]));
++    printf(" - %s: %.2f dB\n",
++           list[i],
++           SoapySDRDevice_getGainElement(handler->device, SOAPY_SDR_RX, first_channel, list[i]));
+   }
+ 
+-  has_agc = SoapySDRDevice_hasGainMode(handler->device, SOAPY_SDR_TX, 0);
+-  list    = SoapySDRDevice_listGains(handler->device, SOAPY_SDR_TX, 0, &list_length);
+-  printf("State of gain elements for Tx channel 0 (AGC %s):\n", has_agc ? "supported" : "not supported");
++  has_agc = SoapySDRDevice_hasGainMode(handler->device, SOAPY_SDR_TX, first_channel);
++  list    = SoapySDRDevice_listGains(handler->device, SOAPY_SDR_TX, first_channel, &list_length);
++  printf("State of gain elements for Tx channel %zu (AGC %s):\n",
++         first_channel,
++         has_agc ? "supported" : "not supported");
+   for (int i = 0; i < list_length; i++) {
+-    printf(" - %s: %.2f dB\n", list[i], SoapySDRDevice_getGainElement(handler->device, SOAPY_SDR_TX, 0, list[i]));
++    printf(" - %s: %.2f dB\n",
++           list[i],
++           SoapySDRDevice_getGainElement(handler->device, SOAPY_SDR_TX, first_channel, list[i]));
+   }
+ 
+   // print actual antenna configuration
+-  char* ant = SoapySDRDevice_getAntenna(handler->device, SOAPY_SDR_RX, 0);
++  char* ant = SoapySDRDevice_getAntenna(handler->device, SOAPY_SDR_RX, first_channel);
+   printf("Rx antenna set to %s\n", ant);
+ 
+-  ant = SoapySDRDevice_getAntenna(handler->device, SOAPY_SDR_TX, 0);
++  ant = SoapySDRDevice_getAntenna(handler->device, SOAPY_SDR_TX, first_channel);
+   printf("Tx antenna set to %s\n", ant);
+ 
+ #if HAVE_ASYNC_THREAD
+@@ -615,7 +661,8 @@ double rf_soapy_set_rx_srate(void* h, double rate)
+ #endif // STOP_STREAM_BEFORE_RATE_CHANGE
+ 
+   for (uint32_t i = 0; i < handler->num_rx_channels; i++) {
+-    if (SoapySDRDevice_setSampleRate(handler->device, SOAPY_SDR_RX, i, rate) != 0) {
++    size_t physical_channel = rf_soapy_physical_channel(handler, i);
++    if (SoapySDRDevice_setSampleRate(handler->device, SOAPY_SDR_RX, physical_channel, rate) != 0) {
+       printf("setSampleRate Rx fail: %s\n", SoapySDRDevice_lastError());
+       return SRSRAN_ERROR;
+     }
+@@ -623,16 +670,18 @@ double rf_soapy_set_rx_srate(void* h, double rate)
+ #if SET_RF_BW
+     // Set bandwidth close to current rate
+     size_t         bw_length;
+-    SoapySDRRange* bw_range = SoapySDRDevice_getBandwidthRange(handler->device, SOAPY_SDR_RX, 0, &bw_length);
++    SoapySDRRange* bw_range =
++        SoapySDRDevice_getBandwidthRange(handler->device, SOAPY_SDR_RX, physical_channel, &bw_length);
+     for (int k = 0; k < bw_length; ++k) {
+       double bw = rate * 0.75;
+       bw        = SRSRAN_MIN(bw, bw_range[k].maximum);
+       bw        = SRSRAN_MAX(bw, bw_range[k].minimum);
+-      if (SoapySDRDevice_setBandwidth(handler->device, SOAPY_SDR_RX, i, bw) != 0) {
++      if (SoapySDRDevice_setBandwidth(handler->device, SOAPY_SDR_RX, physical_channel, bw) != 0) {
+         printf("setBandwidth fail: %s\n", SoapySDRDevice_lastError());
+         return SRSRAN_ERROR;
+       }
+-      printf("Set Rx bandwidth to %.2f MHz\n", SoapySDRDevice_getBandwidth(handler->device, SOAPY_SDR_RX, i) / 1e6);
++      printf("Set Rx bandwidth to %.2f MHz\n",
++             SoapySDRDevice_getBandwidth(handler->device, SOAPY_SDR_RX, physical_channel) / 1e6);
+     }
+ #endif // SET_RF_BW
+   }
+@@ -644,7 +693,8 @@ double rf_soapy_set_rx_srate(void* h, double rate)
+ #endif // STOP_STREAM_BEFORE_RATE_CHANGE
+ 
+   // retrun sample rate of first channel
+-  return SoapySDRDevice_getSampleRate(handler->device, SOAPY_SDR_RX, 0);
++  return SoapySDRDevice_getSampleRate(
++      handler->device, SOAPY_SDR_RX, rf_soapy_physical_channel(handler, 0));
+ }
+ 
+ double rf_soapy_set_tx_srate(void* h, double rate)
+@@ -660,25 +710,28 @@ double rf_soapy_set_tx_srate(void* h, double rate)
+ #endif // STOP_STREAM_BEFORE_RATE_CHANGE
+ 
+   for (uint32_t i = 0; i < handler->num_tx_channels; i++) {
+-    if (SoapySDRDevice_setSampleRate(handler->device, SOAPY_SDR_TX, i, rate) != 0) {
++    size_t physical_channel = rf_soapy_physical_channel(handler, i);
++    if (SoapySDRDevice_setSampleRate(handler->device, SOAPY_SDR_TX, physical_channel, rate) != 0) {
+       printf("setSampleRate Tx fail: %s\n", SoapySDRDevice_lastError());
+       return SRSRAN_ERROR;
+     }
+ 
+ #if SET_RF_BW
+     size_t         bw_length;
+-    SoapySDRRange* bw_range = SoapySDRDevice_getBandwidthRange(handler->device, SOAPY_SDR_TX, i, &bw_length);
++    SoapySDRRange* bw_range =
++        SoapySDRDevice_getBandwidthRange(handler->device, SOAPY_SDR_TX, physical_channel, &bw_length);
+     for (int k = 0; k < bw_length; ++k) {
+       // try to set the BW a bit narrower than sampling rate to prevent aliasing but make sure to stay within device
+       // boundaries
+       double bw = rate * 0.75;
+       bw        = SRSRAN_MAX(bw, bw_range[k].minimum);
+       bw        = SRSRAN_MIN(bw, bw_range[k].maximum);
+-      if (SoapySDRDevice_setBandwidth(handler->device, SOAPY_SDR_TX, i, bw) != 0) {
++      if (SoapySDRDevice_setBandwidth(handler->device, SOAPY_SDR_TX, physical_channel, bw) != 0) {
+         printf("setBandwidth fail: %s\n", SoapySDRDevice_lastError());
+         return SRSRAN_ERROR;
+       }
+-      printf("Set Tx bandwidth to %.2f MHz\n", SoapySDRDevice_getBandwidth(handler->device, SOAPY_SDR_TX, i) / 1e6);
++      printf("Set Tx bandwidth to %.2f MHz\n",
++             SoapySDRDevice_getBandwidth(handler->device, SOAPY_SDR_TX, physical_channel) / 1e6);
+     }
+ #endif // SET_RF_BW
+   }
+@@ -689,7 +742,8 @@ double rf_soapy_set_tx_srate(void* h, double rate)
+   }
+ #endif // STOP_STREAM_BEFORE_RATE_CHANGE
+ 
+-  handler->tx_rate = SoapySDRDevice_getSampleRate(handler->device, SOAPY_SDR_TX, 0);
++  handler->tx_rate =
++      SoapySDRDevice_getSampleRate(handler->device, SOAPY_SDR_TX, rf_soapy_physical_channel(handler, 0));
+ 
+   return handler->tx_rate;
+ }
+@@ -708,10 +762,18 @@ int rf_soapy_set_rx_gain(void* h, double gain)
+ int rf_soapy_set_rx_gain_ch(void* h, uint32_t ch, double gain)
+ {
+   rf_soapy_handler_t* handler = (rf_soapy_handler_t*)h;
+-  if (SoapySDRDevice_setGain(handler->device, SOAPY_SDR_RX, ch, gain) != 0) {
++  size_t control_channel = rf_soapy_rx_gain_control_channel(handler, ch);
++  if (SoapySDRDevice_setGain(handler->device, SOAPY_SDR_RX, control_channel, gain) != 0) {
+     printf("setGain fail: %s\n", SoapySDRDevice_lastError());
+     return SRSRAN_ERROR;
+   }
++  if (handler->physical_channel_offset == 1) {
++    printf("PAVONIS_SRSRAN_SOAPY_RX_GAIN_MAP stream_channel=%zu control_channel=%zu requested_db=%.2f readback_db=%.2f\n",
++           rf_soapy_physical_channel(handler, ch),
++           control_channel,
++           gain,
++           SoapySDRDevice_getGain(handler->device, SOAPY_SDR_RX, control_channel));
++  }
+   return SRSRAN_SUCCESS;
+ }
+ 
+@@ -729,7 +791,8 @@ int rf_soapy_set_tx_gain(void* h, double gain)
+ int rf_soapy_set_tx_gain_ch(void* h, uint32_t ch, double gain)
+ {
+   rf_soapy_handler_t* handler = (rf_soapy_handler_t*)h;
+-  if (SoapySDRDevice_setGain(handler->device, SOAPY_SDR_TX, ch, gain) != 0) {
++  if (SoapySDRDevice_setGain(
++          handler->device, SOAPY_SDR_TX, rf_soapy_physical_channel(handler, ch), gain) != 0) {
+     printf("setGain fail: %s\n", SoapySDRDevice_lastError());
+     return SRSRAN_ERROR;
+   }
+@@ -740,14 +803,14 @@ int rf_soapy_set_tx_gain_ch(void* h, uint32_t ch, double gain)
+ double rf_soapy_get_rx_gain(void* h)
+ {
+   rf_soapy_handler_t* handler = (rf_soapy_handler_t*)h;
+-  return SoapySDRDevice_getGain(handler->device, SOAPY_SDR_RX, 0);
++  return SoapySDRDevice_getGain(handler->device, SOAPY_SDR_RX, rf_soapy_rx_gain_control_channel(handler, 0));
+ }
+ 
+ // Return gain of first channel
+ double rf_soapy_get_tx_gain(void* h)
+ {
+   rf_soapy_handler_t* handler = (rf_soapy_handler_t*)h;
+-  return SoapySDRDevice_getGain(handler->device, SOAPY_SDR_TX, 0);
++  return SoapySDRDevice_getGain(handler->device, SOAPY_SDR_TX, rf_soapy_physical_channel(handler, 0));
+ }
+ 
+ srsran_rf_info_t* rf_soapy_get_info(void* h)
+@@ -765,7 +828,8 @@ double rf_soapy_set_rx_freq(void* h, uint32_t ch, double freq)
+   rf_soapy_handler_t* handler = (rf_soapy_handler_t*)h;
+ 
+   for (uint32_t i = 0; i < handler->num_rx_channels; i++) {
+-    if (SoapySDRDevice_setFrequency(handler->device, SOAPY_SDR_RX, i, freq, NULL) != 0) {
++    if (SoapySDRDevice_setFrequency(
++            handler->device, SOAPY_SDR_RX, rf_soapy_physical_channel(handler, i), freq, NULL) != 0) {
+       printf("setFrequency fail: %s\n", SoapySDRDevice_lastError());
+       return SRSRAN_ERROR;
+     }
+@@ -775,19 +839,22 @@ double rf_soapy_set_rx_freq(void* h, uint32_t ch, double freq)
+   rf_soapy_rx_wait_lo_locked(handler);
+ 
+   // Return actual frequency for channel 0
+-  return SoapySDRDevice_getFrequency(handler->device, SOAPY_SDR_RX, 0);
++  return SoapySDRDevice_getFrequency(
++      handler->device, SOAPY_SDR_RX, rf_soapy_physical_channel(handler, 0));
+ }
+ 
+ double rf_soapy_set_tx_freq(void* h, uint32_t ch, double freq)
+ {
+   rf_soapy_handler_t* handler = (rf_soapy_handler_t*)h;
+   for (uint32_t i = 0; i < handler->num_tx_channels; i++) {
+-    if (SoapySDRDevice_setFrequency(handler->device, SOAPY_SDR_TX, i, freq, NULL) != 0) {
++    if (SoapySDRDevice_setFrequency(
++            handler->device, SOAPY_SDR_TX, rf_soapy_physical_channel(handler, i), freq, NULL) != 0) {
+       printf("setFrequency fail: %s\n", SoapySDRDevice_lastError());
+       return SRSRAN_ERROR;
+     }
+   }
+-  return SoapySDRDevice_getFrequency(handler->device, SOAPY_SDR_TX, 0);
++  return SoapySDRDevice_getFrequency(
++      handler->device, SOAPY_SDR_TX, rf_soapy_physical_channel(handler, 0));
+ }
+ 
+ void rf_soapy_get_time(void* h, time_t* secs, double* frac_secs)
+diff --git a/lib/src/radio/radio.cc b/lib/src/radio/radio.cc
+index 8124185e6..25f660898 100644
+--- a/lib/src/radio/radio.cc
++++ b/lib/src/radio/radio.cc
+@@ -24,12 +24,19 @@
+ #include "srsran/common/string_helpers.h"
+ #include "srsran/config.h"
+ #include "srsran/support/srsran_assert.h"
++#include <cstdlib>
+ #include <list>
+ #include <string>
+ #include <unistd.h>
+ 
+ namespace srsran {
+ 
++static bool pavonis_radio_env_enabled(const char* name)
++{
++  const char* value = std::getenv(name);
++  return value != nullptr && value[0] != '\0' && value[0] != '0';
++}
++
+ radio::radio()
+ {
+   zeros.resize(SRSRAN_SF_LEN_MAX, 0);
+@@ -572,8 +579,13 @@ bool radio::tx_dev(const uint32_t& device_idx, rf_buffer_interface& buffer, cons
+   } else if (past_nsamples < 0 and not is_start_of_burst) {
+     // if the gap is bigger than TX_MAX_GAP_ZEROS, stop burst
+     if (fabs(srsran_timestamp_real(&ts_overlap)) > tx_max_gap_zeros) {
+-      logger.info("Detected RF gap of %.1f us. Sending end-of-burst.", srsran_timestamp_real(&ts_overlap) * 1.0e6);
+-      tx_end_nolock();
++      if (pavonis_radio_env_enabled("PAVONIS_RADIO_SKIP_RF_GAP_TX_END")) {
++        logger.info("Detected RF gap of %.1f us. Skipping end-of-burst due to PAVONIS_RADIO_SKIP_RF_GAP_TX_END.",
++                    srsran_timestamp_real(&ts_overlap) * 1.0e6);
++      } else {
++        logger.info("Detected RF gap of %.1f us. Sending end-of-burst.", srsran_timestamp_real(&ts_overlap) * 1.0e6);
++        tx_end_nolock();
++      }
+     } else {
+       logger.debug("Detected RF gap of %.1f us. Tx'ing zeroes.", srsran_timestamp_real(&ts_overlap) * 1.0e6);
+       // Otherwise, transmit zeros
+-- 
+2.53.0
+

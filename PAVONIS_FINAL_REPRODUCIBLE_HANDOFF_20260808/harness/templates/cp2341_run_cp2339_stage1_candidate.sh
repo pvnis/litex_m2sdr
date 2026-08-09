@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ART="${ART:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
+STAMP="${STAMP:-$(date -u +%Y%m%dT%H%M%SZ)CP2341_CP2339_STAGE1_CANDIDATE}"
+TAG="${TAG:-codex_stage6_cp2341_cp2339_stage1_candidate}"
+
+export ART STAMP TAG
+export PAVONIS_PRACH_DEMOD_INPUT_STAGE1_CANDIDATE_LIST_OVERRIDE="${PAVONIS_PRACH_DEMOD_INPUT_STAGE1_CANDIDATE_LIST_OVERRIDE:-80:0.5:-6500,-64:0.5:-6500,-448:-0.5:31000,-448:-0.5:29000,16:-0.5:-25000,64:-0.5:-25000,120:0:0,-224:-0.5:60000,-96:0.5:24000,-448:0.5:48000,-224:0.5:49000,-192:-0.5:20000,-192:-0.5:35000,-192:-0.5:45000,64:-0.5:5000,64:-0.5:10000,64:-0.5:15000,64:-0.5:20000}"
+
+exec bash "$ART/cp2337_run_ta_offset_preserve_command.sh"

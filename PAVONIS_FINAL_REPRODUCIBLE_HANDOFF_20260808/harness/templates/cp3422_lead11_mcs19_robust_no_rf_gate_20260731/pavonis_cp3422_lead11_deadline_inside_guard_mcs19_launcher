@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE_BIN="${PAVONIS_GNB_BASE_BIN:-@REMOTE_HOME@/CLionProjects/ocudu/build-clion/apps/gnb/gnb}"
+BASE_SHA="${PAVONIS_GNB_BASE_SHA:-cf33689670b6d9e8bace5102a930fbb00bdab46b9cfa1aad2dbba6c10a4c1d78}"
+CONFIG_LAUNCHER="${PAVONIS_CP3422_CONFIG_LAUNCHER:-@REMOTE_HOME@/pavonis_cp3397_pusch_mcs19_logwarning_config_launcher}"
+CONFIG_LAUNCHER_SHA="${PAVONIS_CP3422_CONFIG_LAUNCHER_SHA:-863e1e5a7fbadd4da92e17ae62b82fd06bd78a808fcbc26e58cda145aa7b1135}"
+
+TX_LEAD_NS=11000000
+PRACH_TIMING_COMPENSATION_SAMPLES=126564
+NON_PRACH_NEGATIVE_SHIFT_SAMPLES=-125918
+NON_PRACH_POSITIVE_SHIFT_SAMPLES=-122598
+EDGE_CALIBRATION_SAMPLES=-126560
+EDGE_SCHEDULER_ERROR_SAMPLES=0
+DEADLINE_GUARD_US=100
+SUMMARY_PERIOD=10000
+
+actual_base_sha="$(sha256sum "$BASE_BIN" | awk '{print $1}')"
+actual_config_launcher_sha="$(sha256sum "$CONFIG_LAUNCHER" | awk '{print $1}')"
+if [[ "$actual_base_sha" != "$BASE_SHA" ]]; then
+  printf 'CP3422_BASE_GNB_HASH_MISMATCH\n' >&2
+  exit 63
+fi
+if [[ "$actual_config_launcher_sha" != "$CONFIG_LAUNCHER_SHA" ]]; then
+  printf 'CP3422_CONFIG_LAUNCHER_HASH_MISMATCH\n' >&2
+  exit 64
+fi
+
+printf 'PAVONIS_CP3422_LEAD11_DEADLINE_INSIDE_GUARD_MCS19_LAUNCHER_ACTIVE lead_ns=%s prach_comp_samples=%s nonprach_negative=%s nonprach_positive=%s edge_calibration=%s edge_scheduler_error=%s deadline_guard_us=%s inside_guard=1 summary_period=%s\n' \
+  "$TX_LEAD_NS" \
+  "$PRACH_TIMING_COMPENSATION_SAMPLES" \
+  "$NON_PRACH_NEGATIVE_SHIFT_SAMPLES" \
+  "$NON_PRACH_POSITIVE_SHIFT_SAMPLES" \
+  "$EDGE_CALIBRATION_SAMPLES" \
+  "$EDGE_SCHEDULER_ERROR_SAMPLES" \
+  "$DEADLINE_GUARD_US" \
+  "$SUMMARY_PERIOD"
+
+if [[ "${PAVONIS_CP3422_VALIDATE_ONLY:-0}" == 1 ]]; then
+  printf 'PAVONIS_CP3422_VALIDATE_ONLY=PASS base_sha=%s config_launcher_sha=%s inside_guard=1 max_mcs=19\n' \
+    "$actual_base_sha" "$actual_config_launcher_sha"
+  exit 0
+fi
+
+args=("$@")
+config_index=-1
+for ((i = 0; i < ${#args[@]}; ++i)); do
+  if [[ "${args[$i]}" == "-c" ]]; then
+    ((i + 1 < ${#args[@]}))
+    config_index=$((i + 1))
+    break
+  fi
+done
+((config_index >= 0))
+
+source_config="${args[$config_index]}"
+[[ "$source_config" == /*.yml && -f "$source_config" ]]
+target_dir="${source_config%.yml}.cp3397_pusch_mcs19_logwarning"
+target_config="$target_dir/gnb-run.yml"
+
+PAVONIS_GNB_BASE_BIN="$BASE_BIN" \
+PAVONIS_GNB_BASE_SHA="$BASE_SHA" \
+PAVONIS_CP3397_CONFIG_ONLY=1 \
+  "$CONFIG_LAUNCHER" "${args[@]}"
+[[ -f "$target_config" ]]
+[[ "$(grep -c '^  pusch:$' "$target_config")" == 1 ]]
+[[ "$(grep -c '^    max_ue_mcs: 19$' "$target_config")" == 1 ]]
+[[ "$(grep -c '^  all_level: warning$' "$target_config")" == 1 ]]
+[[ "$(grep -c '^  all_level: info$' "$target_config")" == 0 ]]
+
+export PAVONIS_PUCCH_F1_INCLUDE_NATIVE_CANDIDATE=1
+export M2SDR_SOAPY_TX_TIME_OFFSET_NS="$TX_LEAD_NS"
+export M2SDR_SOAPY_TX_WORKER_SUMMARY_PERIOD="$SUMMARY_PERIOD"
+export M2SDR_SOAPY_TX_RELEASE_SUMMARY_PERIOD="$SUMMARY_PERIOD"
+export PAVONIS_SOAPY_VIRTUAL_TIME_OFFSET_NS=0
+export PAVONIS_PRACH_TIMING_COMPENSATION_SAMPLES="$PRACH_TIMING_COMPENSATION_SAMPLES"
+export PAVONIS_PRACH_TIMING_COMPENSATION_REPORT_SLOT_OFFSET=0
+export PAVONIS_LOWER_PHY_UL_RX_TIMESTAMP_OFFSET_SAMPLES=0
+export OCUDU_SOAPY_TX_DEADLINE_WRITE_GUARD_US="$DEADLINE_GUARD_US"
+export OCUDU_SOAPY_TX_DEADLINE_WRITE_INSIDE_GUARD=1
+export OCUDU_SOAPY_TX_SUMMARY_PERIOD="$SUMMARY_PERIOD"
+export PAVONIS_SOAPY_TX_DEADLINE_BREAK_TRACE=1
+export PAVONIS_SOAPY_TX_DEADLINE_BREAK_TRACE_LIMIT=64
+
+export PAVONIS_NON_PRACH_UL_RX_TIMESTAMP_OFFSET_SAMPLES="$NON_PRACH_NEGATIVE_SHIFT_SAMPLES"
+export PAVONIS_NON_PRACH_UL_RX_OFFSET_FROM_STAGE1=1
+export PAVONIS_NON_PRACH_UL_RX_OFFSET_NEGATIVE_SHIFT_SAMPLES="$NON_PRACH_NEGATIVE_SHIFT_SAMPLES"
+export PAVONIS_NON_PRACH_UL_RX_OFFSET_POSITIVE_SHIFT_SAMPLES="$NON_PRACH_POSITIVE_SHIFT_SAMPLES"
+export PAVONIS_NON_PRACH_UL_RX_OFFSET_FROM_PRACH_EDGE=1
+export PAVONIS_NON_PRACH_UL_RX_OFFSET_EDGE_INCLUDE_RAR_TA=1
+export PAVONIS_NON_PRACH_UL_RX_OFFSET_EDGE_CALIBRATION_SAMPLES="$EDGE_CALIBRATION_SAMPLES"
+export PAVONIS_NON_PRACH_UL_RX_OFFSET_EDGE_SCHEDULER_ERROR_SAMPLES="$EDGE_SCHEDULER_ERROR_SAMPLES"
+export PAVONIS_NON_PRACH_UL_RX_OFFSET_EDGE_BLOCK_SIZE=8
+export PAVONIS_NON_PRACH_UL_RX_OFFSET_EDGE_HOST_ACTIVE_STOP_SAMPLES=10404
+export PAVONIS_NON_PRACH_UL_RX_OFFSET_TRACE_LIMIT=64
+export PAVONIS_NON_PRACH_UL_RX_PIPELINE_DEPTH_SLOTS=40
+export PAVONIS_NON_PRACH_UL_RX_CFO_HZ=-4000
+
+printf 'PAVONIS_CP3422_RUNTIME_EXPORTS prach_comp_samples=%s nonprach_negative=%s nonprach_positive=%s edge_calibration=%s edge_scheduler_error=%s deadline_guard_us=%s inside_guard=%s max_mcs=19 target_config_sha=%s\n' \
+  "$PAVONIS_PRACH_TIMING_COMPENSATION_SAMPLES" \
+  "$PAVONIS_NON_PRACH_UL_RX_OFFSET_NEGATIVE_SHIFT_SAMPLES" \
+  "$PAVONIS_NON_PRACH_UL_RX_OFFSET_POSITIVE_SHIFT_SAMPLES" \
+  "$PAVONIS_NON_PRACH_UL_RX_OFFSET_EDGE_CALIBRATION_SAMPLES" \
+  "$PAVONIS_NON_PRACH_UL_RX_OFFSET_EDGE_SCHEDULER_ERROR_SAMPLES" \
+  "$OCUDU_SOAPY_TX_DEADLINE_WRITE_GUARD_US" \
+  "$OCUDU_SOAPY_TX_DEADLINE_WRITE_INSIDE_GUARD" \
+  "$(sha256sum "$target_config" | awk '{print $1}')"
+
+if [[ "${PAVONIS_CP3422_CONFIG_ONLY:-0}" == 1 ]]; then
+  exit 0
+fi
+
+args[$config_index]="$target_config"
+exec "$BASE_BIN" "${args[@]}"

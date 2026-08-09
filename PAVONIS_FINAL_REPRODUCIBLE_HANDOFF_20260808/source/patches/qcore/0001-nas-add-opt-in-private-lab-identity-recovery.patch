@@ -1,0 +1,215 @@
+From 6272827c3b80bf9fb01a6369c33a3360ebbcd993 Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 16:15:52 +0200
+Subject: [PATCH 1/3] nas: add opt-in private-lab identity recovery
+
+CP2360-CP2370 showed that a phone can retain a temporary identity across isolated core restarts. Add default-off, cached recovery paths for unknown updates and nonlocal temporary/home identities while preserving normal standards-default rejection. Include focused synthetic-identity tests; no private subscriber material is present.
+---
+ .../ue_associated/nas/registration.rs         | 73 ++++++++++++++++---
+ tests/tests/registration_foreign_guti.rs      | 24 ++++++
+ tests/tests/registration_foreign_supi.rs      | 26 +++++++
+ .../registration_unknown_update_fallback.rs   | 23 ++++++
+ 4 files changed, 135 insertions(+), 11 deletions(-)
+ create mode 100644 tests/tests/registration_foreign_guti.rs
+ create mode 100644 tests/tests/registration_foreign_supi.rs
+ create mode 100644 tests/tests/registration_unknown_update_fallback.rs
+
+diff --git a/qcore/src/procedures/ue_associated/nas/registration.rs b/qcore/src/procedures/ue_associated/nas/registration.rs
+index 3b1d524..3afc7a5 100644
+--- a/qcore/src/procedures/ue_associated/nas/registration.rs
++++ b/qcore/src/procedures/ue_associated/nas/registration.rs
+@@ -5,6 +5,34 @@ use oxirush_nas::{
+     Nas5gmmMessage, Nas5gsMessage, NasFGsMobileIdentity, NasMessageContainer,
+     NasUeSecurityCapability, decode_nas_5gs_message,
+ };
++use std::sync::OnceLock;
++
++fn allow_foreign_guti_identity_fallback() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        std::env::var("PAVONIS_QCORE_ALLOW_FOREIGN_GUTI_IDENTITY_FALLBACK")
++            .map(|value| value != "0")
++            .unwrap_or(false)
++    })
++}
++
++fn allow_foreign_supi_home_plmn() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        std::env::var("PAVONIS_QCORE_ALLOW_FOREIGN_SUPI_HOME_PLMN")
++            .map(|value| value != "0")
++            .unwrap_or(false)
++    })
++}
++
++fn allow_unknown_update_identity_fallback() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        std::env::var("PAVONIS_QCORE_ALLOW_UNKNOWN_UPDATE_IDENTITY_FALLBACK")
++            .map(|value| value != "0")
++            .unwrap_or(false)
++    })
++}
+ 
+ impl<'a, B: NasBase> NasProcedure<'a, B> {
+     pub async fn registration(
+@@ -104,7 +132,10 @@ impl<'a, B: NasBase> NasProcedure<'a, B> {
+         let is_registration_update = request.fgs_registration_type.value & REGISTRATION_TYPE_MASK
+             != REGISTRATION_TYPE_INITIAL;
+ 
+-        if is_registration_update && !self.ue.nas.security_activated() {
++        if is_registration_update
++            && !self.ue.nas.security_activated()
++            && !allow_unknown_update_identity_fallback()
++        {
+             // TS24.501 5.5.1.3.5
+             // "The UE shall enter the state 5GMM-DEREGISTERED.NORMAL-SERVICE. The UE shall delete any mapped 5G NAS
+             // security context or partial native 5G NAS security context."
+@@ -115,6 +146,12 @@ impl<'a, B: NasBase> NasProcedure<'a, B> {
+                 ),
+             ));
+         };
++        if is_registration_update && !self.ue.nas.security_activated() {
++            warn!(
++                self.logger,
++                "PAVONIS_QCORE_ALLOW_UNKNOWN_UPDATE_IDENTITY_FALLBACK active: treating registration update without recoverable NAS context as unknown temporary identity"
++            );
++        }
+ 
+         // The UE is authenticated based on cleartext IEs in the outer message.  Any non-cleartext IEs (such as those
+         // governing session reactivation) come in a NAS message container (TS24.501, 4.4.6).
+@@ -238,16 +275,30 @@ impl<'a, B: NasBase> NasProcedure<'a, B> {
+             };
+ 
+         if plmn != self.api.config().plmn {
+-            // This will cause authentication to fail, because the UE will form its
+-            // serving network name using its MCC/MNC, and we form ours using our MCC/MNC.
+-            return Err(NasProcedureError::Fail(
+-                FGMM_CAUSE_PLMN_NOT_ALLOWED,
+-                anyhow!(
+-                    "UE PLMN {:?} doesn't match ours {:?}",
+-                    &plmn,
+-                    self.api.config().plmn
+-                ),
+-            ));
++            match &ret.0 {
++                RegistrationType::Guti if allow_foreign_guti_identity_fallback() => {
++                    warn!(
++                        self.logger,
++                        "PAVONIS_QCORE_ALLOW_FOREIGN_GUTI_IDENTITY_FALLBACK active: treating nonmatching 5G-GUTI as unknown temporary identity"
++                    );
++                }
++                RegistrationType::Supi(_) if allow_foreign_supi_home_plmn() => {
++                    warn!(
++                        self.logger,
++                        "PAVONIS_QCORE_ALLOW_FOREIGN_SUPI_HOME_PLMN active: allowing foreign SUPI home PLMN through normal subscriber authentication"
++                    );
++                }
++                _ => {
++                    return Err(NasProcedureError::Fail(
++                        FGMM_CAUSE_PLMN_NOT_ALLOWED,
++                        anyhow!(
++                            "UE PLMN {:?} doesn't match ours {:?}",
++                            &plmn,
++                            self.api.config().plmn
++                        ),
++                    ));
++                }
++            }
+         }
+ 
+         Ok(ret)
+diff --git a/tests/tests/registration_foreign_guti.rs b/tests/tests/registration_foreign_guti.rs
+new file mode 100644
+index 0000000..44d6b1a
+--- /dev/null
++++ b/tests/tests/registration_foreign_guti.rs
+@@ -0,0 +1,24 @@
++use qcore_tests::framework::*;
++
++#[async_std::test]
++async fn registration_foreign_guti_uses_identity_procedure() -> anyhow::Result<()> {
++    unsafe {
++        std::env::set_var("PAVONIS_QCORE_ALLOW_FOREIGN_GUTI_IDENTITY_FALLBACK", "1");
++    }
++
++    let (du, _qc, _dn, builder, _logger) = init_f1ap().await?;
++    let mut ue = builder.f1ap_ue(&du).build().await?;
++
++    // Foreign PLMN and unknown AMF IDs must trigger identity retrieval, not skip authentication.
++    ue.use_guti([9, 241, 7, 5, 5, 5, 0, 0, 0, 0]);
++    ue.perform_rrc_setup().await?;
++    ue.data.guti = None;
++
++    ue.handle_identity_procedure().await?;
++    ue.handle_nas_authentication().await?;
++    ue.handle_nas_security_mode().await?;
++    ue.handle_rrc_security_mode().await?;
++    ue.handle_capability_enquiry().await?;
++    ue.handle_nas_registration_accept().await?;
++    ue.handle_nas_configuration_update().await
++}
+diff --git a/tests/tests/registration_foreign_supi.rs b/tests/tests/registration_foreign_supi.rs
+new file mode 100644
+index 0000000..4d09dcf
+--- /dev/null
++++ b/tests/tests/registration_foreign_supi.rs
+@@ -0,0 +1,26 @@
++use qcore_tests::{MockDu, framework::*};
++use xxap::PlmnIdentity;
++
++const SERVING_NETWORK_NAME: &str = "5G:mnc070.mcc901.3gppnetwork.org";
++
++#[async_std::test]
++async fn registration_foreign_supi_uses_normal_authentication() -> anyhow::Result<()> {
++    unsafe {
++        std::env::set_var("PAVONIS_QCORE_ALLOW_FOREIGN_SUPI_HOME_PLMN", "1");
++    }
++
++    let (du, _qc, _dn, builder, _logger) = TestFrameworkBuilder::<MockDu>::new()
++        .serving_network(PlmnIdentity([0x09, 0xf1, 0x07]), SERVING_NETWORK_NAME)
++        .build()
++        .await?;
++    let mut ue = builder.f1ap_ue(&du).build().await?;
++    ue.use_serving_network_name(SERVING_NETWORK_NAME);
++
++    ue.perform_rrc_setup().await?;
++    ue.handle_nas_authentication().await?;
++    ue.handle_nas_security_mode().await?;
++    ue.handle_rrc_security_mode().await?;
++    ue.handle_capability_enquiry().await?;
++    ue.handle_nas_registration_accept().await?;
++    ue.handle_nas_configuration_update().await
++}
+diff --git a/tests/tests/registration_unknown_update_fallback.rs b/tests/tests/registration_unknown_update_fallback.rs
+new file mode 100644
+index 0000000..dea8ec2
+--- /dev/null
++++ b/tests/tests/registration_unknown_update_fallback.rs
+@@ -0,0 +1,23 @@
++use qcore_tests::framework::*;
++
++#[async_std::test]
++async fn registration_unknown_update_uses_identity_fallback() -> anyhow::Result<()> {
++    unsafe {
++        std::env::set_var("PAVONIS_QCORE_ALLOW_UNKNOWN_UPDATE_IDENTITY_FALLBACK", "1");
++    }
++
++    let (gnb, _qc, _dn, builder, _logger) = init_ngap().await?;
++    let mut ue = builder.ngap_ue(&gnb).build().await?;
++
++    ue.use_guti([0, 241, 16, 1, 1, 0, 0, 0, 0, 9]);
++    ue.send_nas_registration_update().await?;
++    ue.data.guti = None;
++
++    ue.handle_identity_procedure().await?;
++    ue.handle_nas_authentication().await?;
++    ue.handle_nas_security_mode().await?;
++    gnb.handle_initial_context_setup(&mut ue).await?;
++    gnb.send_ue_radio_capability_info(&mut ue).await?;
++    ue.handle_nas_registration_accept().await?;
++    ue.handle_nas_configuration_update().await
++}
+-- 
+2.53.0
+

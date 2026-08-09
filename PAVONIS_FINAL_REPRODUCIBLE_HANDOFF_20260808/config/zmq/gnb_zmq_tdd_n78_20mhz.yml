@@ -1,0 +1,59 @@
+gnb_id: 332
+
+cu_cp:
+  inactivity_timer: 7200
+  amf:
+    addr: 127.0.0.1
+    bind_addr: 127.0.0.2
+    supported_tracking_areas:
+      - tac: 1
+        plmn_list:
+          - plmn: "00101"
+            tai_slice_support_list:
+              - sst: 1
+                sd: 0
+
+ru_sdr:
+  device_driver: zmq
+  device_args: tx_port=tcp://127.0.0.1:2000,rx_port=tcp://127.0.0.1:2001,base_srate=23040000
+  srate: 23.04
+  tx_gain: 75
+  rx_gain: 75
+
+cell_cfg:
+  dl_arfcn: 626000
+  band: 78
+  channel_bandwidth_MHz: 20
+  common_scs: 30
+  plmn: "00101"
+  tac: 1
+  slicing:
+    - sst: 1
+      sd: 0
+  pci: 1
+  tdd_ul_dl_cfg:
+    dl_ul_tx_period: 10
+    nof_dl_slots: 6
+    nof_dl_symbols: 8
+    nof_ul_slots: 3
+    nof_ul_symbols: 0
+  nof_antennas_ul: 1
+  nof_antennas_dl: 1
+  pdsch:
+    mcs_table: qam256
+  pusch:
+    mcs_table: qam64
+  pucch:
+    sr_period_ms: 10
+  prach:
+    prach_config_index: 159
+
+log:
+  filename: /tmp/gnb_zmq.log
+  all_level: info
+  lib_level: info
+  broadcast_enabled: true
+  hex_max_size: 1024
+
+metrics:
+  autostart_stdout_metrics: 1

@@ -1,0 +1,7 @@
+# Sanitized structure-only example.
+# Replace the table name and both values in a private local file.
+# Never commit the resulting file.
+
+[imsi-REPLACE_WITH_PRIVATE_TEST_IDENTITY]
+ki = "REPLACE_WITH_PRIVATE_TEST_KEY"
+opc = "REPLACE_WITH_PRIVATE_TEST_OPERATOR_KEY"

@@ -1,0 +1,753 @@
+From 9e610a94ad90a84ea127f6a2cafaf5705c97167c Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 16:22:09 +0200
+Subject: [PATCH 2/3] gnb: add opt-in phone primer compatibility path
+
+CP2985 and CP3114 require explicit private-lab scheduler, HARQ, SR/CSI, user-plane container, and release-lifecycle accommodations before the OCUDU handoff. These are known workarounds, including duplicate reactive downlink transmission and bounded follow-up UL grants; all remain disabled by default.
+---
+ srsenb/hdr/stack/upper/gtpu_pdcp_adapter.h |  34 +++
+ srsenb/src/stack/upper/gtpu.cc             |  80 +++++-
+ srsenb/src/stack/upper/pdcp.cc             |  39 +++
+ srsgnb/src/stack/mac/mac_nr.cc             | 287 ++++++++++++++++++++-
+ srsgnb/src/stack/ngap/ngap.cc              |  21 ++
+ srsgnb/src/stack/rrc/cell_asn1_config.cc   |  32 ++-
+ srsgnb/src/stack/rrc/rrc_nr_ue.cc          |  20 +-
+ 7 files changed, 507 insertions(+), 6 deletions(-)
+
+diff --git a/srsenb/hdr/stack/upper/gtpu_pdcp_adapter.h b/srsenb/hdr/stack/upper/gtpu_pdcp_adapter.h
+index 9373d7399..af30249b0 100644
+--- a/srsenb/hdr/stack/upper/gtpu_pdcp_adapter.h
++++ b/srsenb/hdr/stack/upper/gtpu_pdcp_adapter.h
+@@ -25,6 +25,9 @@
+ #include "srsran/common/bearer_manager.h"
+ #include "srsran/interfaces/enb_gtpu_interfaces.h"
+ #include "srsran/srslog/logger.h"
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
+ 
+ namespace srsenb {
+ 
+@@ -43,6 +46,21 @@ public:
+   void write_pdu(uint16_t rnti, uint32_t lcid, srsran::unique_byte_buffer_t pdu) override
+   {
+     auto bearer = bearers->get_lcid_bearer(rnti, lcid);
++    uint32_t row = 0;
++    if (pavonis_nr_userplane_trace_enabled() && pavonis_nr_userplane_trace_take(row)) {
++      const uint32_t bytes = pdu != nullptr ? pdu->N_bytes : 0;
++      const uint32_t first8 = bytes > 0 ? pdu->msg[0] : 0;
++      logger.warning("PAVONIS_NR_USERPLANE_TRACE stage=adapter row=%u rnti=0x%x lcid=%u bytes=%u "
++                     "first8=0x%02x bearer_valid=%u eps_bearer=%u rat=%u",
++                     row,
++                     rnti,
++                     lcid,
++                     bytes,
++                     first8,
++                     bearer.is_valid(),
++                     bearer.eps_bearer_id,
++                     static_cast<unsigned>(bearer.rat));
++    }
+     if (not bearer.is_valid()) {
+       logger.error("Bearer rnti=0x%x, lcid=%d not found", rnti, lcid);
+       return;
+@@ -75,6 +93,22 @@ public:
+   }
+ 
+ private:
++  static bool pavonis_nr_userplane_trace_enabled()
++  {
++    static const bool enabled = []() {
++      const char* value = std::getenv("PAVONIS_NR_USERPLANE_TRACE");
++      return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
++    }();
++    return enabled;
++  }
++
++  static bool pavonis_nr_userplane_trace_take(uint32_t& row)
++  {
++    static std::atomic<uint32_t> rows{0};
++    row = rows.fetch_add(1, std::memory_order_relaxed);
++    return row < 128;
++  }
++
+   srslog::basic_logger& logger;
+   gtpu*                 gtpu_obj     = nullptr;
+   pdcp_interface_gtpu*  pdcp_lte_obj = nullptr;
+diff --git a/srsenb/src/stack/upper/gtpu.cc b/srsenb/src/stack/upper/gtpu.cc
+index 6261cb500..65c52b12e 100644
+--- a/srsenb/src/stack/upper/gtpu.cc
++++ b/srsenb/src/stack/upper/gtpu.cc
+@@ -29,6 +29,9 @@
+ #include "srsran/interfaces/enb_pdcp_interfaces.h"
+ #include "srsran/support/srsran_assert.h"
+ 
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
+ #include <errno.h>
+ #include <linux/ip.h>
+ #include <sys/socket.h>
+@@ -38,6 +41,35 @@ using namespace srsran;
+ 
+ namespace srsenb {
+ 
++namespace {
++
++bool pavonis_nr_userplane_trace_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_NR_USERPLANE_TRACE");
++    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++bool pavonis_nr_gtpu_pdu_session_container_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_NR_GTPU_PDU_SESSION_CONTAINER");
++    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++bool pavonis_nr_userplane_trace_take(uint32_t& row)
++{
++  static std::atomic<uint32_t> rows{0};
++  row = rows.fetch_add(1, std::memory_order_relaxed);
++  return row < 256;
++}
++
++} // namespace
++
+ // ensure consistent formatting
+ #define TEID_IN_FMT "TEID In=0x%x"
+ #define TEID_OUT_FMT "TEID Out=0x%x"
+@@ -453,6 +485,19 @@ void gtpu::stop()
+ void gtpu::write_pdu(uint16_t rnti, uint32_t eps_bearer_id, srsran::unique_byte_buffer_t pdu)
+ {
+   srsran::span<gtpu_tunnel_manager::bearer_teid_pair> teids = tunnels.find_rnti_bearer_tunnels(rnti, eps_bearer_id);
++  uint32_t row = 0;
++  if (pavonis_nr_userplane_trace_enabled() && pavonis_nr_userplane_trace_take(row)) {
++    const uint32_t bytes = pdu != nullptr ? pdu->N_bytes : 0;
++    const uint32_t first8 = bytes > 0 ? pdu->msg[0] : 0;
++    logger.warning("PAVONIS_NR_USERPLANE_TRACE stage=gtpu_lookup row=%u rnti=0x%x eps_bearer=%u bytes=%u "
++                   "first8=0x%02x tunnel_count=%u",
++                   row,
++                   rnti,
++                   eps_bearer_id,
++                   bytes,
++                   first8,
++                   static_cast<unsigned>(teids.size()));
++  }
+   if (teids.empty()) {
+     logger.warning("The rnti=0x%x, eps-BearerID=%d does not have any pdcp_active tunnel", rnti, eps_bearer_id);
+     return;
+@@ -472,12 +517,24 @@ void gtpu::send_pdu_to_tunnel(const gtpu_tunnel& tx_tun, srsran::unique_byte_buf
+   }
+ 
+   gtpu_header_t header;
++  const uint32_t payload_bytes = pdu->N_bytes;
+   header.flags        = GTPU_FLAGS_VERSION_V1 | GTPU_FLAGS_GTP_PROTOCOL;
+   header.message_type = GTPU_MSG_DATA_PDU;
+-  header.length       = pdu->N_bytes;
++  header.length       = payload_bytes;
+   header.teid         = tx_tun.teid_out;
+ 
+-  if (pdcp_sn >= 0) {
++  const bool add_pdu_session_container =
++      ran_type == srsran::srsran_rat_t::nr && pavonis_nr_gtpu_pdu_session_container_enabled();
++  if (add_pdu_session_container) {
++    // The standalone NR stack currently advertises and maps QFI 1 in NGAP/RRC.
++    header.flags |= GTPU_FLAGS_EXTENDED_HDR;
++    header.next_ext_hdr_type = GTPU_EXT_HEADER_PDU_SESSION_CONTAINER;
++    header.ext_buffer = {0x01, 0x10, 0x01, GTPU_EXT_NO_MORE_EXTENSION_HEADERS};
++    static std::atomic<bool> marker_logged{false};
++    if (!marker_logged.exchange(true, std::memory_order_relaxed)) {
++      logger.warning("PAVONIS_NR_GTPU_PDU_SESSION_CONTAINER active qfi=1");
++    }
++  } else if (pdcp_sn >= 0) {
+     header.flags |= GTPU_FLAGS_EXTENDED_HDR;
+     header.next_ext_hdr_type = GTPU_EXT_HEADER_PDCP_PDU_NUMBER;
+     header.ext_buffer.resize(4u);
+@@ -496,7 +553,24 @@ void gtpu::send_pdu_to_tunnel(const gtpu_tunnel& tx_tun, srsran::unique_byte_buf
+     logger.error("Error writing GTP-U Header. Flags 0x%x, Message Type 0x%x", header.flags, header.message_type);
+     return;
+   }
+-  if (sendto(fd, pdu->msg, pdu->N_bytes, MSG_EOR, (struct sockaddr*)&servaddr, sizeof(struct sockaddr_in)) < 0) {
++  const ssize_t send_rc = sendto(fd, pdu->msg, pdu->N_bytes, MSG_EOR, (struct sockaddr*)&servaddr, sizeof(struct sockaddr_in));
++  const int     send_errno = send_rc < 0 ? errno : 0;
++  uint32_t      send_row = 0;
++  if (pavonis_nr_userplane_trace_enabled() && pavonis_nr_userplane_trace_take(send_row)) {
++    logger.warning("PAVONIS_NR_USERPLANE_TRACE stage=sendto row=%u rnti=0x%x eps_bearer=%u teid_out=0x%x "
++                   "payload_bytes=%u wire_bytes=%u pdu_session_ext=%u rc=%d errno=%d",
++                   send_row,
++                   tx_tun.rnti,
++                   tx_tun.eps_bearer_id,
++                   tx_tun.teid_out,
++                   payload_bytes,
++                   pdu->N_bytes,
++                   add_pdu_session_container,
++                   static_cast<int>(send_rc),
++                   send_errno);
++  }
++  if (send_rc < 0) {
++    errno = send_errno;
+     perror("sendto");
+   }
+ }
+diff --git a/srsenb/src/stack/upper/pdcp.cc b/srsenb/src/stack/upper/pdcp.cc
+index cc30f39d9..7f2a8d85b 100644
+--- a/srsenb/src/stack/upper/pdcp.cc
++++ b/srsenb/src/stack/upper/pdcp.cc
+@@ -24,9 +24,32 @@
+ #include "srsran/interfaces/enb_gtpu_interfaces.h"
+ #include "srsran/interfaces/enb_rlc_interfaces.h"
+ #include "srsran/interfaces/enb_rrc_interface_pdcp.h"
++#include <atomic>
++#include <cstdlib>
++#include <cstring>
+ 
+ namespace srsenb {
+ 
++namespace {
++
++bool pavonis_nr_userplane_trace_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_NR_USERPLANE_TRACE");
++    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++bool pavonis_nr_userplane_trace_take(uint32_t& row)
++{
++  static std::atomic<uint32_t> rows{0};
++  row = rows.fetch_add(1, std::memory_order_relaxed);
++  return row < 128;
++}
++
++} // namespace
++
+ pdcp::pdcp(srsran::task_sched_handle task_sched_, srslog::basic_logger& logger_) :
+   task_sched(task_sched_), logger(logger_)
+ {}
+@@ -201,6 +224,22 @@ std::map<uint32_t, srsran::unique_byte_buffer_t> pdcp::get_buffered_pdus(uint16_
+ 
+ void pdcp::write_pdu(uint16_t rnti, uint32_t lcid, srsran::unique_byte_buffer_t sdu)
+ {
++  uint32_t row = 0;
++  if (lcid >= 4 && pavonis_nr_userplane_trace_enabled() && pavonis_nr_userplane_trace_take(row)) {
++    const uint32_t bytes = sdu != nullptr ? sdu->N_bytes : 0;
++    const uint32_t first24 = bytes >= 3 ? (static_cast<uint32_t>(sdu->msg[0]) << 16U) |
++                                             (static_cast<uint32_t>(sdu->msg[1]) << 8U) |
++                                             static_cast<uint32_t>(sdu->msg[2])
++                                       : 0;
++    logger.warning("PAVONIS_NR_USERPLANE_TRACE stage=pdcp_input row=%u rnti=0x%x lcid=%u bytes=%u "
++                   "first24=0x%06x user_exists=%u",
++                   row,
++                   rnti,
++                   lcid,
++                   bytes,
++                   first24,
++                   users.count(rnti) != 0);
++  }
+   if (users.count(rnti)) {
+     users[rnti].pdcp->write_pdu(lcid, std::move(sdu));
+   }
+diff --git a/srsgnb/src/stack/mac/mac_nr.cc b/srsgnb/src/stack/mac/mac_nr.cc
+index 6c257437b..7bcbcf51d 100644
+--- a/srsgnb/src/stack/mac/mac_nr.cc
++++ b/srsgnb/src/stack/mac/mac_nr.cc
+@@ -29,9 +29,158 @@
+ #include "srsran/common/time_prof.h"
+ #include "srsran/mac/mac_rar_pdu_nr.h"
+ 
++#include <atomic>
++#include <cerrno>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <string>
++#include <unistd.h>
++
+ //#define WRITE_SIB_PCAP
+ 
+ namespace srsenb {
++namespace {
++
++bool pucch_ack_trace_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_NR_PUCCH_ACK_TRACE");
++    return value != nullptr && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++bool setup_ul_trace_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_NR_SETUP_UL_TRACE");
++    return value != nullptr && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++bool setup_ack_ul_grant_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_NR_SETUP_ACK_UL_GRANT");
++    return value != nullptr && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++const std::string& setup_ack_tx_worker_trace_arm_path()
++{
++  static const std::string path = []() {
++    const char* value = std::getenv("PAVONIS_NR_TX_WORKER_TRACE_ARM_FILE_ON_SETUP_ACK");
++    return value != nullptr ? std::string(value) : std::string();
++  }();
++  return path;
++}
++
++int arm_tx_worker_trace_on_setup_ack()
++{
++  const std::string& path = setup_ack_tx_worker_trace_arm_path();
++  if (path.empty()) {
++    return 0;
++  }
++
++  static std::atomic<bool> attempted{false};
++  bool                     expected = false;
++  if (not attempted.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
++    return 0;
++  }
++
++  int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
++  if (fd >= 0) {
++    close(fd);
++    return 1;
++  }
++  return errno == EEXIST ? 1 : -errno;
++}
++
++uint32_t setup_followup_ul_grant_budget()
++{
++  static const uint32_t budget = []() {
++    const char* value = std::getenv("PAVONIS_NR_SETUP_FOLLOWUP_UL_GRANTS");
++    if (value == nullptr || *value == '\0') {
++      return 0U;
++    }
++    char*         end    = nullptr;
++    unsigned long parsed = std::strtoul(value, &end, 10);
++    if (end == value || *end != '\0' || parsed > 2048) {
++      return 0U;
++    }
++    return static_cast<uint32_t>(parsed);
++  }();
++  return budget;
++}
++
++std::atomic<uint16_t>& setup_followup_ul_grant_rnti()
++{
++  static std::atomic<uint16_t> rnti{0};
++  return rnti;
++}
++
++std::atomic<uint32_t>& setup_followup_ul_grants_remaining()
++{
++  static std::atomic<uint32_t> remaining{0};
++  return remaining;
++}
++
++uint32_t setup_followup_dl_harq_retx_budget()
++{
++  static const uint32_t budget = []() {
++    const char* value = std::getenv("PAVONIS_NR_SETUP_FOLLOWUP_DL_HARQ_RETX_ACKS");
++    if (value == nullptr || *value == '\0') {
++      return 0U;
++    }
++    char*         end    = nullptr;
++    unsigned long parsed = std::strtoul(value, &end, 10);
++    if (end == value || *end != '\0' || parsed > 16) {
++      return 0U;
++    }
++    return static_cast<uint32_t>(parsed);
++  }();
++  return budget;
++}
++
++uint32_t pdu_session_dl_harq_retx_budget()
++{
++  static const uint32_t budget = []() {
++    const char* value = std::getenv("PAVONIS_NR_PDU_SESSION_DL_HARQ_RETX_ACKS");
++    if (value == nullptr || *value == '\0') {
++      return 0U;
++    }
++    char*         end    = nullptr;
++    unsigned long parsed = std::strtoul(value, &end, 10);
++    if (end == value || *end != '\0' || parsed > 16) {
++      return 0U;
++    }
++    return static_cast<uint32_t>(parsed);
++  }();
++  return budget;
++}
++
++std::atomic<uint16_t>& setup_followup_dl_harq_retx_rnti()
++{
++  static std::atomic<uint16_t> rnti{0};
++  return rnti;
++}
++
++std::atomic<uint32_t>& setup_followup_dl_harq_retx_remaining()
++{
++  static std::atomic<uint32_t> remaining{0};
++  return remaining;
++}
++
++std::atomic<uint16_t>& pdu_session_dl_harq_retx_armed_rnti()
++{
++  static std::atomic<uint16_t> rnti{0};
++  return rnti;
++}
++
++} // namespace
+ 
+ /**
+  * @brief Handles UL PDU processing
+@@ -323,6 +472,21 @@ int mac_nr::cell_cfg(const std::vector<srsenb::sched_nr_cell_cfg_t>& nr_cells)
+ int mac_nr::ue_cfg(uint16_t rnti, const sched_nr_interface::ue_cfg_t& ue_cfg)
+ {
+   sched->ue_cfg(rnti, ue_cfg);
++  const uint32_t late_retx_budget = pdu_session_dl_harq_retx_budget();
++  if (late_retx_budget > 0) {
++    for (const sched_nr_ue_lc_ch_cfg_t& lc_ch : ue_cfg.lc_ch_to_add) {
++      if (lc_ch.lcid >= srsran::MAX_NR_SRB_ID + 1 &&
++          pdu_session_dl_harq_retx_armed_rnti().exchange(rnti, std::memory_order_relaxed) != rnti) {
++        setup_followup_dl_harq_retx_rnti().store(rnti, std::memory_order_relaxed);
++        setup_followup_dl_harq_retx_remaining().store(late_retx_budget, std::memory_order_relaxed);
++        logger.warning("PAVONIS_NR_PDU_SESSION_DL_HARQ_RETX armed rnti=0x%x lcid=%u budget=%u",
++                       rnti,
++                       lc_ch.lcid,
++                       late_retx_budget);
++        break;
++      }
++    }
++  }
+   return SRSRAN_SUCCESS;
+ }
+ 
+@@ -562,6 +726,41 @@ mac_nr::ul_sched_t* mac_nr::get_ul_sched(const srsran_slot_cfg_t& slot_cfg)
+ 
+ int mac_nr::pucch_info(const srsran_slot_cfg_t& slot_cfg, const mac_interface_phy_nr::pucch_info_t& pucch_info)
+ {
++  if (pucch_info.uci_data.cfg.ack.count > 0 && pucch_ack_trace_enabled()) {
++    static std::atomic<uint32_t> trace_rows{0};
++    uint32_t                     row = trace_rows.fetch_add(1, std::memory_order_relaxed);
++    if (row < 64) {
++      logger.warning("PAVONIS_NR_PUCCH_ACK_TRACE row=%u slot=%u rnti=0x%x ack_count=%u valid=%u ack0=%u sr=%u "
++                     "nof_csi=%u snr_db=%.3f",
++                     row,
++                     slot_cfg.idx,
++                     pucch_info.uci_data.cfg.pucch.rnti,
++                     pucch_info.uci_data.cfg.ack.count,
++                     pucch_info.uci_data.value.valid ? 1U : 0U,
++                     static_cast<unsigned>(pucch_info.uci_data.value.ack[0]),
++                     pucch_info.uci_data.value.sr,
++                     pucch_info.uci_data.cfg.nof_csi,
++                     pucch_info.csi.snr_dB);
++    }
++  }
++
++  if (pucch_info.uci_data.cfg.o_sr > 0 && setup_ul_trace_enabled()) {
++    static std::atomic<uint32_t> trace_rows{0};
++    uint32_t                     row = trace_rows.fetch_add(1, std::memory_order_relaxed);
++    if (row < 64) {
++      logger.warning("PAVONIS_NR_PUCCH_SR_TRACE row=%u slot=%u rnti=0x%x valid=%u sr=%u ack_count=%u "
++                     "nof_csi=%u snr_db=%.3f",
++                     row,
++                     slot_cfg.idx,
++                     pucch_info.uci_data.cfg.pucch.rnti,
++                     pucch_info.uci_data.value.valid ? 1U : 0U,
++                     pucch_info.uci_data.value.sr,
++                     pucch_info.uci_data.cfg.ack.count,
++                     pucch_info.uci_data.cfg.nof_csi,
++                     pucch_info.csi.snr_dB);
++    }
++  }
++
+   if (not handle_uci_data(pucch_info.uci_data.cfg.pucch.rnti, pucch_info.uci_data.cfg, pucch_info.uci_data.value)) {
+     logger.error("Error handling UCI data from PUCCH reception");
+     return SRSRAN_ERROR;
+@@ -582,14 +781,82 @@ bool mac_nr::handle_uci_data(uint16_t rnti, const srsran_uci_cfg_nr_t& cfg_, con
+   // Process HARQ-ACK
+   for (uint32_t i = 0; i < cfg_.ack.count; i++) {
+     const srsran_harq_ack_bit_t* ack_bit = &cfg_.ack.bits[i];
+-    bool                         is_ok   = (value.ack[i] == 1) and value.valid;
++    bool                         decoded_ok = (value.ack[i] == 1) and value.valid;
++    bool                         is_ok      = decoded_ok;
++    if (decoded_ok && (setup_followup_dl_harq_retx_budget() > 0 || pdu_session_dl_harq_retx_budget() > 0) &&
++        setup_followup_dl_harq_retx_rnti().load(std::memory_order_relaxed) == rnti) {
++      std::atomic<uint32_t>& remaining = setup_followup_dl_harq_retx_remaining();
++      uint32_t               current   = remaining.load(std::memory_order_relaxed);
++      while (current > 0) {
++        if (remaining.compare_exchange_weak(current, current - 1, std::memory_order_relaxed)) {
++          is_ok = false;
++          logger.warning("PAVONIS_NR_SETUP_FOLLOWUP_DL_HARQ_RETX forced_nack rnti=0x%x pid=%u remaining=%u",
++                         rnti,
++                         ack_bit->pid,
++                         current - 1);
++          break;
++        }
++      }
++    }
+     sched->dl_ack_info(rnti, 0, ack_bit->pid, 0, is_ok);
++    if (decoded_ok and setup_ack_ul_grant_enabled()) {
++      static std::atomic<uint16_t> last_injected_rnti{0};
++      uint16_t                     previous_rnti = last_injected_rnti.exchange(rnti, std::memory_order_relaxed);
++      if (previous_rnti != rnti) {
++        uint32_t followup_budget = setup_followup_ul_grant_budget();
++        if (followup_budget > 0) {
++          setup_followup_ul_grant_rnti().store(rnti, std::memory_order_relaxed);
++          setup_followup_ul_grants_remaining().store(followup_budget, std::memory_order_relaxed);
++          logger.warning(
++              "PAVONIS_NR_SETUP_FOLLOWUP_UL_GRANT armed rnti=0x%x budget=%u", rnti, followup_budget);
++        }
++        uint32_t dl_retx_budget = setup_followup_dl_harq_retx_budget();
++        if (dl_retx_budget > 0) {
++          setup_followup_dl_harq_retx_rnti().store(rnti, std::memory_order_relaxed);
++          setup_followup_dl_harq_retx_remaining().store(dl_retx_budget, std::memory_order_relaxed);
++          logger.warning(
++              "PAVONIS_NR_SETUP_FOLLOWUP_DL_HARQ_RETX armed rnti=0x%x budget=%u", rnti, dl_retx_budget);
++        }
++        int arm_result = arm_tx_worker_trace_on_setup_ack();
++        if (arm_result != 0) {
++          logger.warning("PAVONIS_NR_TX_WORKER_TRACE_ARM_ON_SETUP_ACK result=%d rnti=0x%x", arm_result, rnti);
++        }
++        sched->ul_sr_info(rnti);
++        static std::atomic<uint32_t> marker_rows{0};
++        if (marker_rows.fetch_add(1, std::memory_order_relaxed) < 32) {
++          logger.warning("PAVONIS_NR_SETUP_ACK_UL_GRANT active rnti=0x%x pid=%u", rnti, ack_bit->pid);
++        }
++      }
++    }
+     srsran::rwlock_read_guard rw_lock(rwmutex);
+     if (ue_db.contains(rnti)) {
+       ue_db[rnti]->metrics_tx(is_ok, 0 /*TODO get size of packet from scheduler somehow*/);
+     }
+   }
+ 
++  if (setup_followup_ul_grant_budget() > 0 && cfg_.o_sr > 0 && not(value.valid and value.sr > 0) &&
++      setup_followup_ul_grant_rnti().load(std::memory_order_relaxed) == rnti) {
++    std::atomic<uint32_t>& remaining = setup_followup_ul_grants_remaining();
++    uint32_t               current   = remaining.load(std::memory_order_relaxed);
++    while (current > 0) {
++      if (remaining.compare_exchange_weak(current, current - 1, std::memory_order_relaxed)) {
++        sched->ul_sr_info(rnti);
++        static std::atomic<uint32_t> marker_rows{0};
++        uint32_t                     row = marker_rows.fetch_add(1, std::memory_order_relaxed);
++        if (row < 128) {
++          logger.warning("PAVONIS_NR_SETUP_FOLLOWUP_UL_GRANT injected row=%u rnti=0x%x valid=%u sr=%u "
++                         "remaining=%u",
++                         row,
++                         rnti,
++                         value.valid,
++                         value.sr,
++                         current - 1);
++        }
++        break;
++      }
++    }
++  }
++
+   // Process SR
+   if (value.valid and value.sr > 0) {
+     sched->ul_sr_info(cfg_.pucch.rnti);
+@@ -621,6 +888,24 @@ int mac_nr::pusch_info(const srsran_slot_cfg_t& slot_cfg, mac_interface_phy_nr::
+   uint16_t rnti      = pusch_info.rnti;
+   uint32_t nof_bytes = pusch_info.pdu->N_bytes;
+ 
++  if (setup_ul_trace_enabled()) {
++    static std::atomic<uint32_t> trace_rows{0};
++    uint32_t                     row = trace_rows.fetch_add(1, std::memory_order_relaxed);
++    if (row < 64) {
++      logger.warning("PAVONIS_NR_PUSCH_TRACE row=%u slot=%u rnti=0x%x pid=%u crc=%u bytes=%u ack_count=%u "
++                     "uci_valid=%u snr_db=%.3f",
++                     row,
++                     slot_cfg.idx,
++                     rnti,
++                     pusch_info.pid,
++                     pusch_info.pusch_data.tb[0].crc ? 1U : 0U,
++                     nof_bytes,
++                     pusch_info.uci_cfg.ack.count,
++                     pusch_info.pusch_data.uci.valid ? 1U : 0U,
++                     pusch_info.csi.snr_dB);
++    }
++  }
++
+   // Handle UCI data
+   if (not handle_uci_data(rnti, pusch_info.uci_cfg, pusch_info.pusch_data.uci)) {
+     logger.error("Error handling UCI data from PUCCH reception");
+diff --git a/srsgnb/src/stack/ngap/ngap.cc b/srsgnb/src/stack/ngap/ngap.cc
+index 0a6f02f57..ec60b5477 100644
+--- a/srsgnb/src/stack/ngap/ngap.cc
++++ b/srsgnb/src/stack/ngap/ngap.cc
+@@ -23,6 +23,9 @@
+ #include "srsgnb/hdr/stack/ngap/ngap_ue.h"
+ #include "srsran/common/int_helpers.h"
+ 
++#include <cstdlib>
++#include <cstring>
++
+ using srsran::s1ap_mccmnc_to_plmn;
+ using srsran::uint32_to_uint8;
+ 
+@@ -40,6 +43,19 @@ using srsran::uint32_to_uint8;
+ using namespace asn1::ngap;
+ 
+ namespace srsenb {
++namespace {
++
++bool remove_pre_ngap_ue_on_release_miss_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_RRC_REMOVE_PRE_NGAP_ON_RELEASE_MISS");
++    return value != nullptr && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++} // namespace
++
+ /*********************************************************
+  *                     AMF Connection
+  *********************************************************/
+@@ -278,6 +294,11 @@ void ngap::user_release_request(uint16_t rnti, asn1::ngap::cause_radio_network_e
+ {
+   ue* u = users.find_ue_rnti(rnti);
+   if (u == nullptr) {
++    if (remove_pre_ngap_ue_on_release_miss_enabled()) {
++      logger.warning("Released UE rnti=0x%x has no NGAP context; releasing RRC-only user.", rnti);
++      rrc->release_user(rnti);
++      return;
++    }
+     logger.warning("Released UE rnti=0x%x not found.", rnti);
+     return;
+   }
+diff --git a/srsgnb/src/stack/rrc/cell_asn1_config.cc b/srsgnb/src/stack/rrc/cell_asn1_config.cc
+index c39556b98..b5275e788 100644
+--- a/srsgnb/src/stack/rrc/cell_asn1_config.cc
++++ b/srsgnb/src/stack/rrc/cell_asn1_config.cc
+@@ -25,6 +25,8 @@
+ #include "srsran/asn1/rrc_nr_utils.h"
+ #include "srsran/common/band_helper.h"
+ #include <bitset>
++#include <cstdlib>
++#include <cstring>
+ 
+ using namespace asn1::rrc_nr;
+ 
+@@ -34,6 +36,27 @@ using namespace asn1::rrc_nr;
+   }
+ 
+ namespace srsenb {
++namespace {
++
++bool sr_resource0_compat_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_NR_SR_RESOURCE0_COMPAT");
++    return value != nullptr && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++bool disable_sa_csi_setup_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_NR_DISABLE_SA_CSI_SETUP");
++    return value != nullptr && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++} // namespace
+ 
+ srslog::basic_logger& get_logger(const rrc_nr_cfg_t& cfg)
+ {
+@@ -635,7 +658,10 @@ void fill_pucch_cfg_from_enb_cfg(const rrc_nr_cfg_t& cfg, uint32_t cc, pucch_cfg
+   sr_res1.periodicity_and_offset_present    = true;
+   sr_res1.periodicity_and_offset.set_sl40() = 8;
+   sr_res1.res_present                       = true;
+-  sr_res1.res                               = 2;
++  sr_res1.res                               = sr_resource0_compat_enabled() ? 0 : 2;
++  if (sr_res1.res == 0) {
++    get_logger(cfg).warning("PAVONIS_NR_SR_RESOURCE0_COMPAT active cc=%u resource_id=0", cc);
++  }
+ 
+   // DL data
+   if (cfg.cell_list[cc].duplex_mode == SRSRAN_DUPLEX_MODE_FDD) {
+@@ -1070,6 +1096,10 @@ int fill_master_cell_cfg_from_enb_cfg(const rrc_nr_cfg_t& cfg, uint32_t cc, asn1
+   // spCellConfig -- Need M
+   out.sp_cell_cfg_present = true;
+   fill_sp_cell_cfg_from_enb_cfg(cfg, cc, out.sp_cell_cfg);
++  if (cfg.is_standalone && disable_sa_csi_setup_enabled()) {
++    out.sp_cell_cfg.sp_cell_cfg_ded.csi_meas_cfg_present = false;
++    get_logger(cfg).warning("PAVONIS_NR_DISABLE_SA_CSI_SETUP active cc=%u", cc);
++  }
+ 
+   return SRSRAN_SUCCESS;
+ }
+diff --git a/srsgnb/src/stack/rrc/rrc_nr_ue.cc b/srsgnb/src/stack/rrc/rrc_nr_ue.cc
+index 0c468a41e..2a3fdc762 100644
+--- a/srsgnb/src/stack/rrc/rrc_nr_ue.cc
++++ b/srsgnb/src/stack/rrc/rrc_nr_ue.cc
+@@ -27,9 +27,24 @@
+ #include "srsran/common/standard_streams.h"
+ #include "srsran/common/string_helpers.h"
+ 
++#include <cstdlib>
++#include <cstring>
++
+ using namespace asn1::rrc_nr;
+ 
+ namespace srsenb {
++namespace {
++
++bool sr_prb0_compat_enabled()
++{
++  static const bool enabled = []() {
++    const char* value = std::getenv("PAVONIS_NR_SR_PRB0_COMPAT");
++    return value != nullptr && std::strcmp(value, "0") != 0;
++  }();
++  return enabled;
++}
++
++} // namespace
+ 
+ /*******************************************************************************
+   UE class
+@@ -285,12 +300,15 @@ int rrc_nr::ue::pack_sp_cell_cfg_ded_ul_cfg_init_ul_bwp_pucch_cfg(asn1::rrc_nr::
+ 
+   // Resource for SR
+   srsran_pucch_nr_resource_t resource_sr = {};
+-  resource_sr.starting_prb               = 51;
++  resource_sr.starting_prb               = sr_prb0_compat_enabled() ? 0 : 51;
+   resource_sr.format                     = SRSRAN_PUCCH_NR_FORMAT_1;
+   resource_sr.initial_cyclic_shift       = 0;
+   resource_sr.nof_symbols                = 14;
+   resource_sr.start_symbol_idx           = 0;
+   resource_sr.time_domain_occ            = 0;
++  if (resource_sr.starting_prb == 0) {
++    logger.warning("PAVONIS_NR_SR_PRB0_COMPAT active rnti=0x%x starting_prb=0", rnti);
++  }
+ 
+   // Make 3 possible resources
+   pucch_cfg.setup().res_to_add_mod_list.resize(3);
+-- 
+2.53.0
+

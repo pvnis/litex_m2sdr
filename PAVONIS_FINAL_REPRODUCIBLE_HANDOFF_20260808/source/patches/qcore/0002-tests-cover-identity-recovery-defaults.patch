@@ -1,0 +1,199 @@
+From 4e5d73f6c2572c547475946379db89d55cfba9c6 Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 16:26:57 +0200
+Subject: [PATCH 2/3] tests: cover identity recovery defaults
+
+Add the synthetic fixture helpers used by the CP2360-CP2370 identity tests and assert that the private-lab accommodations remain disabled by default.
+---
+ tests/src/framework.rs                         | 18 +++++++++++++++++-
+ tests/src/mock_ue/build_nas.rs                 | 18 ++++++++++++++++++
+ tests/src/mock_ue/mock_ue_5gc.rs               |  2 ++
+ tests/src/mock_ue/mod.rs                       | 15 ++++++++++++++-
+ .../registration_foreign_guti_default_off.rs   | 11 +++++++++++
+ .../registration_foreign_supi_default_off.rs   | 17 +++++++++++++++++
+ 6 files changed, 79 insertions(+), 2 deletions(-)
+ create mode 100644 tests/tests/registration_foreign_guti_default_off.rs
+ create mode 100644 tests/tests/registration_foreign_supi_default_off.rs
+
+diff --git a/tests/src/framework.rs b/tests/src/framework.rs
+index 357a499..5c549d2 100644
+--- a/tests/src/framework.rs
++++ b/tests/src/framework.rs
+@@ -17,6 +17,8 @@ pub struct TestFrameworkBuilder<T> {
+     logger: Logger,
+     use_dhcp: bool,
+     local_ip: Option<Ipv4Addr>,
++    plmn: Option<PlmnIdentity>,
++    serving_network_name: Option<String>,
+     x: PhantomData<T>,
+ }
+ 
+@@ -26,6 +28,8 @@ impl<T> TestFrameworkBuilder<T> {
+             logger: init_logging(),
+             use_dhcp: false,
+             local_ip: None,
++            plmn: None,
++            serving_network_name: None,
+             x: PhantomData,
+         }
+     }
+@@ -40,6 +44,12 @@ impl<T> TestFrameworkBuilder<T> {
+         self
+     }
+ 
++    pub fn serving_network(mut self, plmn: PlmnIdentity, name: &str) -> Self {
++        self.plmn = Some(plmn);
++        self.serving_network_name = Some(name.to_string());
++        self
++    }
++
+     async fn build_common(
+         &self,
+         ngap_mode: bool,
+@@ -53,7 +63,13 @@ impl<T> TestFrameworkBuilder<T> {
+             None
+         };
+ 
+-        let config = qcore_test_config(0, dhcp_server)?;
++        let mut config = qcore_test_config(0, dhcp_server)?;
++        if let Some(plmn) = &self.plmn {
++            config.plmn = plmn.clone();
++        }
++        if let Some(serving_network_name) = &self.serving_network_name {
++            config.serving_network_name = serving_network_name.clone();
++        }
+ 
+         let qc = QCore::start(
+             config,
+diff --git a/tests/src/mock_ue/build_nas.rs b/tests/src/mock_ue/build_nas.rs
+index 27860b0..81461a8 100644
+--- a/tests/src/mock_ue/build_nas.rs
++++ b/tests/src/mock_ue/build_nas.rs
+@@ -152,6 +152,24 @@ pub fn registration_request(
+     Ok(encode_nas_5gs_message(&message)?)
+ }
+ 
++pub fn registration_update_request(fgs_mobile_identity: NasFGsMobileIdentity) -> Result<Vec<u8>> {
++    let mut request = registration_request_inner(fgs_mobile_identity, false);
++    request.fgs_registration_type = NasFGsRegistrationType::new(
++        (FollowOnRequest::PENDING << 3) | FivegsRegistrationType::MOBILITY_REGISTRATION_UPDATING,
++    );
++    let message = Nas5gsMessage::Gmm(
++        Nas5gmmHeader {
++            extended_protocol_discriminator: ExtendedProtocolDiscriminator::FIVEGMM,
++            security_header_type: SecurityHeaderType::PLAIN_5GS_NAS_MESSAGE_NOT_SECURITY_PROTECTED,
++            message_type: Nas5gmmMessageType::RegistrationRequest,
++        },
++        Nas5gmmMessage::RegistrationRequest(request),
++    );
++    let message =
++        Nas5gsMessage::protect(message, Nas5gsSecurityHeaderType::IntegrityProtected, 0, 5);
++    Ok(encode_nas_5gs_message(&message)?)
++}
++
+ fn registration_request_inner(
+     fgs_mobile_identity: NasFGsMobileIdentity,
+     include_session_1: bool,
+diff --git a/tests/src/mock_ue/mock_ue_5gc.rs b/tests/src/mock_ue/mock_ue_5gc.rs
+index 3540c04..ab5eb82 100644
+--- a/tests/src/mock_ue/mock_ue_5gc.rs
++++ b/tests/src/mock_ue/mock_ue_5gc.rs
+@@ -8,6 +8,7 @@ pub struct MockUe5GCData {
+     pub guti: Option<[u8; 10]>,
+     pub ipv4_addr: Ipv4Addr,
+     pub dnn: Option<&'static [u8]>,
++    pub serving_network_name: String,
+     pub nas_context: NasContext,
+ }
+ 
+@@ -19,6 +20,7 @@ impl MockUe5GCData {
+             guti: None,
+             ipv4_addr: Ipv4Addr::UNSPECIFIED,
+             dnn: None,
++            serving_network_name: "5G:mnc001.mcc001.3gppnetwork.org".to_string(),
+             nas_context: NasContext::default(),
+         }
+     }
+diff --git a/tests/src/mock_ue/mod.rs b/tests/src/mock_ue/mod.rs
+index bd390f5..271f5bc 100644
+--- a/tests/src/mock_ue/mod.rs
++++ b/tests/src/mock_ue/mod.rs
+@@ -109,6 +109,10 @@ impl<T: Transport> MockUe<T> {
+         self.data.dnn = Some(dnn);
+     }
+ 
++    pub fn use_serving_network_name(&mut self, serving_network_name: &str) {
++        self.data.serving_network_name = serving_network_name.to_string();
++    }
++
+     pub fn use_ethernet(&mut self) {
+         self.use_ethernet = true;
+     }
+@@ -190,6 +194,15 @@ impl<T: Transport> MockUe<T> {
+         self.send_nas(nas_bytes).await
+     }
+ 
++    pub async fn send_nas_registration_update(&mut self) -> Result<()> {
++        let Some(guti) = self.data.guti else {
++            bail!("GUTI missing")
++        };
++        let nas_bytes =
++            build_nas::registration_update_request(build_nas::mobile_identity_guti(&guti))?;
++        self.send_nas_no_outer_stmsi(nas_bytes).await
++    }
++
+     pub async fn receive_nas_authentication_request(&mut self) -> Result<NasAuthenticationRequest> {
+         let nas = ensure_nas!(AuthenticationRequest, self.receive_nas().await?);
+         info!(&self.logger, "Nas AuthenticationRequest >>");
+@@ -215,7 +228,7 @@ impl<T: Transport> MockUe<T> {
+         let (xres_star, kseaf) = security::respond_to_challenge_insecure(
+             &self.data.sub_auth_params.sim_creds.ki,
+             &self.data.sub_auth_params.sim_creds.opc,
+-            "5G:mnc001.mcc001.3gppnetwork.org".as_bytes(),
++            self.data.serving_network_name.as_bytes(),
+             &rand,
+             &autn,
+         );
+diff --git a/tests/tests/registration_foreign_guti_default_off.rs b/tests/tests/registration_foreign_guti_default_off.rs
+new file mode 100644
+index 0000000..1a87dc4
+--- /dev/null
++++ b/tests/tests/registration_foreign_guti_default_off.rs
+@@ -0,0 +1,11 @@
++use qcore_tests::framework::*;
++
++#[async_std::test]
++async fn registration_foreign_guti_default_off_is_rejected() -> anyhow::Result<()> {
++    let (du, _qc, _dn, builder, _logger) = init_f1ap().await?;
++    let mut ue = builder.f1ap_ue(&du).build().await?;
++
++    ue.use_guti([9, 241, 7, 5, 5, 5, 0, 0, 0, 0]);
++    ue.perform_rrc_setup().await?;
++    ue.receive_nas_registration_reject().await
++}
+diff --git a/tests/tests/registration_foreign_supi_default_off.rs b/tests/tests/registration_foreign_supi_default_off.rs
+new file mode 100644
+index 0000000..f89ab79
+--- /dev/null
++++ b/tests/tests/registration_foreign_supi_default_off.rs
+@@ -0,0 +1,17 @@
++use qcore_tests::{MockDu, framework::*};
++use xxap::PlmnIdentity;
++
++const SERVING_NETWORK_NAME: &str = "5G:mnc070.mcc901.3gppnetwork.org";
++
++#[async_std::test]
++async fn registration_foreign_supi_default_off_is_rejected() -> anyhow::Result<()> {
++    let (du, _qc, _dn, builder, _logger) = TestFrameworkBuilder::<MockDu>::new()
++        .serving_network(PlmnIdentity([0x09, 0xf1, 0x07]), SERVING_NETWORK_NAME)
++        .build()
++        .await?;
++    let mut ue = builder.f1ap_ue(&du).build().await?;
++    ue.use_serving_network_name(SERVING_NETWORK_NAME);
++
++    ue.perform_rrc_setup().await?;
++    ue.receive_nas_registration_reject().await
++}
+-- 
+2.53.0
+

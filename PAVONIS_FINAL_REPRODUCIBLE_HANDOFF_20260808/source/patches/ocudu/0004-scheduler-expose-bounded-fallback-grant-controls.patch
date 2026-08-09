@@ -1,0 +1,52 @@
+From 7d028379079f2f48ed58fc7d2b6a5fa2940f2d7f Mon Sep 17 00:00:00 2001
+From: stefan <46031448+StefanPetersTM@users.noreply.github.com>
+Date: Thu, 23 Jul 2026 15:59:58 +0200
+Subject: [PATCH 4/7] scheduler: expose bounded fallback grant controls
+
+Complete the CP3114 downlink compatibility API by carrying the optional contention-resolution MCS cap and common-search-space aggregation level into the fallback scheduler. Defaults remain MCS9 and AL4. Refs CP2389, CP3112, CP3114.
+---
+ include/ocudu/scheduler/config/scheduler_expert_config.h | 6 ++++++
+ lib/scheduler/ue_scheduling/ue_fallback_scheduler.h      | 3 ++-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/include/ocudu/scheduler/config/scheduler_expert_config.h b/include/ocudu/scheduler/config/scheduler_expert_config.h
+index 49a51da0c3..713b24dd0f 100644
+--- a/include/ocudu/scheduler/config/scheduler_expert_config.h
++++ b/include/ocudu/scheduler/config/scheduler_expert_config.h
+@@ -17,6 +17,7 @@
+ #include "ocudu/ran/slot_pdu_capacity_constants.h"
+ #include "ocudu/ran/srs/srs_configuration.h"
+ #include <chrono>
++#include <optional>
+ #include <variant>
+ #include <vector>
+ 
+@@ -146,6 +147,11 @@ struct scheduler_ue_expert_config {
+   std::chrono::milliseconds ul_harq_retx_timeout{100};
+   /// Maximum MCS index that can be assigned when scheduling MSG4.
+   sch_mcs_index max_msg4_mcs = 9;
++  /// Optional maximum MCS index for a standalone contention-resolution grant.
++  /// When unset, contention resolution uses \c max_msg4_mcs as before.
++  std::optional<sch_mcs_index> max_conres_mcs;
++  /// Aggregation level used for fallback downlink DCI in the common search space.
++  aggregation_level fallback_dl_dci_aggr_lev = aggregation_level::n4;
+   /// Initial UL SINR value used for Dynamic UL MCS computation (in dB).
+   double initial_ul_sinr = 5.0;
+   /// Enable multiplexing of CSI-RS and PDSCH.
+diff --git a/lib/scheduler/ue_scheduling/ue_fallback_scheduler.h b/lib/scheduler/ue_scheduling/ue_fallback_scheduler.h
+index 3df67d868e..838bca2d40 100644
+--- a/lib/scheduler/ue_scheduling/ue_fallback_scheduler.h
++++ b/lib/scheduler/ue_scheduling/ue_fallback_scheduler.h
+@@ -105,7 +105,8 @@ private:
+   std::tuple<unsigned, sch_mcs_index, units::bytes> select_tbs(const pdsch_config_params&          pdsch_cfg,
+                                                                units::bytes                        pending_bytes,
+                                                                const crb_interval&                 unused_crbs,
+-                                                               const std::optional<sch_mcs_index>& fixed_mcs) const;
++                                                               const std::optional<sch_mcs_index>& fixed_mcs,
++                                                               sch_mcs_index                       max_mcs) const;
+ 
+   /// \brief Allocate DL grant for a UE and for a specific PDSCH slot.
+   std::optional<dl_harq_process_handle> alloc_grant(ue&                                   u,
+-- 
+2.53.0
+
