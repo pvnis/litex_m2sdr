@@ -5,6 +5,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 from migen import *
+from migen.genlib.cdc import MultiReg
 from migen.fhdl.specials import Tristate
 
 from litex.gen import *
@@ -309,23 +310,37 @@ class SI5351(LiteXModule):
         # ---------------
 
         # ClkIn Source Mux.
+        # clkin_src is a quasi-static CSR bit from the sys domain; synchronize it to clk10 so the
+        # BUFGMUX select is not driven by an unconstrained cross-domain path (BUFGMUX switching
+        # itself is glitch-free).
+        clkin_src_sync = Signal()
+        self.specials += MultiReg(self.clkin_src, clkin_src_sync, odomain="clk10")
         si5351_clkin = Signal()
         self.specials += Instance("BUFGMUX",
-            i_S  = self.clkin_src,
+            i_S  = clkin_src_sync,
             i_I0 = ClockSignal("clk10"),
             i_I1 = self.clkin_ufl,
             o_O  = si5351_clkin,
         )
 
         # ClkIn/Enable Output.
+        # version/ss_en are quasi-static CSR bits from the sys domain, but the DDR output below is
+        # clocked by si5351_clkin: synchronize them to avoid an unconstrained clock domain crossing.
+        self.cd_si5351_clkin = ClockDomain(reset_less=True)
+        self.comb += self.cd_si5351_clkin.clk.eq(si5351_clkin)
+        version_sync = Signal()
+        ss_en_sync   = Signal()
+        self.specials += MultiReg(self.version, version_sync, odomain="si5351_clkin")
+        self.specials += MultiReg(self.ss_en,   ss_en_sync,   odomain="si5351_clkin")
+
         si5351_ddr_i1 = Signal()
         si5351_ddr_i2 = Signal()
         self.comb += [
-            Case(self.version, {
+            Case(version_sync, {
                 # SI5351B: Spread Spectrum Enable.
                 SI5351_B_VERSION : [
-                   si5351_ddr_i1.eq(self.ss_en),
-                   si5351_ddr_i2.eq(self.ss_en),
+                   si5351_ddr_i1.eq(ss_en_sync),
+                   si5351_ddr_i2.eq(ss_en_sync),
                 ],
                 # SI5351C: 10MHz ClkIn.
                 SI5351_C_VERSION : [
