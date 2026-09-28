@@ -141,6 +141,22 @@ SoapySDR::Kwargs createDeviceKwargs(
     return dev;
 }
 
+/* Carry user-supplied settings (e.g. ad9361_fir_profile) into the enumeration
+ * result. Applications such as srsRAN build the device from the enumerated kwargs
+ * rather than from the original argument string, so without this they are lost. */
+static void mergeUserArgs(SoapySDR::Kwargs &dev_args, const SoapySDR::Kwargs &args) {
+    static const char *identity_keys[] = {"device", "transport", "dev_id", "path",
+                                          "serial", "identification", "version",
+                                          "label", "eth_ip"};
+    for (const auto &kv : args) {
+        bool is_identity = false;
+        for (const char *key : identity_keys) {
+            if (kv.first == key) { is_identity = true; break; }
+        }
+        if (!is_identity) dev_args[kv.first] = kv.second;
+    }
+}
+
 std::vector<SoapySDR::Kwargs> findLiteXM2SDR(
     const SoapySDR::Kwargs &args) {
     std::vector<SoapySDR::Kwargs> discovered;
@@ -172,6 +188,7 @@ std::vector<SoapySDR::Kwargs> findLiteXM2SDR(
                 if (existing.count("dev_id") && existing.at("dev_id") == dev_args["dev_id"])
                     return true;
             }
+            mergeUserArgs(dev_args, args);
             discovered.push_back(std::move(dev_args));
             return true;
         }
