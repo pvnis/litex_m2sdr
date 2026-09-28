@@ -194,7 +194,7 @@ class CRG(LiteXModule):
             self.clk10_mmcm = clk10_mmcm = S7MMCM(speedgrade=-3, fractional=False)
             self.comb += clk10_mmcm.reset.eq(self.rst)
             clk10_mmcm.register_clkin(clk100, 100e6)
-            clk10_mmcm.expose_dps("clk200", with_csr=False)
+            clk10_mmcm.expose_dps("sys", with_csr=False)
             clk10_mmcm.create_clkout(self.cd_clk10, 10e6, margin=0)
             clk10_mmcm.params.update(p_CLKOUT0_USE_FINE_PS="TRUE")
         pll.create_clkout(self.cd_idelay, 200e6)
