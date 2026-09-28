@@ -1125,9 +1125,14 @@ void SoapyLiteXM2SDR::initTimedTxTimeline()
         samples_to_ns(_tx_stream.samplerate,
                       static_cast<long long>(_tx_stream.timed_tx_lead_buffers) *
                       static_cast<long long>(this->getStreamMTU(TX_STREAM)));
+    /* Provisional anchor, kept so behaviour is sane if the hardware counters
+     * are unavailable; tryAnchorTxTimeline() replaces it with a measured one
+     * as soon as the DMA reader has emitted its first buffer. */
     _tx_stream.tx_next_time_ns =
         this->getHardwareTime("") + lead_ns + _tx_stream.timed_tx_latency_ns;
     _tx_stream.tx_timeline_valid = true;
+    _tx_stream.tx_anchor_pending = true;
+    _tx_stream.tx_underflow_seen = 0;
 
     SoapySDR::logf(SOAPY_SDR_DEBUG,
         "TX timed timeline initialized: next=%lld ns lead=%lld ns latency=%lld ns mtu_time=%lld ns",
@@ -1135,6 +1140,80 @@ void SoapyLiteXM2SDR::initTimedTxTimeline()
         (long long)lead_ns,
         (long long)_tx_stream.timed_tx_latency_ns,
         (long long)mtu_time_ns);
+}
+
+
+/* Anchor the software TX timeline to the hardware's actual emission point.
+ *
+ * Returns true once anchored. Until the DMA reader has consumed at least one
+ * buffer there is nothing to measure against, so this is retried.
+ *
+ * hw_count is the number of buffers the reader has fully consumed, so at the
+ * moment we read it the reader is somewhere inside buffer hw_count -- between
+ * 0 and 1 buffer of progress. The next sample the host writes lands in ring
+ * slot sw_count and is emitted after (sw_count - hw_count) further buffers:
+ *
+ *   emission(next) in [ T + (sw - hw - 1)*B , T + (sw - hw)*B ]
+ *
+ * Take the LOWER bound. Claiming an emission time that is early means the real
+ * emission lands later than the stamp, so the residual is a positive delay --
+ * which the gNB's timing-advance command can absorb, unlike a negative one.
+ * The residual is therefore bounded by one buffer period (88.9 us at
+ * 23.04 MSps with a 2048-sample MTU) plus the read margin, instead of the
+ * several milliseconds of either sign that the unmeasured anchor gave. */
+bool SoapyLiteXM2SDR::tryAnchorTxTimeline(void)
+{
+    if (!isLitePCIe() || _tx_stream.samplerate <= 0.0)
+        return false;
+
+    struct m2sdr_stream_stats st = {};
+    if (m2sdr_get_stream_stats(_dev, M2SDR_TX, &st) != M2SDR_ERR_OK)
+        return false;
+
+    /* Nothing emitted yet: the reader has not started, so there is no
+     * hardware reference to anchor against. Try again later. */
+    if (st.hw_count <= 0)
+        return false;
+
+    const long long T = this->getHardwareTime("");
+
+    const size_t buf_samples =
+        (_bytesPerComplex > 0)
+            ? (size_t)(st.buffer_size / (_nChannels * _bytesPerComplex))
+            : this->getStreamMTU(TX_STREAM);
+    if (buf_samples == 0)
+        return false;
+
+    const long long queued_bufs = (long long)st.sw_count - (long long)st.hw_count;
+    const long long queued_samples =
+        (queued_bufs > 0 ? queued_bufs - 1 : -1) * (long long)buf_samples;
+
+    /* Bias one further buffer early. The lower-bound estimate above already
+     * makes the residual non-negative in principle, but read jitter was still
+     * able to push it slightly negative in testing (-120 us once). A negative
+     * residual is useless to a gNB -- timing advance can only remove a delay --
+     * so trade a larger positive constant, which is calibrated out, for a
+     * reliable sign. */
+    const long long buffer_ns =
+        samples_to_ns(_tx_stream.samplerate, (long long)buf_samples);
+    _tx_stream.tx_next_time_ns =
+        T + samples_to_ns(_tx_stream.samplerate, queued_samples)
+          - buffer_ns
+          - _tx_stream.tx_anchor_margin_ns
+          + _tx_stream.timed_tx_latency_ns;
+    _tx_stream.tx_timeline_valid = true;
+    _tx_stream.tx_anchor_pending = false;
+    _tx_stream.tx_underflow_seen = st.underflow_events;
+
+    SoapySDR::logf(SOAPY_SDR_INFO,
+        "TX timeline anchored to hardware: board=%lld ns hw_count=%lld sw_count=%lld "
+        "queued=%lld buf(s) buf_samples=%zu -> next=%lld ns (residual is a positive delay "
+        "bounded by one buffer = %lld ns)",
+        (long long)T, (long long)st.hw_count, (long long)st.sw_count,
+        (long long)queued_bufs, buf_samples,
+        (long long)_tx_stream.tx_next_time_ns,
+        (long long)samples_to_ns(_tx_stream.samplerate, (long long)buf_samples));
+    return true;
 }
 
 int SoapyLiteXM2SDR::ensureTxRemainderBuffer(
@@ -2265,6 +2344,27 @@ int SoapyLiteXM2SDR::writeStream(
         refreshTimedTxDefaults();
         if (!_tx_stream.tx_timeline_valid)
             initTimedTxTimeline();
+
+        /* Replace the provisional anchor with a hardware-measured one as soon
+         * as the DMA reader has emitted something. */
+        if (_tx_stream.tx_anchor_pending)
+            (void)this->tryAnchorTxTimeline();
+        else if (isLitePCIe()) {
+            /* An underrun means the hardware emitted something other than our
+             * timeline (gap fill or a stale buffer), so the mapping from stamp
+             * to emission time is no longer valid: re-anchor. */
+            struct m2sdr_stream_stats st = {};
+            if (m2sdr_get_stream_stats(_dev, M2SDR_TX, &st) == M2SDR_ERR_OK &&
+                st.underflow_events > _tx_stream.tx_underflow_seen) {
+                SoapySDR::logf(SOAPY_SDR_WARNING,
+                    "TX underrun (%llu events, was %llu): re-anchoring the timed-TX timeline",
+                    (unsigned long long)st.underflow_events,
+                    (unsigned long long)_tx_stream.tx_underflow_seen);
+                _tx_stream.tx_underflow_seen = st.underflow_events;
+                _tx_stream.tx_anchor_pending = true;
+                (void)this->tryAnchorTxTimeline();
+            }
+        }
     } else if (_tx_stream.timed_tx_enabled && (flags & SOAPY_SDR_HAS_TIME)) {
         SoapySDR::log(SOAPY_SDR_ERROR,
             "TX timed write requested before the TX sample rate was configured");

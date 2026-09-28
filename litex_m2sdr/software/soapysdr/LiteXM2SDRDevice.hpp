@@ -536,6 +536,27 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         bool timed_tx_late_margin_configured = false;
         bool tx_timeline_valid = false;
         long long tx_next_time_ns = 0;
+
+        /* ---- Measured TX emission anchor --------------------------------
+         * initTimedTxTimeline() used to anchor the timeline to a bare
+         * getHardwareTime() read and then assume the next sample written was
+         * emitted at that instant. Nothing measured when the DMA reader
+         * actually started or how deep the ring already was, so the true
+         * emission time differed from the stamp by an unmeasured per-start
+         * offset -- observed at +2036, -3734, -4316, -830 and +4957 us over
+         * five restarts, i.e. several ms with arbitrary sign. A gNB cannot
+         * absorb that: its timing-advance command can only remove a POSITIVE
+         * delay.
+         *
+         * Instead, anchor lazily against the hardware: once the TX DMA reader
+         * has actually consumed a buffer, read (hw_count, sw_count) together
+         * with board time and derive when the next queued sample will really
+         * be emitted. hw_count has one-buffer granularity, so take the
+         * conservative end of the interval -- this makes the stamp EARLY and
+         * therefore the residual a positive delay, never negative. */
+        bool      tx_anchor_pending    = false;
+        uint64_t  tx_underflow_seen    = 0;
+        long long tx_anchor_margin_ns  = 10000;  /* covers non-atomic reads */
         int remainderFlags = 0;
         long long remainderTimeNs = 0;
     };
@@ -577,6 +598,7 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     void stopRxStreamUnlocked();
     void stopTxStreamUnlocked();
     void cleanupLiteEthUdpIfIdleUnlocked();
+    bool tryAnchorTxTimeline(void);
     void resetTimedTxTimeline();
     void refreshTimedTxDefaults();
     void initTimedTxTimeline();
