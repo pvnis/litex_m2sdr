@@ -439,6 +439,13 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
             config.rx_header_enable = _rx_dma_header_bytes != 0;
             config.rx_strip_header = _rx_dma_header_bytes != 0;
             config.buffer_size = m2sdr_bytes_to_samples(m2fmt, M2SDR_BUFFER_BYTES - _rx_dma_header_bytes);
+
+            /* Decoupling worker depth, in DMA buffers. 0 (the default) keeps the
+             * upstream zero-copy path. Consumers that stall by design -- srsRAN's
+             * cell search -- need this or the DMA ring overflows continuously. */
+            _rx_stream.rxw_depth = get_kwargs_size(searchArgs, _deviceArgs, "rx_worker_packets", 0);
+            if (_rx_stream.rxw_depth > 16384)
+                _rx_stream.rxw_depth = 16384;
             int rc = m2sdr_stream_configure(_dev, &config);
             if (rc != M2SDR_ERR_OK)
                 throw std::runtime_error("m2sdr_stream_configure(RX) failed: " + std::string(m2sdr_strerror(rc)));
@@ -737,6 +744,8 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
 
 /* Close the specified stream and release associated resources. */
 void SoapyLiteXM2SDR::closeStream(SoapySDR::Stream *stream) {
+    if (stream == RX_STREAM)
+        this->rxWorkerStop();
     if (stream != RX_STREAM && stream != TX_STREAM)
         return;
 
@@ -744,6 +753,11 @@ void SoapyLiteXM2SDR::closeStream(SoapySDR::Stream *stream) {
         _rx_stream.stop_requested.store(true);
     else
         _tx_stream.stop_requested.store(true);
+
+    /* Join the worker before taking the stream lock: it never takes that lock,
+     * but it must not be touching the device while we tear the stream down. */
+    if (stream == RX_STREAM)
+        this->rxWorkerStop();
 
     std::lock_guard<std::recursive_mutex> stream_lock(streamAccessMutex(stream));
     std::lock_guard<std::mutex> lock(_mutex);
@@ -824,6 +838,9 @@ int SoapyLiteXM2SDR::activateStream(
         _rx_stream.user_count = 0;
         _rx_stream.pendingReadBufs.clear();
         _rx_stream.burst_end = false;
+        _rx_stream.rxw_next_handle = 0;
+        if (isLitePCIe())
+            this->rxWorkerStart();
         _rx_stream.time0_ns = this->getHardwareTime("");
         _rx_stream.time0_count = _rx_stream.user_count;
         _rx_stream.time_valid = (_rx_stream.samplerate > 0.0);
@@ -1281,6 +1298,123 @@ int SoapyLiteXM2SDR::appendTxSamples(
 }
 
 /* Acquire a buffer for reading. */
+
+/***********************************************************************
+ * RX decoupling worker
+ *
+ * Drains the DMA ring into a userspace ring and releases each DMA buffer
+ * immediately, so a slow consumer can never stall the hardware. Enabled by
+ * the rx_worker_packets device argument (0 = disabled, upstream zero-copy
+ * behaviour). See the comment on RXStream::rxw_* for why this exists.
+ **********************************************************************/
+void SoapyLiteXM2SDR::rxWorkerLoop(void) {
+    while (_rx_stream.rxw_run.load(std::memory_order_relaxed)) {
+        void    *buffer = nullptr;
+        unsigned total_samples = 0;
+
+        int rc = m2sdr_get_buffer(_dev, M2SDR_RX, &buffer, &total_samples, 20 /* ms */);
+        if (rc == M2SDR_ERR_TIMEOUT)
+            continue;
+        if (rc == M2SDR_ERR_OVERFLOW) {
+            /* The hardware dropped samples. Flag the next slot we deliver so
+             * the reader can surface END_ABRUPT exactly once per gap. */
+            std::lock_guard<std::mutex> lk(_rx_stream.rxw_mutex);
+            _rx_stream.rxw_pending_discontinuity = true;
+            continue;
+        }
+        if (rc != M2SDR_ERR_OK)
+            continue;
+
+        /* Copy out and hand the DMA buffer straight back: this is the whole
+         * point of the worker, so never block while holding it. */
+        const size_t bytes = std::min<size_t>((size_t)total_samples * _bytesPerComplex,
+                                              (size_t)M2SDR_BUFFER_BYTES);
+        long long ts = 0;
+        bool have_ts = false;
+        if (_rx_dma_header_bytes != 0) {
+            struct m2sdr_metadata meta;
+            if (m2sdr_get_buffer_metadata(_dev, M2SDR_RX, buffer, &meta) == M2SDR_ERR_OK &&
+                (meta.flags & M2SDR_META_FLAG_HAS_TIME)) {
+                ts = (long long)meta.timestamp;
+                have_ts = true;
+            }
+        }
+
+        size_t idx;
+        {
+            std::unique_lock<std::mutex> lk(_rx_stream.rxw_mutex);
+            if (_rx_stream.rxw_free.empty()) {
+                /* Ring full: the application is behind. Drop the OLDEST slot so
+                 * we keep the most recent samples, and mark the gap. Dropping
+                 * here (in userspace) instead of letting the DMA ring overflow
+                 * is what keeps the hardware running. */
+                if (_rx_stream.rxw_filled.empty()) {
+                    lk.unlock();
+                    m2sdr_release_buffer(_dev, M2SDR_RX, buffer);
+                    continue;
+                }
+                idx = _rx_stream.rxw_filled.front();
+                _rx_stream.rxw_filled.pop_front();
+                _rx_stream.rxw_drops.fetch_add(1, std::memory_order_relaxed);
+                _rx_stream.rxw_pending_discontinuity = true;
+            } else {
+                idx = _rx_stream.rxw_free.front();
+                _rx_stream.rxw_free.pop_front();
+            }
+        }
+
+        RXStream::WorkerSlot &slot = _rx_stream.rxw_slots[idx];
+        std::memcpy(slot.data.data(), buffer, bytes);
+        m2sdr_release_buffer(_dev, M2SDR_RX, buffer);
+
+        slot.bytes    = bytes;
+        slot.samples  = total_samples;
+        slot.timeNs   = ts;
+        slot.has_time = have_ts;
+        {
+            std::lock_guard<std::mutex> lk(_rx_stream.rxw_mutex);
+            slot.discontinuity = _rx_stream.rxw_pending_discontinuity;
+            _rx_stream.rxw_pending_discontinuity = false;
+            _rx_stream.rxw_filled.push_back(idx);
+        }
+        _rx_stream.rxw_cv_filled.notify_one();
+    }
+}
+
+void SoapyLiteXM2SDR::rxWorkerStart(void) {
+    if (_rx_stream.rxw_depth == 0 || _rx_stream.rxw_run.load())
+        return;
+    _rx_stream.rxw_slots.assign(_rx_stream.rxw_depth, RXStream::WorkerSlot());
+    for (size_t i = 0; i < _rx_stream.rxw_depth; i++)
+        _rx_stream.rxw_slots[i].data.resize(M2SDR_BUFFER_BYTES);
+    _rx_stream.rxw_filled.clear();
+    _rx_stream.rxw_free.clear();
+    for (size_t i = 0; i < _rx_stream.rxw_depth; i++)
+        _rx_stream.rxw_free.push_back(i);
+    _rx_stream.rxw_inflight.clear();
+    _rx_stream.rxw_drops.store(0);
+    _rx_stream.rxw_drops_reported = 0;
+    _rx_stream.rxw_pending_discontinuity = false;
+    _rx_stream.rxw_run.store(true);
+    _rx_stream.rxw_thread = std::thread([this]() { this->rxWorkerLoop(); });
+    SoapySDR::logf(SOAPY_SDR_INFO, "RX worker: %zu buffers of %u bytes",
+                   _rx_stream.rxw_depth, (unsigned)M2SDR_BUFFER_BYTES);
+}
+
+void SoapyLiteXM2SDR::rxWorkerStop(void) {
+    if (!_rx_stream.rxw_run.load())
+        return;
+    _rx_stream.rxw_run.store(false);
+    _rx_stream.rxw_cv_filled.notify_all();
+    _rx_stream.rxw_cv_free.notify_all();
+    if (_rx_stream.rxw_thread.joinable())
+        _rx_stream.rxw_thread.join();
+    std::lock_guard<std::mutex> lk(_rx_stream.rxw_mutex);
+    _rx_stream.rxw_filled.clear();
+    _rx_stream.rxw_free.clear();
+    _rx_stream.rxw_inflight.clear();
+}
+
 int SoapyLiteXM2SDR::acquireReadBuffer(
     SoapySDR::Stream *stream,
     size_t &handle,
@@ -1296,6 +1430,58 @@ int SoapyLiteXM2SDR::acquireReadBuffer(
 
     if (!_rx_stream.opened || _rx_stream.stop_requested.load())
         return SOAPY_SDR_STREAM_ERROR;
+
+    /* Worker enabled: serve from the userspace ring instead of the DMA ring. */
+    if (_rx_stream.rxw_depth != 0 && isLitePCIe()) {
+        size_t idx;
+        {
+            std::unique_lock<std::mutex> lk(_rx_stream.rxw_mutex);
+            if (_rx_stream.rxw_filled.empty()) {
+                const auto deadline = std::chrono::steady_clock::now() +
+                                      std::chrono::microseconds(timeoutUs > 0 ? timeoutUs : 0);
+                if (!_rx_stream.rxw_cv_filled.wait_until(lk, deadline, [this]() {
+                        return !_rx_stream.rxw_filled.empty() ||
+                               !_rx_stream.rxw_run.load(std::memory_order_relaxed);
+                    }))
+                    return SOAPY_SDR_TIMEOUT;
+                if (_rx_stream.rxw_filled.empty())
+                    return SOAPY_SDR_STREAM_ERROR;
+            }
+            idx = _rx_stream.rxw_filled.front();
+            _rx_stream.rxw_filled.pop_front();
+        }
+
+        RXStream::WorkerSlot &slot = _rx_stream.rxw_slots[idx];
+        buffs[0] = slot.data.data();
+        handle = _rx_stream.rxw_next_handle++;
+        _rx_stream.rxw_inflight[handle] = idx;
+
+        /* Report each userspace drop once, the same way the zero-copy path
+         * reports a DMA overflow, so callers still see the discontinuity. */
+        const uint64_t drops = _rx_stream.rxw_drops.load(std::memory_order_relaxed);
+        if (slot.discontinuity || drops != _rx_stream.rxw_drops_reported) {
+            _rx_stream.rxw_drops_reported = drops;
+            flags |= SOAPY_SDR_END_ABRUPT;
+        }
+
+        const size_t samples_per_buffer = slot.samples / _nChannels;
+        if (_rx_stream.time_valid && !(flags & SOAPY_SDR_HAS_TIME)) {
+            if (slot.has_time) {
+                timeNs = slot.timeNs;
+            } else {
+                timeNs = _rx_stream.time0_ns +
+                         samples_to_ns(_rx_stream.samplerate,
+                                       (long long)(handle - _rx_stream.time0_count) *
+                                       (long long)samples_per_buffer);
+            }
+            flags |= SOAPY_SDR_HAS_TIME;
+            if (timeNs < _rx_stream.last_time_ns)
+                timeNs = _rx_stream.last_time_ns;
+            else
+                _rx_stream.last_time_ns = timeNs;
+        }
+        return (int)samples_per_buffer;
+    }
 
     if (_rx_stream.burst_end)
         flags |= SOAPY_SDR_END_BURST;
@@ -1488,6 +1674,21 @@ void SoapyLiteXM2SDR::releaseReadBuffer(
     std::lock_guard<std::recursive_mutex> stream_lock(_rx_stream_mutex);
 
     assert(handle != (size_t)-1 && "Attempt to release an invalid buffer (e.g., from an overflow).");
+
+    if (_rx_stream.rxw_depth != 0 && isLitePCIe()) {
+        auto it = _rx_stream.rxw_inflight.find(handle);
+        if (it != _rx_stream.rxw_inflight.end()) {
+            const size_t idx = it->second;
+            _rx_stream.rxw_inflight.erase(it);
+            {
+                std::lock_guard<std::mutex> lk(_rx_stream.rxw_mutex);
+                _rx_stream.rxw_slots[idx].discontinuity = false;
+                _rx_stream.rxw_free.push_back(idx);
+            }
+            _rx_stream.rxw_cv_free.notify_one();
+        }
+        return;
+    }
 
     if (isLitePCIe()) {
         auto it = _rx_stream.pendingReadBufs.find(handle);

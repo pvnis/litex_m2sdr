@@ -977,6 +977,12 @@ SoapyLiteXM2SDR::~SoapyLiteXM2SDR(void) {
     _rx_stream.stop_requested.store(true);
     _tx_stream.stop_requested.store(true);
 
+    /* Join the RX worker before anything else: destroying a joinable
+     * std::thread calls std::terminate, and applications that exit without
+     * deactivateStream() would abort here otherwise. Safe to call unlocked --
+     * the worker never takes the stream mutexes. */
+    this->rxWorkerStop();
+
     std::lock_guard<std::recursive_mutex> rx_stream_lock(_rx_stream_mutex);
     std::lock_guard<std::recursive_mutex> tx_stream_lock(_tx_stream_mutex);
     std::lock_guard<std::mutex> lock(_mutex);

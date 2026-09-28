@@ -20,6 +20,9 @@
 #include <cstdint>
 #include <chrono>
 #include <atomic>
+#include <thread>
+#include <deque>
+#include <condition_variable>
 
 #include "m2sdr.h"
 
@@ -138,6 +141,10 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         int &flags,
         long long &timeNs,
         const long timeoutUs) override;
+
+    void rxWorkerLoop(void);
+    void rxWorkerStart(void);
+    void rxWorkerStop(void);
 
     void releaseReadBuffer(
         SoapySDR::Stream *stream,
@@ -462,6 +469,39 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         bool rx_timeout_recovery_armed = false;
         uint64_t rx_timeout_recoveries = 0;
         std::map<size_t, void *> pendingReadBufs;
+
+        /* ---- Optional RX decoupling worker ------------------------------
+         * Zero-copy RX hands DMA buffers straight to readStream, so any stall
+         * in the application backs up into the DMA ring and overflows it.
+         * Consumers that stall by design -- srsRAN/NR-Scope's cell search runs
+         * slower than real time -- collapse: every overflow flushes
+         * pendingReadBufs, so a contiguous slot never arrives and sync is never
+         * reached. When rxw_depth != 0 a worker thread drains the DMA ring into
+         * this userspace ring and releases the DMA buffer immediately, so the
+         * hardware never waits on the application. Depth 0 keeps the upstream
+         * zero-copy path untouched. */
+        struct WorkerSlot {
+            std::vector<uint8_t> data;
+            size_t    bytes    = 0;   /* valid bytes in data */
+            size_t    samples  = 0;   /* total samples (all channels) */
+            long long timeNs   = 0;
+            bool      has_time = false;
+            bool      discontinuity = false; /* samples were lost before this slot */
+        };
+        size_t                        rxw_depth = 0;   /* 0 = worker disabled */
+        std::vector<WorkerSlot>       rxw_slots;
+        std::deque<size_t>            rxw_filled;
+        std::deque<size_t>            rxw_free;
+        std::mutex                    rxw_mutex;
+        std::condition_variable       rxw_cv_filled;
+        std::condition_variable       rxw_cv_free;
+        std::thread                   rxw_thread;
+        std::atomic<bool>             rxw_run{false};
+        std::atomic<uint64_t>         rxw_drops{0};
+        uint64_t                      rxw_drops_reported = 0;
+        bool                          rxw_pending_discontinuity = false;
+        std::map<size_t, size_t>      rxw_inflight;   /* handle -> slot index */
+        size_t                        rxw_next_handle = 0;
     };
 
     struct TXStream: Stream {
