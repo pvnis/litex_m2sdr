@@ -154,7 +154,7 @@ actually late because of the stall are a handful.
 | `OCUDU_LPHY_RX_TO_TX_DELAY_US` | TX lead at hand-off (min / avg) | what happens |
 |---|---|---|
 | 5000 (before this work) | 4188 / 4507 µs with the old RX lag; 4909 / 4949 µs now | clean |
-| 4000 (new default) | 3650–3900 / 3950 µs | one episode in the first 5 minutes of soak (lead dipped to 1032 µs, i.e. a ~2.9 ms stall); an episode needs a stall above ~3.4 ms |
+| 4000 (new default) | 3650–3900 / 3950 µs | one episode in a first 5-minute soak with phone traffic (+452 late, +4500 stale), none in the following 11-minute soak (lowest lead 2349 µs); 6 of 6 starts attach and ping 150/150 |
 | 2000 | 1812 / 1943 µs | clean for minutes, then an episode when the phone attached (lead dipped to 1155 µs): +1000 late, the guardian restarted the gNB |
 | 1500 | 1368 / 1446 µs | 8–12 episodes per 45 s |
 | 1000 (stock) | 673–899 / 942 µs | continuous episodes, not usable |
