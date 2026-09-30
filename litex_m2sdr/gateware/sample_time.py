@@ -12,9 +12,9 @@ word strobe, whether or not the word is consumed. It is the only clock the ADC a
 so stamping RX frames and releasing TX frames against it is exact by construction -- no nanosecond
 conversion and no second oscillator involved (what a USRP calls ticks).
 
-* ``RXTickTracker`` (sys): each RX word crosses the clock-domain FIFO together with its tick. The
-  tracker strips it again and keeps, for the word currently offered to the consumer (the RX header
-  inserter), the tick it was sampled at. A frame header stamped with that value is the index of the
+* ``RXTickTracker`` (sys): each RX word crosses the clock-domain FIFO and the RX pipeline register
+  together with its tick. The tracker strips it and exposes, for the word currently offered to the
+  consumer (the RX header inserter), the tick it was sampled at. A frame header stamped with that value is the index of the
   frame's first sample even if samples were dropped upstream.
 
 * ``TXFineGate`` (rfic): emits every word of a timed frame in the PHY slot whose tick equals the
@@ -43,41 +43,34 @@ def tx_stamp_layout():
 # RX Tick Tracker (sys) ----------------------------------------------------------------------------
 
 class RXTickTracker(LiteXModule):
-    def __init__(self, depth=16):
-        self.sink   = sink   = stream.Endpoint(rx_tick_layout())  # i (from the RX clock-domain FIFO)
-        self.source = source = stream.Endpoint(dma_layout(64))    # o (to bit-mode / buffer / consumer)
+    """Strips the tick off the RX words and exposes the tick of the word currently offered downstream.
 
-        self.inc      = Signal(2)  # i: sample periods per word.
-        self.exact    = Signal()   # i: the consumer sees these words 1:1 (12-bit/SC16 mode).
-        self.pop      = Signal()   # i: the consumer accepted one word.
+    It sits right after the RX pipeline register (which carries data and tick together) and in front
+    of the bit-mode stage. In the 12-bit/SC16 format that stage is a wire, so the word offered to the
+    final consumer (the RX header inserter) is the word offered here and ``tick`` is its sample index.
+    In the repacking formats (8-bit, BFP8) words are not 1:1 and ``tick`` falls back to ``now``.
+    """
+    def __init__(self):
+        self.sink   = sink   = stream.Endpoint(rx_tick_layout())  # i (from the RX pipeline register)
+        self.source = source = stream.Endpoint(dma_layout(64))    # o (to bit-mode / consumer)
 
-        self.tick     = Signal(64) # o: tick of the word offered to the consumer.
-        self.now      = Signal(64) # o: tick following the newest word out of the FIFO (sys view of now).
-        self.overflow = Signal()   # o: sticky, tick queue overflowed (consumer not 1:1).
+        self.inc   = Signal(2)  # i: sample periods per word.
+        self.exact = Signal()   # i: the consumer sees these words 1:1 (12-bit/SC16 mode).
+
+        self.tick  = Signal(64) # o: tick of the word offered to the consumer.
+        self.now   = Signal(64) # o: tick following the newest word taken (sys view of now).
 
         # # #
 
-        self.fifo = fifo = stream.SyncFIFO([("tick", 64)], depth, buffered=False)
-
         self.comb += [
             sink.connect(source, omit={"tick"}),
-            fifo.sink.valid.eq(sink.valid & sink.ready & self.exact),
-            fifo.sink.tick.eq(sink.tick),
-            fifo.source.ready.eq(self.pop),
-            If(self.exact & fifo.source.valid,
-                self.tick.eq(fifo.source.tick)
+            If(self.exact & sink.valid,
+                self.tick.eq(sink.tick)
             ).Else(
                 self.tick.eq(self.now)
             ),
         ]
-        self.sync += [
-            If(sink.valid & sink.ready,
-                self.now.eq(sink.tick + self.inc)
-            ),
-            If(fifo.sink.valid & ~fifo.sink.ready,
-                self.overflow.eq(1)
-            ),
-        ]
+        self.sync += If(sink.valid & sink.ready, self.now.eq(sink.tick + self.inc))
 
 # TX Fine Gate (rfic) ------------------------------------------------------------------------------
 

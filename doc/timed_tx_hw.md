@@ -141,14 +141,54 @@ itself: `readStream`/`acquireReadBuffer` time, `writeStream` time, `activateStre
 depends on double precision (2^53 ns is 104 days of board time). `timed_rx=off` keeps the immediate RX
 start; `tx_fifo_buffers=0` restores the whole ring.
 
-A longer-term gateware step would stamp frames and gate TX with a sample counter in the RF clock
-domain; today the ticks exist in the driver and the FPGA still works in nanoseconds of `time_gen`.
+## Sample counter in the gateware (`gateware/sample_time.py`)
 
-Result: with OCUDU (stock lower PHY, `timed_tx=hardware,time_base=samples`) 8 of 8 starts show 0
-non-contiguous RX labels and 0 late UL requests; the first RX label equals OCUDU's `init_time`; the DL
-starts 27–28 slots ahead of RX (was 177–194); RX-minus-TX SSB offset (`align.py`) **45–46 samples on
-every dump generation and every restart**; gate counters `held == passed == 11272 frames/s`,
-`late == 0`.
+The FPGA itself keeps time in samples. The AD9361 core has a 64-bit counter in the RFIC clock domain
+that advances on every PHY RX word, consumed or not, by the number of sample periods in the word (1
+in 2R2T, 2 in 1R1T where a word is two consecutive samples). `ad9361.tick_control.timebase` selects
+what frame stamps and gates use: `time_gen` nanoseconds (default, what the other tools expect) or the
+counter. The plugin selects the counter whenever `timed_tx=hardware` (`fpga_timebase=ns` and
+`tx_fine_gate=off` fall back to the previous behaviour).
+
+* **RX.** Each word crosses the clock-domain FIFO and the RX pipeline register together with its tick.
+  The header inserter waits for the first payload word of a frame and stamps the frame with *that
+  word's* tick, so the stamp is the index of the frame's first sample even if samples were dropped
+  inside the FPGA (the drop shows as a jump between consecutive stamps). The plugin uses the stamp as
+  the label; its running count only reports discontinuities.
+* **Timed RX start.** The inserter is held (and drains) until the last word before the requested tick
+  has gone by; the first frame delivered *is* the requested sample.
+* **TX.** `TimedTXGate` (sys) still decides per frame — hold while far in the future, drop when late
+  or stale — but on ticks, and releases `advance` (64) samples early. It pushes one stamp per frame
+  through a small clock-domain FIFO to `TXFineGate` in the RFIC domain, right in front of the PHY,
+  which gives every word of a timed frame its own tick (stamp + position) and emits it in the PHY
+  slot carrying that tick. A word whose slot has passed is discarded; an early word waits. The stream
+  can therefore lose samples but is never shifted, which is why the late margin can be generous
+  again (half a frame): a frame that arrives a little late is trimmed at its head and the rest goes
+  out on its exact ticks.
+* **Word parity.** In 1R1T frames and PHY words start on every other tick. The plugin makes the
+  counter even while nothing streams and starts a burst one sample early with a zero if needed.
+* **Word phase.** The PHY's TX word counter follows the RX word counter (aligned to the chip's
+  RX_FRAME) instead of free-running, so the RX-sample-to-TX-slot relation is the same after every
+  initialisation.
+
+CSRs: `ad9361.tick_control {timebase, load, read, fine_enable}`, `tick_write`, `tick_read`,
+`tick_status {tx_waiting, tx_trimmed}`, `timed_tx.advance`. libm2sdr: `m2sdr_set_sample_timebase()`,
+`m2sdr_get/set_sample_time()`, `m2sdr_get_sample_time_status()`, `m2sdr_set_tx_timed_gate_advance()`.
+All `timed_tx` / `timed_rx` values (stamps, margins, start time) are samples in this mode.
+
+Simulation: `test/test_sample_time.py` — the fine gate for all 16 RX/TX strobe phase pairs, late and
+interrupted frames, odd stamps, the RX chain with dropped samples, timed start, and the coarse + fine
+TX chain.
+
+Result (gateware v7, OCUDU with the stock lower PHY, `timed_tx=hardware,time_base=samples`):
+
+* counter rate 23.040 MHz; the first RX frame is exactly the requested tick (= OCUDU's `init_time`);
+* 8 of 8 starts with 0 non-contiguous RX labels, 0 FPGA discontinuities, 0 late UL requests;
+* RX-minus-TX SSB offset (`align.py`, phone silent): **42 samples on 9 of 9 cold starts**, each
+  including a re-initialisation of the AD9361 — with the nanosecond gate it was 45–46, and 42–43 before
+  the TX word phase was locked to the RX word phase;
+* gate counters `passed == 11272 frames/s`, `late == stale == 0`, fine gate `trimmed == 0`;
+* timing met: WNS +0.038 ns overall and in the 245.76 MHz RFIC domain.
 
 ## Test procedure
 

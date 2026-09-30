@@ -199,7 +199,7 @@ class AD9361RFIC(LiteXModule):
 
         # Buffers (For Timings) --------------------------------------------------------------------
         self.tx_buffer = tx_buffer = stream.Buffer(dma_layout(64))
-        self.rx_buffer = rx_buffer = stream.Buffer(dma_layout(64))
+        self.rx_buffer = rx_buffer = stream.Buffer(rx_tick_layout())  # Data and its tick together.
         # Externally forced "started" (sys domain, quasi-static): the timed-TX gate sets it so the
         # FIFO never adds priming hysteresis between a release and the first emitted sample.
         self.tx_force_started = Signal()
@@ -289,8 +289,7 @@ class AD9361RFIC(LiteXModule):
         self.comb += [
             rx_tick_tracker.inc.eq(self.tick_inc),
             rx_tick_tracker.exact.eq(self._bitmode.fields.mode == 0b00),
-            rx_tick_tracker.pop.eq(self.source.valid & self.source.ready),
-            self._tick_status.fields.rx_overflow.eq(rx_tick_tracker.overflow),
+            self._tick_status.fields.rx_overflow.eq(0),  # (kept for the register layout; no queue any more)
         ]
         self.sync += If(self._tick_control.fields.read, self._tick_read.status.eq(rx_tick_tracker.now))
 
@@ -349,7 +348,7 @@ class AD9361RFIC(LiteXModule):
 
         # RX.
         # ---
-        # PHY -> GPIORXUnpacker -> optional RX RFIC FIFO -> RX CDC -> RX BitMode -> RX Buffer -> Source.
+        # PHY -> GPIORXPacker (+tick) -> optional RX RFIC FIFO -> RX CDC -> RX Buffer -> tick tracker -> RX BitMode -> Source.
         rx_tagged = stream.Endpoint(rx_tick_layout())  # rfic: packed word + its tick.
         self.comb += [
             gpio_rx_packer.source.connect(rx_tagged),
@@ -366,9 +365,9 @@ class AD9361RFIC(LiteXModule):
             rx_tagged,
             rx_rfic_fifo,
             rx_cdc,
+            rx_buffer,
             rx_tick_tracker,
             rx_bitmode,
-            rx_buffer,
             self.source,
         )
 

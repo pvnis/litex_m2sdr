@@ -217,15 +217,15 @@ def test_fine_transparent_when_disabled():
 
 # RX tick tracker -----------------------------------------------------------------------------------
 
-def test_tracker_reports_the_tick_of_the_word_at_the_consumer():
+def test_tracker_reports_the_tick_of_the_word_it_offers():
     dut = RXTickTracker()
-    seen = []   # (data, tick offered with it)
+    seen = []
 
     def producer():
         yield dut.inc.eq(INC)
         yield dut.exact.eq(1)
         tick = 5000
-        for i in range(40):
+        for i in range(30):
             if i == 17:
                 tick += 3 * INC                         # three words dropped upstream
             yield dut.sink.data.eq(0x1000 + i)
@@ -237,36 +237,25 @@ def test_tracker_reports_the_tick_of_the_word_at_the_consumer():
             yield dut.sink.valid.eq(0)
             yield
             tick += INC
-        for _ in range(60):
+        for _ in range(20):
             yield
-
-    # A one-word pipeline register between the tracker and the consumer, and a slow consumer.
-    class Wrap(Module):
-        def __init__(self):
-            self.submodules.dut = dut
-            self.valid = Signal(); self.data = Signal(64); self.ready = Signal()
-            self.comb += dut.source.ready.eq(~self.valid | self.ready)
-            self.sync += [
-                If(dut.source.valid & dut.source.ready, self.valid.eq(1), self.data.eq(dut.source.data)
-                ).Elif(self.ready, self.valid.eq(0))
-            ]
-            self.comb += dut.pop.eq(self.valid & self.ready)
-    w = Wrap()
+        seen.append(("now", (yield dut.now)))
 
     @passive
     def consumer():
         n = 0
         while True:
-            yield w.ready.eq(1 if (n % 3) == 0 else 0)
+            yield dut.source.ready.eq(1 if (n % 3) == 0 else 0)
             yield
-            if (yield w.valid) and (yield w.ready):
-                seen.append(((yield w.data), (yield dut.tick)))
+            if (yield dut.source.valid) and (yield dut.source.ready):
+                seen.append(((yield dut.source.data), (yield dut.tick)))
             n += 1
 
-    run_simulation(w, [producer(), consumer()])
-    assert [d for d, _ in seen] == [0x1000 + i for i in range(40)]
-    expect = [5000 + INC * i + (3 * INC if i >= 17 else 0) for i in range(40)]
-    assert [t for _, t in seen] == expect, list(zip(seen, expect))[:20]
+    run_simulation(dut, [producer(), consumer()])
+    words = [x for x in seen if x[0] != "now"]
+    assert [d for d, _ in words] == [0x1000 + i for i in range(30)]
+    assert [t for _, t in words] == [5000 + INC * i + (3 * INC if i >= 17 else 0) for i in range(30)]
+    assert seen[-1] == ("now", 5000 + INC * 29 + 3 * INC + INC)
 
 
 # RX chain in tick mode: tracker -> pipeline register -> header inserter (+ timed start) -------------
@@ -284,16 +273,17 @@ RX_SYNC        = 0x5aa5_5aa5_5aa5_5aa5
 
 class RXChain(Module):
     def __init__(self):
+        # As in the AD9361 core: pipeline register (data + tick) -> tracker -> consumer.
+        self.submodules.buffer   = buffer   = stream.Buffer([("data", 64), ("tick", 64)])
         self.submodules.tracker  = tracker  = RXTickTracker()
-        self.submodules.buffer   = buffer   = stream.Buffer(dma_layout(64))
         self.submodules.inserter = inserter = RXHeaderInserter(data_width=64, with_csr=False)
         self.submodules.gate     = gate     = TimedRXStart(with_csr=False)
+        self.sink = buffer.sink
         self.comb += [
-            tracker.source.connect(buffer.sink),
-            buffer.source.connect(inserter.sink),
+            buffer.source.connect(tracker.sink),
+            tracker.source.connect(inserter.sink),
             tracker.inc.eq(INC),
             tracker.exact.eq(1),
-            tracker.pop.eq(inserter.sink.valid & inserter.sink.ready),
             inserter.timestamp.eq(tracker.tick),
             inserter.stamp_on_payload.eq(1),
             inserter.header.eq(RX_SYNC),
@@ -319,13 +309,13 @@ def _rx_chain(scenario, drops=(), words=120, period=5):
         for i in range(words):
             if i in drops:
                 state["tick"] += INC * drops[i]           # words lost before the clock-domain FIFO
-            yield dut.tracker.sink.data.eq(state["tick"])
-            yield dut.tracker.sink.tick.eq(state["tick"])
-            yield dut.tracker.sink.valid.eq(1)
+            yield dut.sink.data.eq(state["tick"])
+            yield dut.sink.tick.eq(state["tick"])
+            yield dut.sink.valid.eq(1)
             yield
-            while not (yield dut.tracker.sink.ready):
+            while not (yield dut.sink.ready):
                 yield
-            yield dut.tracker.sink.valid.eq(0)
+            yield dut.sink.valid.eq(0)
             state["tick"] += INC
             for _ in range(period - 1):
                 yield

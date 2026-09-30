@@ -245,8 +245,11 @@ class AD9361PHY(LiteXModule):
         # ------------------
         # Accepts new TX samples just before the serializer wraps to count 0,
         # so the next word starts with the freshly latched IA/QA MSBs.
+        # The TX word phase follows the RX word phase (which is aligned to the chip's RX_FRAME) instead
+        # of free-running: the delay from an RX sample to the TX slot of the same tick is then the same
+        # after every initialisation of the chip, not one of several RFIC clock phases.
         tx_count = Signal(2)
-        self.sync.rfic += tx_count.eq(tx_count + 1)
+        self.sync.rfic += tx_count.eq(rx_count + 1)
         self.comb += [
             sink.ready.eq((tx_count == 3) & (~loopback | loopback_fifo.sink.ready)),
             loopback_fifo.sink.valid.eq(loopback & sink.valid & (tx_count == 3)),
