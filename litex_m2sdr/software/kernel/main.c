@@ -117,6 +117,8 @@ struct litepcie_dma_chan {
 	int64_t writer_sw_count;
 	uint8_t writer_enable;
 	uint8_t reader_enable;
+	uint8_t reader_fifo_mode;      /* FIFO queue model: descriptors queued per submitted buffer */
+	int64_t reader_prog_count;     /* FIFO mode: descriptors queued so far */
 	uint8_t writer_lock;
 	uint8_t reader_lock;
 	uint64_t writer_level_high_water;
@@ -742,25 +744,30 @@ static void litepcie_dma_reader_start(struct litepcie_device *s, int chan_num)
 	litepcie_writel(s, dmachan->base + PCIE_DMA_READER_ENABLE_OFFSET, 0);
 	litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_FLUSH_OFFSET, 1);
 	litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_LOOP_PROG_N_OFFSET, 0);
-	for (i = 0; i < DMA_BUFFER_COUNT; i++) {
-		/* Fill buffer size + parameters */
-		litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_VALUE_OFFSET,
+	if (!dmachan->reader_fifo_mode) {
+		for (i = 0; i < DMA_BUFFER_COUNT; i++) {
+			/* Fill buffer size + parameters */
+			litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_VALUE_OFFSET,
 #ifndef DMA_BUFFER_ALIGNED
-			DMA_LAST_DISABLE |
+				DMA_LAST_DISABLE |
 #endif
-			(!(i % irq_period == 0)) * DMA_IRQ_DISABLE | /* Generate an MSI every n buffers */
-			DMA_BUFFER_SIZE);
-		/* Fill 32-bit Address LSB */
-		litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_VALUE_OFFSET + 4, (dmachan->reader_handle[i] >>  0) & 0xffffffff);
-		/* Write descriptor (and fill 32-bit Address MSB for 64-bit mode) */
-		litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_WE_OFFSET, (dmachan->reader_handle[i] >> 32) & 0xffffffff);
+				(!(i % irq_period == 0)) * DMA_IRQ_DISABLE | /* Generate an MSI every n buffers */
+				DMA_BUFFER_SIZE);
+			/* Fill 32-bit Address LSB */
+			litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_VALUE_OFFSET + 4, (dmachan->reader_handle[i] >>  0) & 0xffffffff);
+			/* Write descriptor (and fill 32-bit Address MSB for 64-bit mode) */
+			litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_WE_OFFSET, (dmachan->reader_handle[i] >> 32) & 0xffffffff);
+		}
+		litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_LOOP_PROG_N_OFFSET, 1);
 	}
-	litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_LOOP_PROG_N_OFFSET, 1);
+	/* FIFO mode: the table stays in prog mode and empty; litepcie_dma_reader_fifo_push()
+	 * queues one descriptor per submitted buffer. */
 
 	/* Clear counters */
 	dmachan->reader_hw_count      = 0;
 	dmachan->reader_hw_count_last = 0;
 	dmachan->reader_sw_count      = 0;
+	dmachan->reader_prog_count    = 0;
 
 	/* Start DMA reader */
 	litepcie_writel(s, dmachan->base + PCIE_DMA_READER_ENABLE_OFFSET, 1);
@@ -774,6 +781,71 @@ static void litepcie_dma_reader_start(struct litepcie_device *s, int chan_num)
 	} else {
 		dev_dbg(&s->dev->dev, "DMA Writer is active; skipping synchronizer re-arm in reader_start\n");
 	}
+}
+
+/* Completed-descriptor count of the DMA reader from its table loop status.
+ * Loop mode: (loops, index of the last descriptor executed) - the historical count.
+ * FIFO (prog) mode: the 32-bit status is the number of descriptors executed.
+ */
+static void litepcie_dma_reader_update_hw_count(struct litepcie_device *s, struct litepcie_dma_chan *dma)
+{
+	uint32_t loop_status = litepcie_readl(s, dma->base + PCIE_DMA_READER_TABLE_LOOP_STATUS_OFFSET);
+	int64_t count;
+
+	if (dma->reader_fifo_mode) {
+		count = (dma->reader_hw_count & ~0xffffffffLL) | loop_status;
+		if (count < dma->reader_hw_count_last)
+			count += 1LL << 32;
+	} else {
+		count = dma->reader_hw_count & ((~(DMA_BUFFER_COUNT - 1) << 16) & 0xffffffffffff0000);
+		count |= (loop_status >> 16) * DMA_BUFFER_COUNT + (loop_status & 0xffff);
+		if (dma->reader_hw_count_last > count)
+			count += (1 << (ilog2(DMA_BUFFER_COUNT) + 16));
+	}
+	dma->reader_hw_count = count;
+	dma->reader_hw_count_last = count;
+}
+
+/* FIFO mode: queue the descriptors of the buffers submitted up to sw_count.
+ * Returns the number of buffers that did not fit in the descriptor table (0 normally:
+ * user space bounds the queue well below the table depth).
+ */
+static int64_t litepcie_dma_reader_fifo_push(struct litepcie_device *s, struct litepcie_dma_chan *dma,
+					     int64_t sw_count)
+{
+	unsigned int irq_period = litepcie_dma_irq_period(READ_ONCE(tx_irq_period));
+	unsigned long flags;
+	int64_t room, left;
+
+	spin_lock_irqsave(&s->lock, flags);
+	/* The table holds DMA_BUFFER_COUNT descriptors and silently ignores a write when full.
+	 * The interrupt-driven count is enough while the queue is short; read the live count
+	 * when it is not. */
+	room = DMA_BUFFER_COUNT - 1 - (dma->reader_prog_count - dma->reader_hw_count);
+	if (sw_count - dma->reader_prog_count > room) {
+		litepcie_dma_reader_update_hw_count(s, dma);
+		room = DMA_BUFFER_COUNT - 1 - (dma->reader_prog_count - dma->reader_hw_count);
+	}
+	while (dma->reader_prog_count < sw_count && room > 0) {
+		unsigned int i = dma->reader_prog_count % DMA_BUFFER_COUNT;
+
+		litepcie_writel(s, dma->base + PCIE_DMA_READER_TABLE_VALUE_OFFSET,
+#ifndef DMA_BUFFER_ALIGNED
+			DMA_LAST_DISABLE |
+#endif
+			(!(dma->reader_prog_count % irq_period == 0)) * DMA_IRQ_DISABLE |
+			DMA_BUFFER_SIZE);
+		litepcie_writel(s, dma->base + PCIE_DMA_READER_TABLE_VALUE_OFFSET + 4,
+				(dma->reader_handle[i] >> 0) & 0xffffffff);
+		litepcie_writel(s, dma->base + PCIE_DMA_READER_TABLE_WE_OFFSET,
+				(dma->reader_handle[i] >> 32) & 0xffffffff);
+		dma->reader_prog_count++;
+		room--;
+	}
+	left = sw_count - dma->reader_prog_count;
+	spin_unlock_irqrestore(&s->lock, flags);
+
+	return left > 0 ? left : 0;
 }
 
 /* Stop DMA reader for a specific channel */
@@ -802,6 +874,8 @@ static void litepcie_dma_reader_stop(struct litepcie_device *s, int chan_num)
 	dmachan->reader_hw_count      = 0;
 	dmachan->reader_hw_count_last = 0;
 	dmachan->reader_sw_count      = 0;
+	dmachan->reader_prog_count    = 0;
+	dmachan->reader_fifo_mode     = 0;
 }
 
 /* Stop all DMA channels */
@@ -855,13 +929,7 @@ static irqreturn_t litepcie_interrupt(int irq, void *data)
 		chan = &s->chan[i];
 		/* DMA reader interrupt handling */
 		if (irq_vector & (1 << chan->dma.reader_interrupt)) {
-			loop_status = litepcie_readl(s, chan->dma.base +
-				PCIE_DMA_READER_TABLE_LOOP_STATUS_OFFSET);
-			chan->dma.reader_hw_count &= ((~(DMA_BUFFER_COUNT - 1) << 16) & 0xffffffffffff0000);
-			chan->dma.reader_hw_count |= (loop_status >> 16) * DMA_BUFFER_COUNT + (loop_status & 0xffff);
-			if (chan->dma.reader_hw_count_last > chan->dma.reader_hw_count)
-				chan->dma.reader_hw_count += (1 << (ilog2(DMA_BUFFER_COUNT) + 16));
-			chan->dma.reader_hw_count_last = chan->dma.reader_hw_count;
+			litepcie_dma_reader_update_hw_count(s, &chan->dma);
 			litepcie_dma_update_level_stats(&chan->dma);
 #ifdef DEBUG_MSI
 			dev_dbg(&s->dev->dev, "MSI DMA%d Reader buf: %lld\n", i,
@@ -1122,6 +1190,9 @@ static ssize_t litepcie_write(struct file *file, const char __user *data, size_t
 			break;
 		}
 	}
+
+	if (chan->dma.reader_fifo_mode)
+		litepcie_dma_reader_fifo_push(s, &chan->dma, chan->dma.reader_sw_count);
 
 	if (underflows) {
 		chan->dma.reader_underflow_events++;
@@ -1481,7 +1552,31 @@ static long litepcie_ioctl(struct file *file, unsigned int cmd,
 		}
 
 		chan->dma.reader_sw_count = m.sw_count;
+		/* FIFO mode: queue the new buffers. What does not fit in the descriptor table
+		 * (never, with a bounded queue in user space) is queued by the next update. */
+		if (chan->dma.reader_fifo_mode && chan->dma.reader_enable)
+			litepcie_dma_reader_fifo_push(dev, &chan->dma, m.sw_count);
 		litepcie_dma_update_level_stats(&chan->dma);
+	}
+	break;
+	case LITEPCIE_IOCTL_DMA_READER_MODE:
+	{
+		struct litepcie_ioctl_dma_reader_mode m;
+
+		if (copy_from_user(&m, (void *)arg, sizeof(m))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (m.mode > LITEPCIE_DMA_READER_MODE_FIFO) {
+			ret = -EINVAL;
+			break;
+		}
+		/* The queue model is part of how the reader is started. */
+		if (chan->dma.reader_enable) {
+			ret = -EBUSY;
+			break;
+		}
+		chan->dma.reader_fifo_mode = (m.mode == LITEPCIE_DMA_READER_MODE_FIFO);
 	}
 	break;
 	case LITEPCIE_IOCTL_DMA_STATS:
@@ -2478,7 +2573,7 @@ static int __init litepcie_module_init(void)
 		litepcie_class = class_create(THIS_MODULE, LITEPCIE_NAME);
 	#else
 		litepcie_class = class_create(LITEPCIE_NAME);
-	#endif
+#endif
 	if (!litepcie_class) {
 		ret = -EEXIST;
 		pr_err(" Failed to create class\n");

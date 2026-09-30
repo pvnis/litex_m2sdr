@@ -1,4 +1,4 @@
-# RX delivery lag: interrupts, the completed-buffer count, and what a poll-mode driver would change
+# RX delivery lag and the TX FIFO queue: interrupts, the completed-buffer count, what a poll-mode driver would change
 
 Branch `hw-timed-tx`, 2026-09-30. Measured with OCUDU (gNB, TDD n78, 23.04 MSps, 1R1T, SC16) on an
 i7-9750H laptop (6 cores, stock Ubuntu kernel 7.0, governor `performance`). A DMA buffer is 8 KiB =
@@ -115,7 +115,7 @@ Conclusion: for RX delivery the interrupt-driven driver with one interrupt per b
 a poll-mode driver at the median and identical in the tail on this host. The remaining latency budget
 problem is on the TX side and is about ring semantics, not about interrupts.
 
-## What still limits the RX-to-TX budget: the TX ring
+## What then limited the RX-to-TX budget: the free-running TX ring (loop mode)
 
 With the RX lag gone, OCUDU hands each DL slot to the driver `rx_to_tx_delay − ~60 µs` ahead of its time
 (stock 1 ms: 942 µs average, 673–899 µs minimum per 5 s window). The TX path as it is built cannot live
@@ -162,22 +162,42 @@ actually late because of the stall are a handful.
 So the delay is no longer sized by the RX lag (that needed ~1 ms of it) but by the largest host stall the
 TX ring must never see, because one underrun costs 80 ms instead of the stall itself.
 
-### What would fix it
+### The fix: a FIFO queue for TX (`tx_dma=fifo`, default with `timed_tx=hardware`)
 
-TX needs FIFO semantics: the reader must stop when there is nothing new, the way a USRP's flow-controlled
-TX FIFO (or a poll-mode driver's descriptor ring with a tail pointer) does. Two ways, both without gateware:
+TX needs FIFO semantics: the reader must stop when there is nothing new, the way a USRP's
+flow-controlled TX FIFO (or a poll-mode driver's descriptor ring with a tail pointer) does. LitePCIe
+already has it: the descriptor table's *prog* mode executes each descriptor once and the DMA stops when
+the table is empty. No gateware change.
 
-1. **LitePCIe table *prog* mode** (kernel driver + libm2sdr): the driver queues one descriptor per
-   submitted frame instead of pre-loading a looping table; the reader stops when the table is empty. A
-   frame then needs only the PCIe fetch time of lead (tens of µs), an underrun costs exactly the late
-   frames, and the ring-lead / resync / stale logic goes away. Cost: three CSR writes per frame in the
-   submit ioctl.
-2. **A silence timeline in the ring** (libm2sdr + plugin only): every slot ahead of the write pointer is
-   pre-stamped with the time it will be due and a zero payload, so the reader always advances in real
-   time, and a frame that arrives too late is simply not seen. Needs ~0.25 ms of lead (the FPGA
-   prefetch) and a fixed frame grid.
+| Where | Change |
+|---|---|
+| `kernel/litepcie.h`, `main.c` | ioctl `LITEPCIE_IOCTL_DMA_READER_MODE` (loop / FIFO), accepted while the reader is stopped and reset to loop at every reader stop. In FIFO mode the table is left empty in prog mode and each `MMAP_DMA_READER_UPDATE` (the submit) queues one descriptor per new buffer (three CSR writes). `hw_count` is then the exact number of buffers fetched (the 32-bit table status). |
+| `libm2sdr` | `m2sdr_set_tx_fifo_mode()` / `m2sdr_get_tx_fifo_mode()`; the TX acquire has no ring lead and no resync in this mode, only the queue-depth bound (`tx_fifo_buffers`, checked against the live count when the interrupt-driven one says "full") |
+| Soapy plugin | device argument `tx_dma=fifo` (default in hardware-timed mode) or `tx_dma=loop`; logs `TX DMA: FIFO queue` when the kernel accepted it (an older module falls back to loop mode) |
 
-With either, the stock 1 ms budget leaves 0.7–0.9 ms for host jitter, and the last OCUDU core change
-(`OCUDU_LPHY_RX_TO_TX_DELAY_US`) can go. On this host a late slot would then still happen whenever a
-stall exceeds that margin (the per-10 s maximum of the RX lag is 0.5–1.1 ms, occasionally 2–3 ms), but
-it would cost that slot and nothing else, as with any radio.
+What it changes: a frame is fetched as soon as it is submitted (the lead it needs is the PCIe fetch
+time, tens of µs, instead of ~0.55 ms), nothing is ever read twice (no stale frames, no racing reader),
+and a frame that is submitted too late is dropped by the gate on its own; the next frame that is on time
+is emitted on its tick. The per-word fine gate still salvages the on-time part of a frame that is late
+by less than half a frame.
+
+Results with the FIFO queue (same host, same cell):
+
+| `OCUDU_LPHY_RX_TO_TX_DELAY_US` | TX lead at hand-off (typical min / avg) | gate late / stale in a 48 s window | reader racing |
+|---|---|---|---|
+| 5000 | 4897 / 4947 µs | 0 / 0 | |
+| 2000 | 1900 / 1950 µs | 0 / 0 | |
+| 1500 | 1380 / 1445 µs | 0 / 0 | |
+| not set (stock 1 ms, stock OCUDU) | 900 / 950 µs | 0 / 0 | none: 11 272 frames/s, no interval above 30 k/s |
+
+Stock OCUDU (no delay knob, default `expert_phy` and RA window), 14-minute soak with the phone attached
+and pinging: 292 late frames of 9.5 million (0–42 per minute, 0.003 %), 0 stale, 0 `PUxCH request late`,
+0 `UL processor is busy`, 0 RX discontinuities, no guardian restart, ping 2769/2800. The TX lead minimum
+per 5 s window is typically ~900 µs; the lowest eight of 177 windows were −765, 170, 195, 296, 314, 324,
+345 and 392 µs, i.e. host stalls of 0.6–1.7 ms, each of which now costs the frames that were late and
+nothing else. Attach and ping 150/150 (149/150 once) on the three starts before it; residual RX-minus-TX
+offset still 0 samples with `OCUDU_SOAPY_RX_TS_SHIFT=-42`; HARQ error rates DL ~4 %, UL 4–9 % (they were
+DL 3–19 %, UL 10–28 % with the 4 ms lead).
+
+Not covered: `write()` (non-mmap) TX in FIFO mode is implemented in the kernel but untested; FIFO mode
+is only requested by the plugin in hardware-timed mode.

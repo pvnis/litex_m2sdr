@@ -83,6 +83,9 @@ struct m2sdr_dev {
      * have not been consumed by the DMA reader yet. 0 = the whole ring. */
     int64_t  tx_max_pending;
     uint64_t pcie_tx_resync_events;
+    /* TX FIFO queue model (kernel DMA reader in table prog mode): requested / active. */
+    int      tx_fifo_request;
+    int      tx_fifo_mode;
     /* RX busy-poll mode: completed-buffer count taken from the DMA writer's live table index. */
     int      rx_busy_poll;
     int      rx_live_valid;

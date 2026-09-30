@@ -23,6 +23,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -839,6 +840,7 @@ int m2sdr_stream_deactivate(struct m2sdr_dev *dev, enum m2sdr_direction directio
             litepcie_dma_reader(dev->tx_dma.fds.fd, 0,
                                 &dev->tx_dma.reader_hw_count,
                                 &dev->tx_dma.reader_sw_count);
+            dev->tx_fifo_mode = 0;
         }
         return M2SDR_ERR_OK;
     }
@@ -877,6 +879,14 @@ int m2sdr_stream_activate(struct m2sdr_dev *dev, enum m2sdr_direction direction)
         } else if (direction == M2SDR_TX && dev->tx_configured) {
             struct litepcie_dma_ctrl *dma = &dev->tx_dma;
             dma->reader_enable = 1;
+            dev->tx_fifo_mode = 0;
+            if (dev->zero_copy && dev->tx_fifo_request) {
+                /* The queue model is chosen while the reader is stopped; the kernel falls back to
+                 * loop mode at every reader stop. ENOTTY = a driver without the FIFO mode. */
+                struct litepcie_ioctl_dma_reader_mode mode = {.mode = LITEPCIE_DMA_READER_MODE_FIFO};
+                if (ioctl(dma->fds.fd, LITEPCIE_IOCTL_DMA_READER_MODE, &mode) == 0)
+                    dev->tx_fifo_mode = 1;
+            }
             if (dev->zero_copy) {
                 litepcie_dma_reader(dma->fds.fd, 1,
                                     &dma->reader_hw_count,
@@ -1070,6 +1080,37 @@ static int m2sdr_wait_tx_buffer(struct m2sdr_dev *dev, char **buf, unsigned time
                 return M2SDR_ERR_STATE;
 
             int64_t hw_now = dma->reader_hw_count;
+            if (dev->tx_fifo_mode) {
+                /* FIFO queue: the reader only fetches what was submitted, so there is no lead to
+                 * keep and nothing to resynchronise. The only limit is the queue depth: the
+                 * application's bound (back-pressure) and the ring/descriptor table. */
+                int64_t limit = buffer_count - 8;
+                if (dev->tx_max_pending > 0 && dev->tx_max_pending < limit)
+                    limit = dev->tx_max_pending;
+                int64_t pending = dev->tx_user_count - hw_now;
+                if (pending >= limit) {
+                    /* The kernel count is as old as the last DMA interrupt; the table status is
+                     * the live number of descriptors fetched (32 bits). */
+                    uint32_t fetched = 0;
+                    if (m2sdr_reg_read(dev, CSR_PCIE_DMA0_READER_TABLE_LOOP_STATUS_ADDR, &fetched) == 0) {
+                        hw_now += (int64_t)(uint32_t)(fetched - (uint32_t)hw_now);
+                        pending = dev->tx_user_count - hw_now;
+                    }
+                }
+                if (pending < limit) {
+                    int buf_offset = dev->tx_user_count % buffer_count;
+                    *buf = dma->buf_wr + buf_offset * dma->mmap_dma_info.dma_tx_buf_size;
+                    dev->tx_user_count++;
+                    return M2SDR_ERR_OK;
+                }
+                if (timeout_ms == M2SDR_TIMEOUT_NOWAIT)
+                    return M2SDR_ERR_TIMEOUT;
+                if (timeout_ms > 0 && (get_time_ms() - start) > (int64_t)timeout_ms)
+                    return M2SDR_ERR_TIMEOUT;
+                /* Full of buffers that are not due yet: they drain at the sample rate. */
+                usleep(50);
+                continue;
+            }
             if (dev->tx_min_lead > 0 &&
                 dev->tx_user_count - hw_now < dev->tx_min_lead + 2 * DMA_BUFFER_PER_IRQ) {
                 /* The kernel refreshes hw_count only on the DMA IRQ (every 8 buffers); when the cheap
@@ -1499,6 +1540,19 @@ int m2sdr_set_rx_busy_poll(struct m2sdr_dev *dev, bool enable)
     dev->rx_busy_poll = enable ? 1 : 0;
     dev->rx_live_valid = 0;
     return M2SDR_ERR_OK;
+}
+
+int m2sdr_set_tx_fifo_mode(struct m2sdr_dev *dev, bool enable)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+    dev->tx_fifo_request = enable ? 1 : 0;
+    return M2SDR_ERR_OK;
+}
+
+bool m2sdr_get_tx_fifo_mode(struct m2sdr_dev *dev)
+{
+    return dev && dev->tx_fifo_mode;
 }
 
 uint64_t m2sdr_get_tx_resync_events(struct m2sdr_dev *dev)

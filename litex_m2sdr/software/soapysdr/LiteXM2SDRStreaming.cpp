@@ -1192,13 +1192,34 @@ int SoapyLiteXM2SDR::activateStream(
                  * dropped as late) at start-up. Zeroed slots are untimed silence. */
                 std::memset(_tx_stream.buf, 0, _tx_buf_count * _tx_buf_stride);
             }
+            bool tx_fifo = false;
+            if (_tx_stream.timed_tx_hw) {
+                /* TX queue model. tx_dma=fifo (default): the kernel queues one DMA descriptor per
+                 * submitted frame and the reader stops when the queue is empty, like a USRP's TX
+                 * FIFO. tx_dma=loop: the reader free-runs through the ring (needs the ring lead
+                 * below, and an underrun makes it race through stale slots). */
+                const std::string v = get_kwargs_string(SoapySDR::Kwargs(), _deviceArgs, "tx_dma", "fifo");
+                (void)m2sdr_set_tx_fifo_mode(_dev, !(v == "loop" || v == "ring"));
+            } else {
+                (void)m2sdr_set_tx_fifo_mode(_dev, false);
+            }
             int rc = m2sdr_stream_activate(_dev, M2SDR_TX);
             if (rc != M2SDR_ERR_OK) {
                 SoapySDR::logf(SOAPY_SDR_ERROR,
                     "PCIe TX stream activation failed: %s", m2sdr_strerror(rc));
                 return SOAPY_SDR_STREAM_ERROR;
             }
-            if (_tx_stream.timed_tx_hw) {
+            tx_fifo = m2sdr_get_tx_fifo_mode(_dev);
+            if (_tx_stream.timed_tx_hw && tx_fifo) {
+                /* Same bounded queue as below (back-pressure); no ring lead: a frame is fetched as
+                 * soon as it is submitted. */
+                const unsigned depth = static_cast<unsigned>(
+                    get_kwargs_size(SoapySDR::Kwargs(), _deviceArgs, "tx_fifo_buffers", 96));
+                (void)m2sdr_set_tx_ring_lead(_dev, 0);
+                (void)m2sdr_set_tx_ring_depth(_dev, depth);
+                SoapySDR::logf(SOAPY_SDR_INFO, "TX DMA: FIFO queue (descriptor per submitted frame), depth %u buffers", depth);
+                litex_m2sdr_writel(_dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
+            } else if (_tx_stream.timed_tx_hw) {
                 /* Write at least this many slots ahead of the free-running reader (it prefetches
                  * about two buffers); the frame timestamps, not the ring position, set emission. */
                 /* Measured against the reader's live table index (libm2sdr): just past its ~3-slot

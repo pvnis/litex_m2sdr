@@ -760,6 +760,15 @@ int  m2sdr_set_tx_ring_lead(struct m2sdr_dev *dev, unsigned min_lead_buffers);
  * once that many submitted buffers are still unconsumed. 0 = whole ring (previous behaviour). */
 int  m2sdr_set_tx_ring_depth(struct m2sdr_dev *dev, unsigned max_pending_buffers);
 uint64_t m2sdr_get_tx_resync_events(struct m2sdr_dev *dev);
+/* TX queue model (PCIe zero-copy). Default (loop): the DMA reader free-runs through the buffer
+ * ring, so the host must stay ahead of it and an underrun makes it re-read old slots. FIFO: the
+ * kernel queues one DMA descriptor per submitted buffer and the reader stops when the queue is
+ * empty, like a flow-controlled TX FIFO: a buffer is fetched as soon as it is submitted, nothing
+ * is ever read twice, and a late buffer costs only itself. Request it before activating the TX
+ * stream; m2sdr_get_tx_fifo_mode() tells whether the kernel driver accepted it (older drivers
+ * do not know the mode and the stream then runs in loop mode). */
+int  m2sdr_set_tx_fifo_mode(struct m2sdr_dev *dev, bool enable);
+bool m2sdr_get_tx_fifo_mode(struct m2sdr_dev *dev);
 /* RX wake-up mode (PCIe zero-copy). Default: the RX buffer acquire sleeps in poll() until the DMA
  * interrupt (kernel module parameter rx_irq_period = buffers per interrupt). Busy-poll: the acquire
  * spins on the DMA writer's live table index instead, the way a poll-mode driver would - no interrupt

@@ -61,6 +61,22 @@ struct litepcie_ioctl_mmap_dma_update {
 	int64_t sw_count;
 };
 
+/* TX (DMA reader) queue model, selected before the reader is enabled:
+ *  LOOP: the descriptor table loops over all DMA buffers; the reader free-runs through
+ *        the ring whether or not the host has written a buffer (upstream behaviour).
+ *  FIFO: one descriptor is queued per buffer the host submits (sw_count updates) and the
+ *        reader stops when the queue is empty. hw_count is then the exact number of
+ *        buffers fetched. The mode returns to LOOP when the reader is disabled.
+ */
+enum litepcie_dma_reader_mode {
+	LITEPCIE_DMA_READER_MODE_LOOP = 0,
+	LITEPCIE_DMA_READER_MODE_FIFO = 1,
+};
+
+struct litepcie_ioctl_dma_reader_mode {
+	uint8_t mode;
+};
+
 enum litepcie_dma_stats_direction {
 	LITEPCIE_DMA_STATS_WRITER = 0,
 	LITEPCIE_DMA_STATS_READER = 1,
@@ -115,5 +131,6 @@ struct litepcie_ioctl_sata_dma {
 #define LITEPCIE_IOCTL_MMAP_DMA_READER_UPDATE    _IOW(LITEPCIE_IOCTL,  27, struct litepcie_ioctl_mmap_dma_update)
 #define LITEPCIE_IOCTL_SATA_DMA                  _IOWR(LITEPCIE_IOCTL, 28, struct litepcie_ioctl_sata_dma)
 #define LITEPCIE_IOCTL_DMA_STATS                 _IOWR(LITEPCIE_IOCTL, 29, struct litepcie_ioctl_dma_stats)
+#define LITEPCIE_IOCTL_DMA_READER_MODE           _IOW(LITEPCIE_IOCTL,  30, struct litepcie_ioctl_dma_reader_mode)
 
 #endif /* _LINUX_LITEPCIE_H */
