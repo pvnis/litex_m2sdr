@@ -70,11 +70,13 @@ def _run(scenario, **cfg):
         yield dut.frames_active.eq(cfg.get("frames_active", 1))
         yield dut.enable.eq(cfg.get("enable", 1))
         yield dut.late_margin.eq(cfg.get("late_margin", 100))
+        yield dut.stale_margin.eq(cfg.get("stale_margin", 100_000))
         yield
         yield from scenario(h)
         for _ in range(20):
             yield
         h.late   = yield dut.late_count
+        h.stale  = yield dut.stale_count
         h.held   = yield dut.held_count
         h.passed = yield dut.passed_count
 
@@ -133,6 +135,17 @@ def test_late_frame_is_dropped_and_counted():
     assert words(h, 0x500) == []                                   # dropped
     assert words(h, 0x600) == list(range(0x600, 0x600 + FRAME_WORDS))  # stream continues
     assert (h.late, h.passed) == (1, 1)
+
+
+def test_stale_ring_reread_is_dropped_and_counted_separately():
+    def scenario(h):
+        for _ in range(2000):
+            yield
+        yield from h.send_frame(0x900, ts=h.now - 15_000)          # 15 us late: beyond the 10 us stale margin
+        yield from h.send_frame(0xa00, ts=h.now - 5_000)           # 5 us late: a genuinely late frame
+    dut, h = _run(scenario, stale_margin=10_000)
+    assert words(h, 0x900) == [] and words(h, 0xa00) == []
+    assert (h.stale, h.late) == (1, 1)
 
 
 def test_slightly_late_frame_within_margin_passes():

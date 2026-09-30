@@ -696,6 +696,7 @@ int  m2sdr_set_tx_header(struct m2sdr_dev *dev, bool enable);
  * reports whether this library was built against such a CSR map. */
 struct m2sdr_timed_tx_stats {
     uint32_t late_count;   /* frames dropped because they arrived after timestamp + late margin */
+    uint32_t stale_count;  /* frames dropped as stale ring re-reads (later than the stale margin) */
     uint32_t held_count;   /* frames held until their timestamp */
     uint32_t passed_count; /* frames emitted */
     uint8_t  state;        /* 0=IDLE, 1=HOLD, 2=PASS, 3=DROP */
@@ -704,7 +705,10 @@ struct m2sdr_timed_tx_stats {
     uint64_t armed_ts;     /* timestamp (ns) of the frame being held/emitted */
 };
 bool m2sdr_has_tx_timed_gate(struct m2sdr_dev *dev);
-int  m2sdr_set_tx_timed_gate(struct m2sdr_dev *dev, bool enable, uint32_t late_margin_ns);
+/* late_margin_ns: a frame later than this is dropped. stale_margin_ns: a dropped frame later than
+ * this is a stale re-read of a ring slot the free-running DMA reader already emitted a lap ago
+ * (the host left a gap), counted in stale_count instead of late_count; 0 keeps the gateware default. */
+int  m2sdr_set_tx_timed_gate(struct m2sdr_dev *dev, bool enable, uint32_t late_margin_ns, uint32_t stale_margin_ns);
 int  m2sdr_reset_tx_timed_gate_counts(struct m2sdr_dev *dev);
 int  m2sdr_get_tx_timed_gate_stats(struct m2sdr_dev *dev, struct m2sdr_timed_tx_stats *stats);
 /* Hardware-timed TX ring placement. The PCIe DMA reader free-runs over the ring and

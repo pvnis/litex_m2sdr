@@ -952,7 +952,13 @@ int SoapyLiteXM2SDR::activateStream(
             refreshTimedTxDefaults();
             const uint32_t margin_ns = static_cast<uint32_t>(
                 std::max<long long>(0, _tx_stream.timed_tx_late_margin_ns));
-            int rc = m2sdr_set_tx_timed_gate(_dev, true, margin_ns);
+            /* Half a ring lap: a dropped frame older than this is a re-read of a slot the reader
+             * already emitted (the host left a gap), not one of the host's frames arriving late. */
+            const uint32_t stale_ns = static_cast<uint32_t>(std::max<long long>(1,
+                samples_to_ns(_tx_stream.samplerate,
+                              static_cast<long long>(_tx_buf_count / 2) *
+                              static_cast<long long>(this->getStreamMTU(TX_STREAM)))));
+            int rc = m2sdr_set_tx_timed_gate(_dev, true, margin_ns, stale_ns);
             if (rc != M2SDR_ERR_OK) {
                 SoapySDR::logf(SOAPY_SDR_ERROR,
                     "enabling the hardware timed-TX gate failed: %s", m2sdr_strerror(rc));
@@ -960,6 +966,8 @@ int SoapyLiteXM2SDR::activateStream(
             }
             (void)m2sdr_reset_tx_timed_gate_counts(_dev);
             _tx_stream.hw_late_seen = 0;
+            _tx_stream.hw_stale_seen = 0;
+            _tx_stream.hw_stale_log = std::chrono::steady_clock::now();
             _tx_stream.hw_resync_seen = m2sdr_get_tx_resync_events(_dev);
             _tx_stream.hw_stats_poll = std::chrono::steady_clock::now();
             /* The FPGA owns emission timing: no software anchoring against the DMA counters. */
@@ -1035,7 +1043,7 @@ void SoapyLiteXM2SDR::stopTxStreamUnlocked()
     if (isLitePCIe()) {
         /* Disable the DMA engine for TX. */
         if (_tx_stream.timed_tx_hw) {
-            (void)m2sdr_set_tx_timed_gate(_dev, false, 0);
+            (void)m2sdr_set_tx_timed_gate(_dev, false, 0, 0);
             (void)m2sdr_set_tx_ring_lead(_dev, 0);
         }
         int rc = m2sdr_stream_deactivate(_dev, M2SDR_TX);
@@ -2635,8 +2643,19 @@ int SoapyLiteXM2SDR::readStreamStatus(
                         }
                     }
                     struct m2sdr_timed_tx_stats st;
-                    if (m2sdr_get_tx_timed_gate_stats(_dev, &st) == M2SDR_ERR_OK &&
-                        st.late_count != _tx_stream.hw_late_seen) {
+                    const bool have_st = m2sdr_get_tx_timed_gate_stats(_dev, &st) == M2SDR_ERR_OK;
+                    if (have_st && st.stale_count != _tx_stream.hw_stale_seen &&
+                        now - _tx_stream.hw_stale_log >= std::chrono::seconds(1)) {
+                        /* Stale ring re-reads are dropped silently by the FPGA; they only mean the
+                         * host left a gap. Not a TIME_ERROR (the caller would end its burst and
+                         * create the next gap), but worth knowing about. */
+                        SoapySDR::logf(SOAPY_SDR_INFO,
+                            "TX ring: %u stale slots swept since the last report (host gap)",
+                            st.stale_count - _tx_stream.hw_stale_seen);
+                        _tx_stream.hw_stale_seen = st.stale_count;
+                        _tx_stream.hw_stale_log = now;
+                    }
+                    if (have_st && st.late_count != _tx_stream.hw_late_seen) {
                         _tx_stream.hw_late_seen = st.late_count;
                         flags |= SOAPY_SDR_HAS_TIME;
                         timeNs = static_cast<long long>(st.armed_ts);

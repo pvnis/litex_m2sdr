@@ -16,9 +16,13 @@ The gate gives the TX path USRP-like semantics:
          nothing is emitted, so the RFIC PHY starves and outputs zeros until the release instant.
 * PASS  when ``timestamp <= time <= timestamp + late_margin``: the frame streams straight through.
          In a continuous stream every frame after the first release arrives exactly on time.
-* DROP  when ``time - timestamp > late_margin``: the whole frame is consumed and discarded and
-         ``late_count`` increments. After a host stall the stream therefore re-aligns itself at the
-         first on-time frame instead of shifting the timeline.
+* DROP  when ``time - timestamp > late_margin``: the whole frame is consumed and discarded. It is
+         counted in ``late_count``, or in ``stale_count`` when it is older than ``stale_margin``: the
+         DMA reader free-runs over the ring, so whenever the host leaves a gap the reader re-reads
+         slots it already emitted a lap earlier (22.7 ms at 23.04 MSps). Those are not the host's
+         frames being late and must not be reported as such (srsRAN/OCUDU reacts to a late report by
+         ending the burst, which creates the next gap). After a host stall the stream re-aligns
+         itself at the first on-time frame instead of shifting the timeline.
 
 A frame with ``timestamp == 0`` (libm2sdr writes 0 when the caller passes no time) is untimed and
 passes immediately, so untimed tools keep working with the gate enabled. With ``enable == 0`` the
@@ -52,10 +56,12 @@ class TimedTXGate(LiteXModule):
 
         self.enable        = Signal()   # i (CSR): 1 = timed gating, 0 = pass-through.
         self.late_margin   = Signal(32) # i (CSR): ns a frame may be late and still be emitted.
+        self.stale_margin  = Signal(32) # i (CSR): ns after which a late frame is a stale ring re-read.
         self.active        = Signal()   # o: gating in effect (enable & frames_active).
 
         # Status.
         self.late_count   = Signal(32)  # o: frames dropped because they were late.
+        self.stale_count  = Signal(32)  # o: frames dropped as stale ring re-reads (late > stale_margin).
         self.held_count   = Signal(32)  # o: frames that waited for their timestamp.
         self.passed_count = Signal(32)  # o: frames emitted.
         self.state        = Signal(2)   # o: 0=IDLE, 1=HOLD, 2=PASS, 3=DROP.
@@ -70,6 +76,7 @@ class TimedTXGate(LiteXModule):
         # they never sit on a single-cycle path; the FSM spends one DECIDE cycle per frame to use them.
         lateness  = Signal(64)   # combinational: time - timestamp
         is_late   = Signal()
+        is_stale  = Signal()
         is_future = Signal()
         is_timed  = Signal()
         self.comb += lateness.eq(self.time - self.timestamp)
@@ -78,6 +85,7 @@ class TimedTXGate(LiteXModule):
         self.sync += [
             is_future.eq(self.time < self.timestamp),
             is_late.eq((self.time >= self.timestamp) & (lateness > self.late_margin)),
+            is_stale.eq(lateness > self.stale_margin),
             is_timed.eq(self.timestamp != 0),
         ]
 
@@ -110,7 +118,11 @@ class TimedTXGate(LiteXModule):
                 NextValue(self.held_count, self.held_count + 1),
                 NextState("HOLD")
             ).Elif(is_late,
-                NextValue(self.late_count, self.late_count + 1),
+                If(is_stale,
+                    NextValue(self.stale_count, self.stale_count + 1),
+                ).Else(
+                    NextValue(self.late_count, self.late_count + 1),
+                ),
                 NextState("DROP")
             ).Else(
                 NextState("PASS")
@@ -146,7 +158,7 @@ class TimedTXGate(LiteXModule):
         if with_csr:
             self.add_csr()
 
-    def add_csr(self, default_enable=0, default_late_margin_ns=100_000):
+    def add_csr(self, default_enable=0, default_late_margin_ns=100_000, default_stale_margin_ns=10_000_000):
         self._control = CSRStorage(fields=[
             CSRField("enable", size=1, offset=0, values=[
                 ("``0b0``", "Pass-through (software-timed TX)."),
@@ -156,7 +168,10 @@ class TimedTXGate(LiteXModule):
         ])
         self._late_margin  = CSRStorage(32, reset=default_late_margin_ns,
             description="Late margin in ns: a frame older than this at arrival is dropped.")
-        self._late_count   = CSRStatus(32, description="Frames dropped as late.")
+        self._stale_margin = CSRStorage(32, reset=default_stale_margin_ns,
+            description="Stale margin in ns: a frame later than this is a ring re-read, counted in stale_count.")
+        self._late_count   = CSRStatus(32, description="Frames dropped as late (late_margin < lateness <= stale_margin).")
+        self._stale_count  = CSRStatus(32, description="Frames dropped as stale ring re-reads (lateness > stale_margin).")
         self._held_count   = CSRStatus(32, description="Frames held until their timestamp.")
         self._passed_count = CSRStatus(32, description="Frames emitted.")
         self._status       = CSRStatus(fields=[
@@ -169,7 +184,9 @@ class TimedTXGate(LiteXModule):
         self.comb += [
             self.enable.eq(self._control.fields.enable),
             self.late_margin.eq(self._late_margin.storage),
+            self.stale_margin.eq(self._stale_margin.storage),
             self._late_count.status.eq(self.late_count),
+            self._stale_count.status.eq(self.stale_count),
             self._held_count.status.eq(self.held_count),
             self._passed_count.status.eq(self.passed_count),
             self._status.fields.state.eq(self.state),
@@ -179,6 +196,7 @@ class TimedTXGate(LiteXModule):
         ]
         self.sync += If(self._control.fields.reset_counts,
             self.late_count.eq(0),
+            self.stale_count.eq(0),
             self.held_count.eq(0),
             self.passed_count.eq(0),
         )

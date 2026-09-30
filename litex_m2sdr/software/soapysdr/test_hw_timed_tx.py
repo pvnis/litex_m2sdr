@@ -69,7 +69,7 @@ def reg_read64(addr):
 
 def gate_stats():
     st = {}
-    for n in ["CONTROL", "LATE_COUNT", "HELD_COUNT", "PASSED_COUNT", "STATUS"]:
+    for n in ["CONTROL", "LATE_COUNT", "STALE_COUNT", "HELD_COUNT", "PASSED_COUNT", "STATUS"]:
         a = csr(f"CSR_TIMED_TX_{n}_ADDR")
         st[n.lower()] = reg_read(a) if a is not None else None
     a = csr("CSR_TIMED_TX_ARMED_TS_ADDR")

@@ -535,6 +535,8 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
          * DMA header; the software timeline then only supplies stamps for untimed writes. */
         bool timed_tx_hw = false;
         uint32_t hw_late_seen = 0;
+        uint32_t hw_stale_seen = 0;
+        std::chrono::steady_clock::time_point hw_stale_log;
         unsigned hw_submit_log = 0;
         std::chrono::steady_clock::time_point hw_stats_poll{};
         size_t timed_tx_lead_buffers = 0;

@@ -1039,9 +1039,12 @@ static int m2sdr_wait_tx_buffer(struct m2sdr_dev *dev, char **buf, unsigned time
                 return M2SDR_ERR_STATE;
 
             int64_t hw_now = dma->reader_hw_count;
-            if (dev->tx_min_lead > 0) {
-                /* The kernel refreshes hw_count only on the DMA IRQ (every 8 buffers); read the
-                 * reader's live table index so the lead is measured from where the reader really is. */
+            if (dev->tx_min_lead > 0 &&
+                dev->tx_user_count - hw_now < dev->tx_min_lead + 2 * DMA_BUFFER_PER_IRQ) {
+                /* The kernel refreshes hw_count only on the DMA IRQ (every 8 buffers); when the cheap
+                 * check says we are close, read the reader's live table index so the lead is measured
+                 * from where the reader really is. (In steady state the host is tens of buffers ahead
+                 * and this register read, an ioctl, is skipped.) */
                 uint32_t loop = 0;
                 if (m2sdr_reg_read(dev, CSR_PCIE_DMA0_READER_TABLE_LOOP_STATUS_ADDR, &loop) == 0) {
                     const int64_t modulus = (int64_t)65536 * buffer_count;   /* 16-bit loop count x buffers */

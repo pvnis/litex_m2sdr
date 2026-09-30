@@ -2266,19 +2266,26 @@ bool m2sdr_has_tx_timed_gate(struct m2sdr_dev *dev)
 #endif
 }
 
-int m2sdr_set_tx_timed_gate(struct m2sdr_dev *dev, bool enable, uint32_t late_margin_ns)
+int m2sdr_set_tx_timed_gate(struct m2sdr_dev *dev, bool enable, uint32_t late_margin_ns, uint32_t stale_margin_ns)
 {
     if (!dev)
         return M2SDR_ERR_INVAL;
 #ifdef CSR_TIMED_TX_BASE
     if (m2sdr_reg_write(dev, CSR_TIMED_TX_LATE_MARGIN_ADDR, late_margin_ns) != 0)
         return M2SDR_ERR_IO;
+#ifdef CSR_TIMED_TX_STALE_MARGIN_ADDR
+    if (stale_margin_ns != 0 &&
+        m2sdr_reg_write(dev, CSR_TIMED_TX_STALE_MARGIN_ADDR, stale_margin_ns) != 0)
+        return M2SDR_ERR_IO;
+#else
+    (void)stale_margin_ns;
+#endif
     if (m2sdr_reg_write(dev, CSR_TIMED_TX_CONTROL_ADDR,
         ((enable ? 1u : 0u) << CSR_TIMED_TX_CONTROL_ENABLE_OFFSET)) != 0)
         return M2SDR_ERR_IO;
     return M2SDR_ERR_OK;
 #else
-    (void)enable; (void)late_margin_ns;
+    (void)enable; (void)late_margin_ns; (void)stale_margin_ns;
     return M2SDR_ERR_UNSUPPORTED;
 #endif
 }
@@ -2312,6 +2319,11 @@ int m2sdr_get_tx_timed_gate_stats(struct m2sdr_dev *dev, struct m2sdr_timed_tx_s
     if (m2sdr_reg_read(dev, CSR_TIMED_TX_LATE_COUNT_ADDR, &v) != 0)
         return M2SDR_ERR_IO;
     stats->late_count = v;
+#ifdef CSR_TIMED_TX_STALE_COUNT_ADDR
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_STALE_COUNT_ADDR, &v) != 0)
+        return M2SDR_ERR_IO;
+    stats->stale_count = v;
+#endif
     if (m2sdr_reg_read(dev, CSR_TIMED_TX_HELD_COUNT_ADDR, &v) != 0)
         return M2SDR_ERR_IO;
     stats->held_count = v;
