@@ -2255,6 +2255,85 @@ int m2sdr_set_tx_header(struct m2sdr_dev *dev, bool enable)
     return M2SDR_ERR_OK;
 }
 
+/* Hardware timed-TX gate (see m2sdr.h). Compiled out when the CSR map has no timed_tx block. */
+bool m2sdr_has_tx_timed_gate(struct m2sdr_dev *dev)
+{
+    (void)dev;
+#ifdef CSR_TIMED_TX_BASE
+    return true;
+#else
+    return false;
+#endif
+}
+
+int m2sdr_set_tx_timed_gate(struct m2sdr_dev *dev, bool enable, uint32_t late_margin_ns)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_TIMED_TX_BASE
+    if (m2sdr_reg_write(dev, CSR_TIMED_TX_LATE_MARGIN_ADDR, late_margin_ns) != 0)
+        return M2SDR_ERR_IO;
+    if (m2sdr_reg_write(dev, CSR_TIMED_TX_CONTROL_ADDR,
+        ((enable ? 1u : 0u) << CSR_TIMED_TX_CONTROL_ENABLE_OFFSET)) != 0)
+        return M2SDR_ERR_IO;
+    return M2SDR_ERR_OK;
+#else
+    (void)enable; (void)late_margin_ns;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_reset_tx_timed_gate_counts(struct m2sdr_dev *dev)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_TIMED_TX_BASE
+    uint32_t ctrl = 0;
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_CONTROL_ADDR, &ctrl) != 0)
+        return M2SDR_ERR_IO;
+    /* reset_counts is a pulse field: writing 1 clears the counters, enable is preserved. */
+    if (m2sdr_reg_write(dev, CSR_TIMED_TX_CONTROL_ADDR,
+        (ctrl & (1u << CSR_TIMED_TX_CONTROL_ENABLE_OFFSET)) |
+        (1u << CSR_TIMED_TX_CONTROL_RESET_COUNTS_OFFSET)) != 0)
+        return M2SDR_ERR_IO;
+    return M2SDR_ERR_OK;
+#else
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_get_tx_timed_gate_stats(struct m2sdr_dev *dev, struct m2sdr_timed_tx_stats *stats)
+{
+    if (!dev || !stats)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_TIMED_TX_BASE
+    uint32_t v = 0, hi = 0, lo = 0;
+    memset(stats, 0, sizeof(*stats));
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_LATE_COUNT_ADDR, &v) != 0)
+        return M2SDR_ERR_IO;
+    stats->late_count = v;
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_HELD_COUNT_ADDR, &v) != 0)
+        return M2SDR_ERR_IO;
+    stats->held_count = v;
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_PASSED_COUNT_ADDR, &v) != 0)
+        return M2SDR_ERR_IO;
+    stats->passed_count = v;
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_STATUS_ADDR, &v) != 0)
+        return M2SDR_ERR_IO;
+    stats->state   = (v >> CSR_TIMED_TX_STATUS_STATE_OFFSET) & ((1u << CSR_TIMED_TX_STATUS_STATE_SIZE) - 1u);
+    stats->active  = (v >> CSR_TIMED_TX_STATUS_ACTIVE_OFFSET) & 1u;
+    stats->holding = (v >> CSR_TIMED_TX_STATUS_HOLDING_OFFSET) & 1u;
+    /* 64-bit CSR: LiteX places the most significant word at the base address. */
+    if (m2sdr_reg_read(dev, CSR_TIMED_TX_ARMED_TS_ADDR, &hi) != 0 ||
+        m2sdr_reg_read(dev, CSR_TIMED_TX_ARMED_TS_ADDR + 4, &lo) != 0)
+        return M2SDR_ERR_IO;
+    stats->armed_ts = ((uint64_t)hi << 32) | lo;
+    return M2SDR_ERR_OK;
+#else
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
 /* Configure GPIO ownership, loopback mode, and the data source selection. */
 int m2sdr_gpio_config(struct m2sdr_dev *dev, bool enable, bool loopback, bool source_csr)
 {

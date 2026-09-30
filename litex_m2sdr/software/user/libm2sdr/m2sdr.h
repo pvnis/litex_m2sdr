@@ -691,6 +691,23 @@ void *m2sdr_get_handle(struct m2sdr_dev *dev);
 int  m2sdr_set_rx_header(struct m2sdr_dev *dev, bool enable, bool strip_header);
 int  m2sdr_set_tx_header(struct m2sdr_dev *dev, bool enable);
 
+/* Hardware timed-TX gate: the FPGA holds, passes or drops each DMA frame on the timestamp (ns, board
+ * time) carried in its DMA header. Requires gateware with the timed_tx block; m2sdr_has_tx_timed_gate()
+ * reports whether this library was built against such a CSR map. */
+struct m2sdr_timed_tx_stats {
+    uint32_t late_count;   /* frames dropped because they arrived after timestamp + late margin */
+    uint32_t held_count;   /* frames held until their timestamp */
+    uint32_t passed_count; /* frames emitted */
+    uint8_t  state;        /* 0=IDLE, 1=HOLD, 2=PASS, 3=DROP */
+    bool     active;       /* gating in effect (enabled and TX headers on) */
+    bool     holding;      /* a frame is currently held */
+    uint64_t armed_ts;     /* timestamp (ns) of the frame being held/emitted */
+};
+bool m2sdr_has_tx_timed_gate(struct m2sdr_dev *dev);
+int  m2sdr_set_tx_timed_gate(struct m2sdr_dev *dev, bool enable, uint32_t late_margin_ns);
+int  m2sdr_reset_tx_timed_gate_counts(struct m2sdr_dev *dev);
+int  m2sdr_get_tx_timed_gate_stats(struct m2sdr_dev *dev, struct m2sdr_timed_tx_stats *stats);
+
 /* GPIO helper (4-bit) */
 int  m2sdr_gpio_config(struct m2sdr_dev *dev, bool enable, bool loopback, bool source_csr);
 int  m2sdr_gpio_write(struct m2sdr_dev *dev, uint8_t value, uint8_t oe);

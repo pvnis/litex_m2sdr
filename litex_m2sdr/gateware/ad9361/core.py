@@ -198,7 +198,13 @@ class AD9361RFIC(LiteXModule):
         # Buffers (For Timings) --------------------------------------------------------------------
         self.tx_buffer = tx_buffer = stream.Buffer(dma_layout(64))
         self.rx_buffer = rx_buffer = stream.Buffer(dma_layout(64))
+        # Externally forced "started" (sys domain, quasi-static): the timed-TX gate sets it so the
+        # FIFO never adds priming hysteresis between a release and the first emitted sample.
+        self.tx_force_started = Signal()
+        tx_force_started_rfic = Signal()
+        self.specials += MultiReg(self.tx_force_started, tx_force_started_rfic, odomain="rfic")
         self.tx_rfic_fifo_started = tx_rfic_fifo_started = Signal()
+        tx_rfic_fifo_started_hyst = Signal()
         if with_tx_fifo:
             self.tx_rfic_fifo = tx_rfic_fifo = ClockDomainsRenamer("rfic")(
                 stream.SyncFIFO(dma_layout(64), depth=tx_fifo_depth, buffered=True)
@@ -208,11 +214,12 @@ class AD9361RFIC(LiteXModule):
             self.comb += tx_rfic_fifo_primed.eq(tx_rfic_fifo.level >= tx_fifo_start_level)
             self.sync.rfic += [
                 If(tx_rfic_fifo_primed,
-                    tx_rfic_fifo_started.eq(1)
+                    tx_rfic_fifo_started_hyst.eq(1)
                 ).Elif(tx_rfic_fifo.level == 0,
-                    tx_rfic_fifo_started.eq(0)
+                    tx_rfic_fifo_started_hyst.eq(0)
                 )
             ]
+            self.sync.rfic += tx_rfic_fifo_started.eq(tx_rfic_fifo_started_hyst | tx_force_started_rfic)
         else:
             self.tx_rfic_fifo = tx_rfic_fifo = AD9361RFICStreamBypass()
             self.comb += tx_rfic_fifo_started.eq(1)

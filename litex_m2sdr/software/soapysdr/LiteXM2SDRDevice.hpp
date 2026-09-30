@@ -410,6 +410,7 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
      * construction since older bitstreams lack the header module. */
     bool _rx_dma_header_supported = false;
     size_t _rx_dma_header_bytes = 0;
+    size_t _tx_dma_header_bytes = 0;
 
     struct liteeth_udp_ctrl _udp;
     bool _udp_inited = false;
@@ -530,6 +531,11 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         uint64_t paced_buffers = 0;
 
         bool timed_tx_enabled = true;
+        /* Hardware timed TX: the FPGA gate holds/passes/drops each DMA frame on the timestamp in its
+         * DMA header; the software timeline then only supplies stamps for untimed writes. */
+        bool timed_tx_hw = false;
+        uint32_t hw_late_seen = 0;
+        std::chrono::steady_clock::time_point hw_stats_poll{};
         size_t timed_tx_lead_buffers = 0;
         long long timed_tx_latency_ns = 0;
         long long timed_tx_late_margin_ns = 0;

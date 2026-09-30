@@ -64,6 +64,7 @@ from litex_m2sdr.gateware.pcie        import (
     add_s7_pcie_timing_constraints,
 )
 from litex_m2sdr.gateware.header      import TXRXHeader
+from litex_m2sdr.gateware.timed_tx_gate import TimedTXGate
 from litex_m2sdr.gateware.etherbone   import SharedLiteEthEtherbone
 from litex_m2sdr.gateware.led         import StatusLed
 from litex_m2sdr.gateware.measurement import MultiClkMeasurement
@@ -309,6 +310,8 @@ class BaseSoC(SoCMini):
         "ad9361"           : 24,
         "crossbar"         : 25,
         "txrx_loopback"    : 33,
+        "pps_in"           : 42, # was auto-allocated here; pinned so adding timed_tx moves nothing
+        "timed_tx"         : 43,
 
         # Measurements/Analyzer.
         "clk_measurement"  : 30,
@@ -845,9 +848,24 @@ class BaseSoC(SoCMini):
         # -------------------------------
         self.txrx_loopback = TXRXLoopback(data_width=64, with_csr=True)
 
-        # Header TX -> Loopback -> RFIC TX.
+        # Hardware timed-TX gate: holds/passes/drops each DMA frame on its header timestamp (ns, board
+        # time) so a stamped sample leaves the FPGA at its stamp instead of whenever the DMA ring
+        # reaches it. Pass-through unless enabled through its CSR.
+        self.timed_tx = TimedTXGate(data_width=64)
         self.comb += [
-            self.header.tx.source.connect(self.txrx_loopback.tx_sink),
+            self.timed_tx.time.eq(self.time_gen.time),
+            self.timed_tx.timestamp.eq(self.header.tx.timestamp),
+            self.timed_tx.frames_active.eq(self.header.tx.header_enable),
+            self.timed_tx.reset.eq(self.header.tx.reset),
+            # No priming hysteresis on the RFIC TX FIFO while gating: after a hold the downstream is
+            # empty and the release-to-air latency must be a fixed pipeline depth.
+            self.ad9361.tx_force_started.eq(self.timed_tx.enable),
+        ]
+
+        # Header TX -> Timed TX Gate -> Loopback -> RFIC TX.
+        self.comb += [
+            self.header.tx.source.connect(self.timed_tx.sink),
+            self.timed_tx.source.connect(self.txrx_loopback.tx_sink),
             self.txrx_loopback.tx_source.connect(self.ad9361.sink),
         ]
 
