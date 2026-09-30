@@ -1039,7 +1039,15 @@ static int m2sdr_wait_tx_buffer(struct m2sdr_dev *dev, char **buf, unsigned time
                 return M2SDR_ERR_STATE;
 
             int64_t buffers_pending = dev->tx_user_count - dma->reader_hw_count;
-            if (buffers_pending < 0) {
+            if (dev->tx_min_lead > 0 && buffers_pending < dev->tx_min_lead) {
+                /* Hardware-timed TX: keep the write pointer clear of the reader's prefetch.
+                 * Skipped slots hold stale (late -> dropped) or zeroed (untimed silence) frames. */
+                dev->pcie_tx_resync_events++;
+                dev->tx_user_count = dma->reader_hw_count + dev->tx_min_lead;
+                dev->tx_submit_count = dev->tx_user_count;
+                m2sdr_pcie_dma_update_tx_submit(dev);
+                buffers_pending = dev->tx_min_lead;
+            } else if (buffers_pending < 0) {
                 dev->pcie_tx_underflow_events++;
                 dev->pcie_tx_underflow_buffers += (uint64_t)(-buffers_pending);
                 dev->tx_user_count = dma->reader_hw_count;
@@ -1415,6 +1423,19 @@ int m2sdr_submit_buffer(struct m2sdr_dev *dev,
         return M2SDR_ERR_OK;
     }
     return M2SDR_ERR_UNSUPPORTED;
+}
+
+int m2sdr_set_tx_ring_lead(struct m2sdr_dev *dev, unsigned min_lead_buffers)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+    dev->tx_min_lead = (int64_t)min_lead_buffers;
+    return M2SDR_ERR_OK;
+}
+
+uint64_t m2sdr_get_tx_resync_events(struct m2sdr_dev *dev)
+{
+    return dev ? dev->pcie_tx_resync_events : 0;
 }
 
 int m2sdr_release_buffer(struct m2sdr_dev *dev,

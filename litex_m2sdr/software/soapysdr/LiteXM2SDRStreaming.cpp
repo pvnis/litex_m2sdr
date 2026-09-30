@@ -888,11 +888,28 @@ int SoapyLiteXM2SDR::activateStream(
                 channel_configure(SOAPY_SDR_TX, _tx_stream.channels[i]);
             /* Crossbar Mux: Select PCIe streaming */
             litex_m2sdr_writel(_dev, CSR_CROSSBAR_MUX_SEL_ADDR, 0);
+            if (_tx_stream.timed_tx_hw && _tx_stream.buf && _tx_buf_count && _tx_buf_stride) {
+                /* The DMA reader free-runs over the ring and prefetches about two buffers before the
+                 * first write lands, so stale headers from a previous run would be emitted (or
+                 * dropped as late) at start-up. Zeroed slots are untimed silence. */
+                std::memset(_tx_stream.buf, 0, _tx_buf_count * _tx_buf_stride);
+            }
             int rc = m2sdr_stream_activate(_dev, M2SDR_TX);
             if (rc != M2SDR_ERR_OK) {
                 SoapySDR::logf(SOAPY_SDR_ERROR,
                     "PCIe TX stream activation failed: %s", m2sdr_strerror(rc));
                 return SOAPY_SDR_STREAM_ERROR;
+            }
+            if (_tx_stream.timed_tx_hw) {
+                /* Write at least this many slots ahead of the free-running reader (it prefetches
+                 * about two buffers); the frame timestamps, not the ring position, set emission. */
+                const unsigned lead = static_cast<unsigned>(
+                    std::max<size_t>(4, _tx_stream.timed_tx_lead_buffers ? _tx_stream.timed_tx_lead_buffers : 8));
+                (void)m2sdr_set_tx_ring_lead(_dev, lead);
+                /* The kernel arms the DMA synchronizer at reader start: the TX stream (and an RX
+                 * stream started alone) then waits for the next PPS edge, up to 1 s. Emission timing
+                 * comes from the per-frame timestamps here, so start the streams immediately. */
+                litex_m2sdr_writel(_dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
             }
             _tx_stream.user_count = 0;
         } else if (isLiteEth()) {
@@ -1012,8 +1029,10 @@ void SoapyLiteXM2SDR::stopTxStreamUnlocked()
 {
     if (isLitePCIe()) {
         /* Disable the DMA engine for TX. */
-        if (_tx_stream.timed_tx_hw)
+        if (_tx_stream.timed_tx_hw) {
             (void)m2sdr_set_tx_timed_gate(_dev, false, 0);
+            (void)m2sdr_set_tx_ring_lead(_dev, 0);
+        }
         int rc = m2sdr_stream_deactivate(_dev, M2SDR_TX);
         if (rc != M2SDR_ERR_OK) {
             SoapySDR::logf(SOAPY_SDR_WARNING,
@@ -1945,6 +1964,16 @@ void SoapyLiteXM2SDR::releaseWriteBuffer(
             int rc = m2sdr_submit_buffer(_dev, M2SDR_TX, it->second,
                                          static_cast<unsigned>(numElems * _nChannels),
                                          meta_ptr);
+            if (_tx_stream.timed_tx_hw && _tx_stream.hw_submit_log < 8) {
+                /* Diagnostic: prove the DMA header was written where the FPGA reads it. */
+                uint64_t hdr[2] = {0, 0};
+                if (_tx_dma_header_bytes == 16)
+                    std::memcpy(hdr, it->second - 16, 16);
+                SoapySDR::logf(SOAPY_SDR_INFO,
+                    "hw-timed submit #%u handle=%zu flags=%#x timeNs=%lld -> header sync=%#llx ts=%llu (rc=%d)",
+                    _tx_stream.hw_submit_log++, handle, flags, (long long)timeNs,
+                    (unsigned long long)hdr[0], (unsigned long long)hdr[1], rc);
+            }
             if (rc != M2SDR_ERR_OK) {
                 _tx_stream.underflow = true;
                 resetTimedTxTimeline();

@@ -76,6 +76,10 @@ struct m2sdr_dev {
     uint64_t pcie_rx_overflow_buffers;
     uint64_t pcie_tx_underflow_events;
     uint64_t pcie_tx_underflow_buffers;
+    /* Hardware-timed TX: minimum ring lead (buffers) of the next write over the
+     * DMA reader's hw_count, and how often the write pointer was moved to keep it. */
+    int64_t  tx_min_lead;
+    uint64_t pcie_tx_resync_events;
     struct ad9361_rf_phy *ad9361_phy;
     /* Per-device snapshot of the AD9361_InitParam used at RF bring-up.
      * The header-defined default_init_param template is per translation

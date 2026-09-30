@@ -707,6 +707,14 @@ bool m2sdr_has_tx_timed_gate(struct m2sdr_dev *dev);
 int  m2sdr_set_tx_timed_gate(struct m2sdr_dev *dev, bool enable, uint32_t late_margin_ns);
 int  m2sdr_reset_tx_timed_gate_counts(struct m2sdr_dev *dev);
 int  m2sdr_get_tx_timed_gate_stats(struct m2sdr_dev *dev, struct m2sdr_timed_tx_stats *stats);
+/* Hardware-timed TX ring placement. The PCIe DMA reader free-runs over the ring and
+ * prefetches about two buffers, so a frame must be written at least a few slots ahead
+ * of hw_count or it is never emitted. With min_lead_buffers > 0 the TX buffer acquire
+ * moves the write pointer to hw_count + min_lead_buffers whenever it lags behind that
+ * (silently: with per-frame timestamps a gap in the ring is just untimed silence, not
+ * an underflow). 0 restores the software-timed behaviour (UNDERFLOW on lag). */
+int  m2sdr_set_tx_ring_lead(struct m2sdr_dev *dev, unsigned min_lead_buffers);
+uint64_t m2sdr_get_tx_resync_events(struct m2sdr_dev *dev);
 
 /* GPIO helper (4-bit) */
 int  m2sdr_gpio_config(struct m2sdr_dev *dev, bool enable, bool loopback, bool source_csr);
