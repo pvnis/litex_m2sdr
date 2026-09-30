@@ -111,15 +111,50 @@ change except for the stale counter.
    stamped at the write time. The loopback test (`software/soapysdr/test_hw_timed_tx.py`) proves hold,
    release, sample continuity and late/stale drops; the offset is measured over the air.
 
-Result: OCUDU's RX-minus-TX SSB offset (`align.py`) is **45-46 samples on every dump generation and
-every restart**; gate counters `held == passed == 11272 frames/s`, `late == 0`, one resync at start.
-Software timing gave a random offset per start (the reason for the runtime RX shift and the guardian
-in OCUDU); with hardware timing the offset is a constant that goes into the configuration once.
+7. **RX timestamps must be sample-exact.** RX frames were labelled with each frame's FPGA nanosecond
+   stamp. The stamps carry quantisation noise, so an application converting them to samples saw labels
+   that were not contiguous — ±1 sample, 2000–3000 times per second on about half of the starts
+   (it depends on the sub-sample phase at start). OCUDU's lower PHY treats any such mismatch as lost
+   alignment and discards RX up to the next subframe: permanent "PUxCH request late" / "UL processor
+   is busy" with the UE attached and the UL dead. This, not anything in the TX path, was the
+   start-dependent UL storm (8 starts: 0 jumps ⇔ 0 lates, 42k–66k jumps ⇔ storm). RX labels are now
+   produced by **counting samples** from an anchor; the FPGA stamp is only used to detect real gaps
+   (whole frames lost, advanced by exactly that many frames). A map `ns0 ↔ tick0` converts ticks to
+   board time for the FPGA gates.
+8. **Timed RX start.** OCUDU seeds its timeline from "RX begins at `init_time`"; the plugin started RX
+   immediately (~95 ms earlier). `gateware/timed_rx_start.py` holds the RX header inserter in reset
+   until board time reaches the requested start, so the first frame delivered is stamped with it (a
+   `lead` of 5 sys cycles pre-compensates the compare-to-stamp latency).
+   `activateStream(RX, HAS_TIME, t)` arms it before the DMA writer starts.
+9. **TX back-pressure.** A USRP's `send()` blocks once its FIFO is full of samples that are not due
+   yet. The ring accepted 22.7 ms; OCUDU stamps its first frames 100 ms ahead, so its DL timeline ran
+   177–194 slots ahead of RX at start. `tx_fifo_buffers` (default 96 = 8.5 ms) bounds the number of
+   submitted-but-not-due frames; `writeStream` times out beyond it and the caller retries.
+
+## Time base: `time_base=samples`
+
+Internally every sample has an integer index ("tick") at the stream rate. By default the Soapy API
+carries nanoseconds computed as `round(tick × 1e9 / rate)`, which an application rounding back gets
+exactly. With the device argument `time_base=samples` every Soapy `timeNs` parameter carries the tick
+itself: `readStream`/`acquireReadBuffer` time, `writeStream` time, `activateStream` time,
+`readStreamStatus` time, `get/setHardwareTime`. No nanosecond value crosses the API, and nothing
+depends on double precision (2^53 ns is 104 days of board time). `timed_rx=off` keeps the immediate RX
+start; `tx_fifo_buffers=0` restores the whole ring.
+
+A longer-term gateware step would stamp frames and gate TX with a sample counter in the RF clock
+domain; today the ticks exist in the driver and the FPGA still works in nanoseconds of `time_gen`.
+
+Result: with OCUDU (stock lower PHY, `timed_tx=hardware,time_base=samples`) 8 of 8 starts show 0
+non-contiguous RX labels and 0 late UL requests; the first RX label equals OCUDU's `init_time`; the DL
+starts 27–28 slots ahead of RX (was 177–194); RX-minus-TX SSB offset (`align.py`) **45–46 samples on
+every dump generation and every restart**; gate counters `held == passed == 11272 frames/s`,
+`late == 0`.
 
 ## Test procedure
 
 1. `test/test_timed_tx_gate.py` — simulation (pass-through, untimed, on-time, hold, late, stale,
-   in-margin, back-to-back).
+   in-margin, back-to-back); `test/test_timed_rx_start.py` — timed RX start against the real RX
+   header inserter (transparent, first frame stamped with the start time, late arm, re-arm).
 2. Build: `source /opt/Xilinx/2026.1/Vivado/settings64.sh && ~/litex-venv/bin/python litex_m2sdr.py
    --variant m2 --with-pcie --pcie-gen 2 --pcie-lanes 4 --build`; check the routed WNS in
    `build/<name>/gateware/vivado.log` (the baseline closes with ~+0.04 ns, there is little slack).
