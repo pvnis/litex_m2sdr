@@ -1072,7 +1072,9 @@ static int m2sdr_wait_tx_buffer(struct m2sdr_dev *dev, char **buf, unsigned time
                 dev->tx_submit_count = dma->reader_hw_count;
                 return M2SDR_ERR_UNDERFLOW;
             }
-            if (buffers_pending < buffer_count) {
+            const int64_t pending_limit =
+                (dev->tx_max_pending > 0 && dev->tx_max_pending < buffer_count) ? dev->tx_max_pending : buffer_count;
+            if (buffers_pending < pending_limit) {
                 int buf_offset = dev->tx_user_count % buffer_count;
                 *buf = dma->buf_wr + buf_offset * dma->mmap_dma_info.dma_tx_buf_size;
                 dev->tx_user_count++;
@@ -1448,6 +1450,14 @@ int m2sdr_set_tx_ring_lead(struct m2sdr_dev *dev, unsigned min_lead_buffers)
     if (!dev)
         return M2SDR_ERR_INVAL;
     dev->tx_min_lead = (int64_t)min_lead_buffers;
+    return M2SDR_ERR_OK;
+}
+
+int m2sdr_set_tx_ring_depth(struct m2sdr_dev *dev, unsigned max_pending_buffers)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+    dev->tx_max_pending = (int64_t)max_pending_buffers;
     return M2SDR_ERR_OK;
 }
 

@@ -613,6 +613,11 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
     : _deviceArgs(args), _rx_buf_size(0), _tx_buf_size(0), _rx_buf_count(0), _tx_buf_count(0),
       _udp_inited(false),
       _fd(FD_INIT), ad9361_phy(NULL) {
+    {
+        /* time_base=samples: every Soapy "timeNs" carries a sample count instead of nanoseconds. */
+        const auto tb = args.find("time_base");
+        _time_base_samples = (tb != args.end()) && (tb->second == "samples" || tb->second == "ticks");
+    }
     std::string path;
     std::string eth_ip = "192.168.1.50";
 
@@ -1815,7 +1820,7 @@ void SoapyLiteXM2SDR::setSampleRate(
         if (_autoBandwidth)
             setBandwidthUnlocked(direction, auto_bandwidth_from_sample_rate(rate));
         if (direction == SOAPY_SDR_RX && _rx_stream.opened) {
-            _rx_stream.time0_ns = this->getHardwareTime("");
+            _rx_stream.time0_ns = this->hardwareTimeNs();
             _rx_stream.time0_count = _rx_stream.user_count;
             _rx_stream.time_valid = (_rx_stream.samplerate > 0.0);
             _rx_stream.last_time_ns = _rx_stream.time0_ns;
@@ -1903,7 +1908,7 @@ void SoapyLiteXM2SDR::setSampleRate(
     setSampleMode();
 
     if (direction == SOAPY_SDR_RX && _rx_stream.opened) {
-        _rx_stream.time0_ns = this->getHardwareTime("");
+        _rx_stream.time0_ns = this->hardwareTimeNs();
         _rx_stream.time0_count = _rx_stream.user_count;
         _rx_stream.time_valid = (_rx_stream.samplerate > 0.0);
         _rx_stream.last_time_ns = _rx_stream.time0_ns;
@@ -2225,6 +2230,14 @@ bool SoapyLiteXM2SDR::hasHardwareTime(const std::string &) const {
 
 long long SoapyLiteXM2SDR::getHardwareTime(const std::string &) const
 {
+    /* Public API value: nanoseconds, or sample ticks with time_base=samples. */
+    const long long ns = this->hardwareTimeNs();
+    return _time_base_samples ? this->hwNsToApi(ns) : ns;
+}
+
+/* Board time in nanoseconds (internal unit). */
+long long SoapyLiteXM2SDR::hardwareTimeNs() const
+{
     uint64_t time_ns = 0;
     int rc = m2sdr_get_time(_dev, &time_ns);
 
@@ -2235,8 +2248,9 @@ long long SoapyLiteXM2SDR::getHardwareTime(const std::string &) const
     return static_cast<long long>(time_ns);
 }
 
-void SoapyLiteXM2SDR::setHardwareTime(const long long timeNs, const std::string &)
+void SoapyLiteXM2SDR::setHardwareTime(const long long timeApi, const std::string &)
 {
+    const long long timeNs = _time_base_samples ? this->nsAbs(timeApi) : timeApi;
     int rc = m2sdr_set_time(_dev, static_cast<uint64_t>(timeNs));
 
     if (rc != 0)

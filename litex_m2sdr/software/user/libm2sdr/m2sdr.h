@@ -711,6 +711,21 @@ bool m2sdr_has_tx_timed_gate(struct m2sdr_dev *dev);
 int  m2sdr_set_tx_timed_gate(struct m2sdr_dev *dev, bool enable, uint32_t late_margin_ns, uint32_t stale_margin_ns);
 int  m2sdr_reset_tx_timed_gate_counts(struct m2sdr_dev *dev);
 int  m2sdr_get_tx_timed_gate_stats(struct m2sdr_dev *dev, struct m2sdr_timed_tx_stats *stats);
+/* Timed RX start (gateware timed_rx_start): RX samples are dropped in the FPGA until board time
+ * reaches start_time_ns, and the first DMA frame delivered is stamped with it -- the
+ * stream_cmd(time_spec, stream_now=false) semantics of a USRP. Arm it BEFORE activating the RX
+ * stream; disarm (enable=false) when the stream stops. */
+struct m2sdr_timed_rx_status {
+    bool     armed;     /* control.enable */
+    bool     opened;    /* start time reached, RX flowing */
+    bool     hold;      /* armed and still waiting */
+    bool     late;      /* start time was already in the past when armed */
+    uint64_t open_time; /* board time (ns) at which the gate opened */
+};
+bool m2sdr_has_rx_timed_start(struct m2sdr_dev *dev);
+int  m2sdr_set_rx_timed_start(struct m2sdr_dev *dev, bool enable, uint64_t start_time_ns);
+int  m2sdr_get_rx_timed_start_status(struct m2sdr_dev *dev, struct m2sdr_timed_rx_status *status);
+
 /* Hardware-timed TX ring placement. The PCIe DMA reader free-runs over the ring and
  * prefetches about two buffers, so a frame must be written at least a few slots ahead
  * of hw_count or it is never emitted. With min_lead_buffers > 0 the TX buffer acquire
@@ -718,6 +733,12 @@ int  m2sdr_get_tx_timed_gate_stats(struct m2sdr_dev *dev, struct m2sdr_timed_tx_
  * (silently: with per-frame timestamps a gap in the ring is just untimed silence, not
  * an underflow). 0 restores the software-timed behaviour (UNDERFLOW on lag). */
 int  m2sdr_set_tx_ring_lead(struct m2sdr_dev *dev, unsigned min_lead_buffers);
+/* TX FIFO depth (back-pressure). A USRP's TX path is a bounded, flow-controlled FIFO: send() blocks
+ * once it is full of samples that are not due yet, which is what keeps an application's TX timeline
+ * from running ahead of the device. Here the 256-buffer ring would accept 22.7 ms (at 23.04 MSps)
+ * of not-yet-due frames; with max_pending_buffers > 0 the TX buffer acquire waits (and times out)
+ * once that many submitted buffers are still unconsumed. 0 = whole ring (previous behaviour). */
+int  m2sdr_set_tx_ring_depth(struct m2sdr_dev *dev, unsigned max_pending_buffers);
 uint64_t m2sdr_get_tx_resync_events(struct m2sdr_dev *dev);
 
 /* GPIO helper (4-bit) */

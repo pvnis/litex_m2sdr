@@ -402,6 +402,41 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     size_t _rx_buf_size = 0;
     size_t _tx_buf_size = 0;
     size_t _rx_buf_count = 0;
+    /* Timed RX start (timed_rx device argument, default on when the gateware has the gate):
+     * activateStream(RX, HAS_TIME, t) delivers the first sample at board time t. */
+    /* Time base. Internally every sample has an exact integer index ("tick") at the stream sample
+     * rate; RX frames are labelled by COUNTING samples from an anchor, not by converting each
+     * frame's FPGA nanosecond stamp (whose quantisation made labels jitter by +-1 sample, which a
+     * 5G lower PHY treats as a lost alignment). The map (ns0 <-> tick0) ties ticks to board time for
+     * the FPGA gates. The Soapy API carries nanoseconds by default (tick * 1e9 / rate, which
+     * round-trips exactly) or, with the device argument time_base=samples, the ticks themselves in
+     * every "timeNs" parameter. */
+    bool _time_base_samples = false;
+    mutable std::mutex _time_map_mutex;
+    bool      _time_map_valid = false;
+    long long _time_map_ns0 = 0;
+    long long _time_map_tick0 = 0;
+    bool      _rx_tick_valid = false;
+    long long _rx_next_tick = 0;
+    long long _rx_tick_max_dev_ns = 0;
+    uint64_t  _rx_tick_gaps = 0;
+    uint64_t  _rx_tick_reanchors = 0;
+    bool      _rx_timed_start_pending = false;
+    long long _rx_timed_start_tick = 0;
+    double    timeRate() const;
+    long long tickAbs(long long ns) const;
+    long long nsAbs(long long tick) const;
+    long long hwNsOfTick(long long tick) const;
+    long long tickOfHwNs(long long ns) const;
+    long long apiToTick(long long api) const;
+    long long tickToApi(long long tick) const;
+    long long apiToHwNs(long long api) const;
+    long long hwNsToApi(long long ns) const;
+    long long apiTimeAdvance(long long api, long long samples) const;
+    long long hardwareTimeNs() const;
+    long long rxFrameLabel(long long hw_ns, size_t frame_samples);
+    bool _rx_timed_start = true;
+    bool _rx_timed_start_armed = false;
     size_t _tx_buf_count = 0;
     size_t _rx_buf_stride = 0;
     size_t _tx_buf_stride = 0;

@@ -79,6 +79,9 @@ struct m2sdr_dev {
     /* Hardware-timed TX: minimum ring lead (buffers) of the next write over the
      * DMA reader's hw_count, and how often the write pointer was moved to keep it. */
     int64_t  tx_min_lead;
+    /* TX FIFO depth in buffers: the acquire blocks (back-pressure) once this many submitted buffers
+     * have not been consumed by the DMA reader yet. 0 = the whole ring. */
+    int64_t  tx_max_pending;
     uint64_t pcie_tx_resync_events;
     struct ad9361_rf_phy *ad9361_phy;
     /* Per-device snapshot of the AD9361_InitParam used at RF bring-up.

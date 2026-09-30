@@ -29,6 +29,166 @@
 #include "liteeth_udp.h"
 
 static inline long long samples_to_ns(double sample_rate, long long samples);
+
+/***********************************************************************
+ * Time base (see the comment on _time_base_samples in the header)
+ **********************************************************************/
+double SoapyLiteXM2SDR::timeRate() const
+{
+    return (_rx_stream.samplerate > 0.0) ? _rx_stream.samplerate : _tx_stream.samplerate;
+}
+
+static inline long long tb_ns_to_ticks(double rate, long long ns)
+{
+    return static_cast<long long>(std::llroundl(static_cast<long double>(ns) * static_cast<long double>(rate) / 1e9L));
+}
+
+static inline long long tb_ticks_to_ns(double rate, long long ticks)
+{
+    return static_cast<long long>(std::llroundl(static_cast<long double>(ticks) * 1e9L / static_cast<long double>(rate)));
+}
+
+/* Absolute conversions: what an application doing tick = round(ns * rate / 1e9) computes. */
+long long SoapyLiteXM2SDR::tickAbs(long long ns) const
+{
+    const double rate = timeRate();
+    return (rate > 0.0) ? tb_ns_to_ticks(rate, ns) : ns;
+}
+
+long long SoapyLiteXM2SDR::nsAbs(long long tick) const
+{
+    const double rate = timeRate();
+    return (rate > 0.0) ? tb_ticks_to_ns(rate, tick) : tick;
+}
+
+/* Mapped conversions: the board time at which a given tick is (was) sampled, through the anchor
+ * set by the first RX frame. Without an anchor they fall back to the absolute conversion. */
+long long SoapyLiteXM2SDR::hwNsOfTick(long long tick) const
+{
+    const double rate = timeRate();
+    if (rate <= 0.0)
+        return tick;
+    std::lock_guard<std::mutex> lk(_time_map_mutex);
+    if (!_time_map_valid)
+        return tb_ticks_to_ns(rate, tick);
+    return _time_map_ns0 + tb_ticks_to_ns(rate, tick - _time_map_tick0);
+}
+
+long long SoapyLiteXM2SDR::tickOfHwNs(long long ns) const
+{
+    const double rate = timeRate();
+    if (rate <= 0.0)
+        return ns;
+    std::lock_guard<std::mutex> lk(_time_map_mutex);
+    if (!_time_map_valid)
+        return tb_ns_to_ticks(rate, ns);
+    return _time_map_tick0 + tb_ns_to_ticks(rate, ns - _time_map_ns0);
+}
+
+long long SoapyLiteXM2SDR::apiToTick(long long api) const
+{
+    return _time_base_samples ? api : tickAbs(api);
+}
+
+long long SoapyLiteXM2SDR::tickToApi(long long tick) const
+{
+    return _time_base_samples ? tick : nsAbs(tick);
+}
+
+/* API time -> board nanoseconds for the FPGA. In nanosecond mode without an RX anchor the value is
+ * passed through untouched (TX-only applications keep today's behaviour). */
+long long SoapyLiteXM2SDR::apiToHwNs(long long api) const
+{
+    if (!_time_base_samples) {
+        std::lock_guard<std::mutex> lk(_time_map_mutex);
+        if (!_time_map_valid)
+            return api;
+    }
+    return hwNsOfTick(apiToTick(api));
+}
+
+long long SoapyLiteXM2SDR::hwNsToApi(long long ns) const
+{
+    if (!_time_base_samples) {
+        std::lock_guard<std::mutex> lk(_time_map_mutex);
+        if (!_time_map_valid)
+            return ns;
+    }
+    return tickToApi(tickOfHwNs(ns));
+}
+
+long long SoapyLiteXM2SDR::apiTimeAdvance(long long api, long long samples) const
+{
+    return tickToApi(apiToTick(api) + samples);
+}
+
+/* Label one RX DMA frame (called once per frame, in arrival order). The first frame anchors the
+ * map; afterwards the label is the running sample count. The frame's FPGA stamp is only used to
+ * detect real discontinuities (whole frames lost), never for the label itself. */
+long long SoapyLiteXM2SDR::rxFrameLabel(const long long hw_ns, const size_t frame_samples)
+{
+    const double rate = timeRate();
+    if (rate <= 0.0 || frame_samples == 0)
+        return hw_ns;
+    const long long n = static_cast<long long>(frame_samples);
+    const long long frame_ns = tb_ticks_to_ns(rate, n);
+
+    std::lock_guard<std::mutex> lk(_time_map_mutex);
+    if (!_rx_tick_valid) {
+        long long tick0 = tb_ns_to_ticks(rate, hw_ns);
+        bool timed = false;
+        if (_rx_timed_start_pending) {
+            /* Timed start: the FPGA released RX at the requested time, so this frame IS the
+             * requested tick -- provided its stamp agrees (the gate may have been late). */
+            const long long want_ns = tb_ticks_to_ns(rate, _rx_timed_start_tick);
+            if (std::llabs(hw_ns - want_ns) <= frame_ns / 2) {
+                tick0 = _rx_timed_start_tick;
+                timed = true;
+            } else {
+                SoapySDR::logf(SOAPY_SDR_WARNING,
+                    "RX timed start missed: first frame at %lld ns, requested %lld ns (%+.1f us)",
+                    hw_ns, want_ns, (double)(hw_ns - want_ns) / 1e3);
+            }
+            _rx_timed_start_pending = false;
+        }
+        _time_map_ns0 = hw_ns;
+        _time_map_tick0 = tick0;
+        _time_map_valid = true;
+        _rx_next_tick = tick0;
+        _rx_tick_valid = true;
+        SoapySDR::logf(SOAPY_SDR_INFO,
+            "RX time base anchored: tick %lld at board time %lld ns (%s start, API unit: %s)",
+            tick0, hw_ns, timed ? "timed" : "immediate", _time_base_samples ? "samples" : "ns");
+    } else {
+        const long long expected = _time_map_ns0 + tb_ticks_to_ns(rate, _rx_next_tick - _time_map_tick0);
+        const long long dev = hw_ns - expected;
+        if (std::llabs(dev) > _rx_tick_max_dev_ns)
+            _rx_tick_max_dev_ns = std::llabs(dev);
+        if (std::llabs(dev) > frame_ns / 2) {
+            const long long missed = static_cast<long long>(
+                std::llroundl(static_cast<long double>(dev) / static_cast<long double>(frame_ns)));
+            if (missed >= 1) {
+                /* Whole frames were lost upstream (DMA overflow): advance by exactly that many. */
+                _rx_next_tick += missed * n;
+                _rx_tick_gaps++;
+                SoapySDR::logf(SOAPY_SDR_WARNING,
+                    "RX discontinuity: %lld frame(s) (%lld samples) lost before board time %lld ns",
+                    missed, missed * n, hw_ns);
+            } else {
+                /* Board time stepped back or drifted away from the sample count: keep the ticks
+                 * contiguous and move the map. */
+                _time_map_ns0 = hw_ns;
+                _time_map_tick0 = _rx_next_tick;
+                _rx_tick_reanchors++;
+                SoapySDR::logf(SOAPY_SDR_WARNING,
+                    "RX time base re-anchored: board time is %+.1f us from the sample count", (double)dev / 1e3);
+            }
+        }
+    }
+    const long long label = _rx_next_tick;
+    _rx_next_tick += n;
+    return _time_base_samples ? label : tb_ticks_to_ns(rate, label);
+}
 #endif
 
 /* Parse Soapy/gr-osmosdr channel arguments:
@@ -451,6 +611,10 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
              * upstream zero-copy path. Consumers that stall by design -- srsRAN's
              * cell search -- need this or the DMA ring overflows continuously. */
             _rx_stream.rxw_depth = get_kwargs_size(searchArgs, _deviceArgs, "rx_worker_packets", 0);
+            {
+                const std::string v = get_kwargs_string(searchArgs, _deviceArgs, "timed_rx", "on");
+                _rx_timed_start = !(v == "off" || v == "0" || v == "false" || v == "no");
+            }
             if (_rx_stream.rxw_depth > 16384)
                 _rx_stream.rxw_depth = 16384;
             int rc = m2sdr_stream_configure(_dev, &config);
@@ -827,6 +991,36 @@ int SoapyLiteXM2SDR::activateStream(
                 channel_configure(SOAPY_SDR_RX, _rx_stream.channels[i]);
             /* Crossbar Demux: Select PCIe streaming */
             litex_m2sdr_writel(_dev, CSR_CROSSBAR_DEMUX_SEL_ADDR, 0);
+            /* Timed start: arm the FPGA gate BEFORE the DMA writer starts, so no frame older than
+             * the requested time can reach the host. The gate stamps the first frame with timeNs. */
+            _rx_timed_start_armed = false;
+            {
+                /* New RX run: the first frame re-anchors the sample-count time base. */
+                std::lock_guard<std::mutex> lk(_time_map_mutex);
+                _rx_tick_valid = false;
+                _time_map_valid = false;
+                _rx_timed_start_pending = false;
+                _rx_tick_max_dev_ns = 0;
+            }
+            if (m2sdr_has_rx_timed_start(_dev)) {
+                const bool want = (flags & SOAPY_SDR_HAS_TIME) && _rx_timed_start &&
+                                  _rx_dma_header_bytes != 0 && timeNs > 0;
+                /* The requested time is a tick; the gate gets the board time of that tick. */
+                const long long req_tick = want ? this->apiToTick(timeNs) : 0;
+                const long long start_ns = want ? this->nsAbs(req_tick) : 0;
+                int grc = m2sdr_set_rx_timed_start(_dev, want, static_cast<uint64_t>(start_ns));
+                if (grc != M2SDR_ERR_OK) {
+                    SoapySDR::logf(SOAPY_SDR_WARNING,
+                        "timed RX start could not be programmed: %s", m2sdr_strerror(grc));
+                } else {
+                    _rx_timed_start_armed = want;
+                    if (want) {
+                        std::lock_guard<std::mutex> lk(_time_map_mutex);
+                        _rx_timed_start_tick = req_tick;
+                        _rx_timed_start_pending = true;
+                    }
+                }
+            }
             /* Re-enable the DMA and resync ring counters (the kernel clears
              * them across a deactivate/activate cycle); drop any buffer still
              * held from before the restart. */
@@ -835,6 +1029,11 @@ int SoapyLiteXM2SDR::activateStream(
                 SoapySDR::logf(SOAPY_SDR_ERROR,
                     "PCIe RX stream activation failed: %s", m2sdr_strerror(rc));
                 return SOAPY_SDR_STREAM_ERROR;
+            }
+            if (_rx_timed_start_armed) {
+                /* The start instant comes from the gate, not from the DMA synchronizer's PPS edge
+                 * (which would also wait for TX data). */
+                litex_m2sdr_writel(_dev, CSR_PCIE_DMA0_SYNCHRONIZER_BYPASS_ADDR, 1);
             }
             _rx_stream.remainderHandle = -1;
             _rx_stream.remainderSamps = 0;
@@ -864,7 +1063,7 @@ int SoapyLiteXM2SDR::activateStream(
         _rx_stream.rxw_next_handle = 0;
         if (isLitePCIe())
             this->rxWorkerStart();
-        _rx_stream.time0_ns = this->getHardwareTime("");
+        _rx_stream.time0_ns = this->hardwareTimeNs();
         _rx_stream.time0_count = _rx_stream.user_count;
         _rx_stream.time_valid = (_rx_stream.samplerate > 0.0);
         /* Capture starts while activation is still configuring the datapath,
@@ -877,9 +1076,19 @@ int SoapyLiteXM2SDR::activateStream(
         _rx_stream.time_warned = false;
         _rx_stream.hw_time_warned = false;
         if (flags & SOAPY_SDR_HAS_TIME) {
-            SoapySDR::logf(SOAPY_SDR_WARNING,
-                "RX timed activation requested for %lld ns; timing not supported, starting immediately",
-                (long long)timeNs);
+            if (_rx_timed_start_armed) {
+                struct m2sdr_timed_rx_status rs;
+                const bool have = m2sdr_get_rx_timed_start_status(_dev, &rs) == M2SDR_ERR_OK;
+                const long long start_ns = this->nsAbs(this->apiToTick(timeNs));
+                SoapySDR::logf(SOAPY_SDR_INFO,
+                    "RX timed start armed: first sample at board time %lld ns (%.3f ms from now)%s",
+                    start_ns, (double)(start_ns - _rx_stream.time0_ns) / 1e6,
+                    (have && rs.late) ? " -- ALREADY IN THE PAST, started immediately" : "");
+            } else {
+                SoapySDR::logf(SOAPY_SDR_WARNING,
+                    "RX timed activation requested for %lld ns; timing not supported, starting immediately",
+                    (long long)timeNs);
+            }
         }
 
     /* TX */
@@ -912,6 +1121,15 @@ int SoapyLiteXM2SDR::activateStream(
                 const unsigned lead = static_cast<unsigned>(
                     std::max<size_t>(3, _tx_stream.timed_tx_lead_buffers ? _tx_stream.timed_tx_lead_buffers : 4));
                 (void)m2sdr_set_tx_ring_lead(_dev, lead);
+                /* Bounded TX FIFO (tx_fifo_buffers, default 96 = 8.5 ms at 23.04 MSps; 0 = whole
+                 * ring): writeStream times out once this many frames are queued and not yet due,
+                 * like a USRP's flow-controlled send(). Without it an application that stamps its
+                 * first frames far ahead (OCUDU: init_time + 100 ms) runs its DL timeline tens of
+                 * milliseconds ahead of RX before the first frame is even emitted. */
+                const unsigned depth = static_cast<unsigned>(
+                    get_kwargs_size(SoapySDR::Kwargs(), _deviceArgs, "tx_fifo_buffers", 96));
+                (void)m2sdr_set_tx_ring_depth(_dev, depth);
+                SoapySDR::logf(SOAPY_SDR_INFO, "TX FIFO depth: %u buffers (0 = whole ring), ring lead %u", depth, lead);
                 /* The kernel arms the DMA synchronizer at reader start: the TX stream (and an RX
                  * stream started alone) then waits for the next PPS edge, up to 1 s. Emission timing
                  * comes from the per-frame timestamps here, so start the streams immediately. */
@@ -928,7 +1146,7 @@ int SoapyLiteXM2SDR::activateStream(
             _tx_stream.pace_host_anchor = std::chrono::steady_clock::now();
             _tx_stream.pace_board_valid = false;
             try {
-                _tx_stream.pace_board_start_ns = this->getHardwareTime("");
+                _tx_stream.pace_board_start_ns = this->hardwareTimeNs();
                 _tx_stream.pace_board_anchor_ns = _tx_stream.pace_board_start_ns;
                 _tx_stream.pace_board_valid = true;
             } catch (const std::exception &e) {
@@ -1026,6 +1244,10 @@ void SoapyLiteXM2SDR::stopRxStreamUnlocked()
     if (isLitePCIe()) {
         /* Disable the DMA engine for RX. */
         int rc = m2sdr_stream_deactivate(_dev, M2SDR_RX);
+        if (_rx_timed_start_armed) {
+            (void)m2sdr_set_rx_timed_start(_dev, false, 0);
+            _rx_timed_start_armed = false;
+        }
         if (rc != M2SDR_ERR_OK) {
             SoapySDR::logf(SOAPY_SDR_WARNING,
                 "PCIe RX stream deactivation failed: %s", m2sdr_strerror(rc));
@@ -1047,6 +1269,7 @@ void SoapyLiteXM2SDR::stopTxStreamUnlocked()
         if (_tx_stream.timed_tx_hw) {
             (void)m2sdr_set_tx_timed_gate(_dev, false, 0, 0);
             (void)m2sdr_set_tx_ring_lead(_dev, 0);
+            (void)m2sdr_set_tx_ring_depth(_dev, 0);
         }
         int rc = m2sdr_stream_deactivate(_dev, M2SDR_TX);
         if (rc != M2SDR_ERR_OK) {
@@ -1232,7 +1455,7 @@ void SoapyLiteXM2SDR::initTimedTxTimeline()
     /* Provisional anchor, kept so behaviour is sane if the hardware counters
      * are unavailable; tryAnchorTxTimeline() replaces it with a measured one
      * as soon as the DMA reader has emitted its first buffer. */
-    setTxTimeline(this->getHardwareTime("") + lead_ns + _tx_stream.timed_tx_latency_ns);
+    setTxTimeline(this->hardwareTimeNs() + lead_ns + _tx_stream.timed_tx_latency_ns);
     _tx_stream.tx_timeline_valid = true;
     _tx_stream.tx_anchor_pending = true;
     _tx_stream.tx_underflow_seen = 0;
@@ -1278,7 +1501,7 @@ bool SoapyLiteXM2SDR::tryAnchorTxTimeline(void)
     if (st.hw_count <= 0)
         return false;
 
-    const long long T = this->getHardwareTime("");
+    const long long T = this->hardwareTimeNs();
 
     const size_t buf_samples =
         (_bytesPerComplex > 0)
@@ -1553,7 +1776,7 @@ void SoapyLiteXM2SDR::rxWorkerLoop(void) {
 
         slot.bytes    = bytes;
         slot.samples  = total_samples;
-        slot.timeNs   = ts;
+        slot.timeNs   = have_ts ? this->rxFrameLabel(ts, total_samples / _nChannels) : ts;
         slot.has_time = have_ts;
         {
             std::lock_guard<std::mutex> lk(_rx_stream.rxw_mutex);
@@ -1792,7 +2015,7 @@ int SoapyLiteXM2SDR::acquireReadBuffer(
             _rx_stream.pendingReadBufs.clear();
             _rx_stream.overflow = true;
             flags |= SOAPY_SDR_END_ABRUPT;
-            _rx_stream.time0_ns = this->getHardwareTime("");
+            _rx_stream.time0_ns = this->hardwareTimeNs();
             _rx_stream.time0_count = _rx_stream.user_count;
             _rx_stream.time_valid = (_rx_stream.samplerate > 0.0);
             /* Hardware timestamps stay monotonic across drops on their own;
@@ -1822,7 +2045,7 @@ int SoapyLiteXM2SDR::acquireReadBuffer(
             if (_rx_dma_header_bytes != 0 &&
                 m2sdr_get_buffer_metadata(_dev, M2SDR_RX, buffer, &meta) == M2SDR_ERR_OK &&
                 (meta.flags & M2SDR_META_FLAG_HAS_TIME)) {
-                timeNs = static_cast<long long>(meta.timestamp);
+                timeNs = this->rxFrameLabel(static_cast<long long>(meta.timestamp), samples_per_buffer);
                 have_hw_time = true;
             } else {
                 timeNs = _rx_stream.time0_ns +
@@ -2033,7 +2256,7 @@ void SoapyLiteXM2SDR::releaseWriteBuffer(
             if (_tx_stream.pace_board_valid &&
                 (_tx_stream.paced_buffers % LITEETH_PACE_RESYNC_BUFFERS) == 0) {
                 try {
-                    _tx_stream.pace_board_anchor_ns = this->getHardwareTime("");
+                    _tx_stream.pace_board_anchor_ns = this->hardwareTimeNs();
                     _tx_stream.pace_host_anchor = std::chrono::steady_clock::now();
                 } catch (const std::exception &) {
                     /* Keep pacing on the previous anchors. */
@@ -2334,8 +2557,8 @@ int SoapyLiteXM2SDR::readStream(
         }
 
         if (_rx_stream.time_valid) {
-            timeNs = _rx_stream.remainderTimeNs +
-                     samples_to_ns(_rx_stream.samplerate, _rx_stream.remainderOffset);
+            timeNs = this->apiTimeAdvance(_rx_stream.remainderTimeNs,
+                                          static_cast<long long>(_rx_stream.remainderOffset));
             flags |= SOAPY_SDR_HAS_TIME;
             if (timeNs < _rx_stream.last_time_ns) {
                 timeNs = _rx_stream.last_time_ns;
@@ -2397,8 +2620,8 @@ int SoapyLiteXM2SDR::readStream(
     const size_t n = std::min((returnedElems - samp_avail), _rx_stream.remainderSamps);
 
     if (_rx_stream.time_valid) {
-        timeNs = _rx_stream.remainderTimeNs +
-                 samples_to_ns(_rx_stream.samplerate, _rx_stream.remainderOffset);
+        timeNs = this->apiTimeAdvance(_rx_stream.remainderTimeNs,
+                                      static_cast<long long>(_rx_stream.remainderOffset));
         flags |= SOAPY_SDR_HAS_TIME;
         if (timeNs < _rx_stream.last_time_ns) {
             timeNs = _rx_stream.last_time_ns;
@@ -2440,11 +2663,13 @@ int SoapyLiteXM2SDR::writeStream(
     const void *const *buffs,
     const size_t numElems,
     int &flags,
-    const long long timeNs,
+    const long long timeApi,
     const long timeoutUs) {
     if (stream != TX_STREAM) {
         return SOAPY_SDR_NOT_SUPPORTED;
     }
+    /* Everything below works in board nanoseconds; the API value is ns or ticks (time_base). */
+    const long long timeNs = (flags & SOAPY_SDR_HAS_TIME) ? this->apiToHwNs(timeApi) : timeApi;
 
     std::lock_guard<std::recursive_mutex> stream_lock(_tx_stream_mutex);
 
@@ -2532,7 +2757,7 @@ int SoapyLiteXM2SDR::writeStream(
                          _tx_stream.timed_tx_late_margin_ns) {
                 try {
                     const long long hw_floor_ns =
-                        this->getHardwareTime("") + _tx_stream.timed_tx_latency_ns;
+                        this->hardwareTimeNs() + _tx_stream.timed_tx_latency_ns;
                     if (_tx_stream.tx_next_time_ns < hw_floor_ns)
                         setTxTimeline(hw_floor_ns);
                 } catch (const std::exception &e) {
@@ -2622,7 +2847,7 @@ int SoapyLiteXM2SDR::readStreamStatus(
             if (_tx_stream.time_error) {
                 _tx_stream.time_error = false;
                 flags |= SOAPY_SDR_HAS_TIME;
-                timeNs = _tx_stream.status_time_ns;
+                timeNs = this->hwNsToApi(_tx_stream.status_time_ns);
                 SoapySDR::log(SOAPY_SDR_SSI, "T");
                 return SOAPY_SDR_TIME_ERROR;
             }
@@ -2660,7 +2885,7 @@ int SoapyLiteXM2SDR::readStreamStatus(
                     if (have_st && st.late_count != _tx_stream.hw_late_seen) {
                         _tx_stream.hw_late_seen = st.late_count;
                         flags |= SOAPY_SDR_HAS_TIME;
-                        timeNs = static_cast<long long>(st.armed_ts);
+                        timeNs = this->hwNsToApi(static_cast<long long>(st.armed_ts));
                         SoapySDR::log(SOAPY_SDR_SSI, "T");
                         return SOAPY_SDR_TIME_ERROR;
                     }

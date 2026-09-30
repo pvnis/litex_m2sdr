@@ -2256,6 +2256,64 @@ int m2sdr_set_tx_header(struct m2sdr_dev *dev, bool enable)
 }
 
 /* Hardware timed-TX gate (see m2sdr.h). Compiled out when the CSR map has no timed_tx block. */
+bool m2sdr_has_rx_timed_start(struct m2sdr_dev *dev)
+{
+    (void)dev;
+#ifdef CSR_TIMED_RX_BASE
+    return true;
+#else
+    return false;
+#endif
+}
+
+int m2sdr_set_rx_timed_start(struct m2sdr_dev *dev, bool enable, uint64_t start_time_ns)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_TIMED_RX_BASE
+    /* Disarm first so a new start time is never compared half-written; 64-bit CSR: LiteX places
+     * the most significant word at the base address. */
+    if (m2sdr_reg_write(dev, CSR_TIMED_RX_CONTROL_ADDR, 0) != 0)
+        return M2SDR_ERR_IO;
+    if (!enable)
+        return M2SDR_ERR_OK;
+    if (m2sdr_reg_write(dev, CSR_TIMED_RX_START_TIME_ADDR,     (uint32_t)(start_time_ns >> 32)) != 0 ||
+        m2sdr_reg_write(dev, CSR_TIMED_RX_START_TIME_ADDR + 4, (uint32_t)(start_time_ns & 0xffffffffu)) != 0)
+        return M2SDR_ERR_IO;
+    if (m2sdr_reg_write(dev, CSR_TIMED_RX_CONTROL_ADDR, 1u << CSR_TIMED_RX_CONTROL_ENABLE_OFFSET) != 0)
+        return M2SDR_ERR_IO;
+    return M2SDR_ERR_OK;
+#else
+    (void)enable; (void)start_time_ns;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_get_rx_timed_start_status(struct m2sdr_dev *dev, struct m2sdr_timed_rx_status *status)
+{
+    if (!dev || !status)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_TIMED_RX_BASE
+    uint32_t v = 0, hi = 0, lo = 0;
+    memset(status, 0, sizeof(*status));
+    if (m2sdr_reg_read(dev, CSR_TIMED_RX_CONTROL_ADDR, &v) != 0)
+        return M2SDR_ERR_IO;
+    status->armed = (v >> CSR_TIMED_RX_CONTROL_ENABLE_OFFSET) & 1u;
+    if (m2sdr_reg_read(dev, CSR_TIMED_RX_STATUS_ADDR, &v) != 0)
+        return M2SDR_ERR_IO;
+    status->opened = (v >> CSR_TIMED_RX_STATUS_OPENED_OFFSET) & 1u;
+    status->hold   = (v >> CSR_TIMED_RX_STATUS_HOLD_OFFSET) & 1u;
+    status->late   = (v >> CSR_TIMED_RX_STATUS_LATE_OFFSET) & 1u;
+    if (m2sdr_reg_read(dev, CSR_TIMED_RX_OPEN_TIME_ADDR, &hi) != 0 ||
+        m2sdr_reg_read(dev, CSR_TIMED_RX_OPEN_TIME_ADDR + 4, &lo) != 0)
+        return M2SDR_ERR_IO;
+    status->open_time = ((uint64_t)hi << 32) | lo;
+    return M2SDR_ERR_OK;
+#else
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
 bool m2sdr_has_tx_timed_gate(struct m2sdr_dev *dev)
 {
     (void)dev;
