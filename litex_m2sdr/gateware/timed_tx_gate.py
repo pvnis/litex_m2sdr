@@ -56,6 +56,7 @@ class TimedTXGate(LiteXModule):
 
         self.enable        = Signal()   # i (CSR): 1 = timed gating, 0 = pass-through.
         self.late_margin   = Signal(32) # i (CSR): ns a frame may be late and still be emitted.
+        self.advance       = Signal(32) # i (CSR): release this much before the timestamp (fine gate).
         self.stale_margin  = Signal(32) # i (CSR): ns after which a late frame is a stale ring re-read.
         self.active        = Signal()   # o: gating in effect (enable & frames_active).
 
@@ -67,6 +68,12 @@ class TimedTXGate(LiteXModule):
         self.state        = Signal(2)   # o: 0=IDLE, 1=HOLD, 2=PASS, 3=DROP.
         self.armed_ts     = Signal(64)  # o: timestamp of the frame being held/passed.
         self.holding      = Signal()    # o: level, 1 while a frame is held.
+
+        # Frame stamps for the RFIC-domain fine gate (sample-count time base): one entry per frame
+        # forwarded, pushed before its first word. ``stamp_enable`` = the fine gate is in use.
+        self.stamp        = stream.Endpoint([("timed", 1), ("tick", 64)]) # o
+        self.stamp_enable = Signal()                                      # i
+        frame_timed       = Signal()
 
         # # #
 
@@ -83,7 +90,7 @@ class TimedTXGate(LiteXModule):
         # All three decisions are registered in the same stage from the same-cycle inputs, so a frame is
         # never judged with another frame's timestamp.
         self.sync += [
-            is_future.eq(self.time < self.timestamp),
+            is_future.eq((self.time + self.advance) < self.timestamp),
             is_late.eq((self.time >= self.timestamp) & (lateness > self.late_margin)),
             is_stale.eq(lateness > self.stale_margin),
             is_timed.eq(self.timestamp != 0),
@@ -96,8 +103,15 @@ class TimedTXGate(LiteXModule):
         fsm.act("IDLE",
             self.state.eq(0),
             If(~self.active,
-                # Pass-through: identical to a wire.
-                sink.connect(source),
+                If(self.stamp_enable & sink.valid & sink.first,
+                    # The fine gate expects a stamp for every frame start: this one is untimed.
+                    NextValue(frame_timed, 0),
+                    NextValue(self.armed_ts, 0),
+                    NextState("STAMP")
+                ).Else(
+                    # Pass-through: identical to a wire.
+                    sink.connect(source),
+                )
             ).Elif(sink.valid & sink.first,
                 # First payload word of a frame: the extractor latched this frame's timestamp before
                 # emitting its payload. Pause one cycle so the registered compares reflect it.
@@ -112,8 +126,9 @@ class TimedTXGate(LiteXModule):
         fsm.act("DECIDE",
             self.state.eq(1),
             # sink.ready = 0: the first word waits while the registered compares settle.
+            NextValue(frame_timed, is_timed),
             If(~is_timed,
-                NextState("PASS")
+                NextState("STAMP")
             ).Elif(is_future,
                 NextValue(self.held_count, self.held_count + 1),
                 NextState("HOLD")
@@ -125,7 +140,7 @@ class TimedTXGate(LiteXModule):
                 ),
                 NextState("DROP")
             ).Else(
-                NextState("PASS")
+                NextState("STAMP")
             )
         )
         fsm.act("HOLD",
@@ -134,8 +149,18 @@ class TimedTXGate(LiteXModule):
             # sink.ready = 0, source.valid = 0: back-pressure upstream, starve downstream (zeros).
             # is_future is registered: release lands one cycle after time reaches the stamp.
             If(~self.active,
-                NextState("PASS")
+                NextState("STAMP")
             ).Elif(~is_future,
+                NextState("STAMP")
+            )
+        )
+        fsm.act("STAMP",
+            self.state.eq(2),
+            # Hand the frame's tick to the fine gate before its first word (skipped when unused).
+            self.stamp.valid.eq(self.stamp_enable),
+            self.stamp.timed.eq(frame_timed),
+            self.stamp.tick.eq(self.armed_ts),
+            If(self.stamp.ready | ~self.stamp_enable,
                 NextState("PASS")
             )
         )
@@ -180,11 +205,15 @@ class TimedTXGate(LiteXModule):
             CSRField("holding", size=1, offset=3, description="A frame is currently held."),
         ])
         self._armed_ts     = CSRStatus(64, description="Timestamp (ns) of the frame being held/emitted.")
+        # (appended so the addresses of the registers above do not move)
+        self._advance      = CSRStorage(32, reset=0,
+            description="Release a frame this much before its timestamp (time units); the fine gate does the exact release.")
 
         self.comb += [
             self.enable.eq(self._control.fields.enable),
             self.late_margin.eq(self._late_margin.storage),
             self.stale_margin.eq(self._stale_margin.storage),
+            self.advance.eq(self._advance.storage),
             self._late_count.status.eq(self.late_count),
             self._stale_count.status.eq(self.stale_count),
             self._held_count.status.eq(self.held_count),

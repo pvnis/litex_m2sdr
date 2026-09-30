@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 from migen import *
-from migen.genlib.cdc import MultiReg
+from migen.genlib.cdc import MultiReg, PulseSynchronizer, GrayDecoder
 
 from litex.gen import *
 
@@ -15,6 +15,7 @@ from litex.soc.interconnect.csr import *
 from litepcie.common import *
 
 from litex_m2sdr.gateware.gpio import GPIORXPacker, GPIOTXUnpacker
+from litex_m2sdr.gateware.sample_time import RXTickTracker, TXFineGate, rx_tick_layout, tx_stamp_layout
 
 from litex_m2sdr.gateware.ad9361.phy     import AD9361PHY
 from litex_m2sdr.gateware.ad9361.spi     import AD9361SPIMaster
@@ -87,9 +88,10 @@ from litex_m2sdr.gateware.ad9361.agc     import (
 # AD9361 RFIC --------------------------------------------------------------------------------------
 
 class AD9361RFICStreamBypass(LiteXModule):
-    def __init__(self):
-        self.sink   = stream.Endpoint(dma_layout(64))
-        self.source = stream.Endpoint(dma_layout(64))
+    def __init__(self, layout=None):
+        layout = dma_layout(64) if layout is None else layout
+        self.sink   = stream.Endpoint(layout)
+        self.source = stream.Endpoint(layout)
 
         # # #
 
@@ -189,7 +191,7 @@ class AD9361RFIC(LiteXModule):
             with_common_rst = True
         )
         self.rx_cdc = rx_cdc = stream.ClockDomainCrossing(
-            layout  = dma_layout(64),
+            layout  = rx_tick_layout(), # Each word crosses with the tick it was sampled at.
             cd_from = "rfic",
             cd_to   = "sys",
             with_common_rst = True
@@ -226,16 +228,101 @@ class AD9361RFIC(LiteXModule):
 
         if with_rx_fifo:
             self.rx_rfic_fifo = rx_rfic_fifo = ClockDomainsRenamer("rfic")(
-                stream.SyncFIFO(dma_layout(64), depth=rx_fifo_depth, buffered=True)
+                stream.SyncFIFO(rx_tick_layout(), depth=rx_fifo_depth, buffered=True)
             )
         else:
-            self.rx_rfic_fifo = rx_rfic_fifo = AD9361RFICStreamBypass()
+            self.rx_rfic_fifo = rx_rfic_fifo = AD9361RFICStreamBypass(rx_tick_layout())
 
         # BitMode ----------------------------------------------------------------------------------
         self.tx_bitmode = tx_bitmode = AD9361TXBitMode()
         self.rx_bitmode = rx_bitmode = AD9361RXBitMode()
         self.comb += tx_bitmode.mode.eq(self._bitmode.fields.mode)
         self.comb += rx_bitmode.mode.eq(self._bitmode.fields.mode)
+
+        # Sample Counter (time base) ---------------------------------------------------------------
+        # See gateware/sample_time.py. ``tick`` is the index of the first sample of the PHY word being
+        # received, in the rfic domain; it advances on every RX word strobe (consumed or not), by 2 in
+        # 1R1T (a word is two consecutive samples) and by 1 in 2R2T.
+        self._tick_control = CSRStorage(fields=[
+            CSRField("timebase", size=1, offset=0, values=[
+                ("``0b0``", "Frame timestamps and gates use time_gen (nanoseconds)."),
+                ("``0b1``", "Frame timestamps and gates use the sample counter (ticks)."),
+            ]),
+            CSRField("load", size=1, offset=1, pulse=True, description="Load tick_write into the counter."),
+            CSRField("read", size=1, offset=2, pulse=True, description="Latch the counter into tick_read."),
+            CSRField("fine_enable", size=1, offset=3, values=[
+                ("``0b0``", "TX words go to the PHY as they arrive."),
+                ("``0b1``", "TX words are emitted in the PHY slot of their own tick (TXFineGate)."),
+            ]),
+        ])
+        self._tick_write  = CSRStorage(64, description="Value loaded into the sample counter.")
+        self._tick_read   = CSRStatus(64,  description="Sample counter (sys view), latched by control.read.")
+        self._tick_status = CSRStatus(fields=[
+            CSRField("rx_overflow", size=1,  offset=0,  description="RX tick queue overflowed (non 1:1 sample format)."),
+            CSRField("tx_waiting",  size=1,  offset=1,  description="A TX word is waiting for its slot."),
+            CSRField("tx_trimmed",  size=16, offset=16, description="TX words discarded by the fine gate (wraps)."),
+        ])
+
+        self.tick      = tick     = Signal(64)  # rfic.
+        self.tick_inc  = Signal(2)              # sys:  sample periods per PHY word.
+        tick_inc_rfic  = Signal(2)              # rfic.
+        self.tick_mode = Signal()               # sys:  1 = the time base is the sample counter.
+        self.comb += [
+            self.tick_inc.eq(Mux(self.phy.control.fields.mode, 2, 1)),
+            tick_inc_rfic.eq(Mux(self.phy.mode_rfic, 2, 1)),
+            self.tick_mode.eq(self._tick_control.fields.timebase),
+        ]
+        self.tick_load_ps = tick_load_ps = PulseSynchronizer("sys", "rfic")
+        self.comb += tick_load_ps.i.eq(self._tick_control.fields.load)
+        self.sync.rfic += [
+            If(tick_load_ps.o,
+                tick.eq(self._tick_write.storage),  # Static by the time the pulse has crossed.
+            ).Elif(self.phy.rx_strobe,
+                tick.eq(tick + tick_inc_rfic),
+            )
+        ]
+
+        # RX: tick tracker (sys), between the clock-domain FIFO and the bit-mode stage.
+        self.rx_tick_tracker = rx_tick_tracker = RXTickTracker()
+        self.rx_tick     = rx_tick_tracker.tick  # sys: tick of the word offered on ``source``.
+        self.rx_tick_now = rx_tick_tracker.now   # sys: view of "now" (tick after the newest word).
+        self.comb += [
+            rx_tick_tracker.inc.eq(self.tick_inc),
+            rx_tick_tracker.exact.eq(self._bitmode.fields.mode == 0b00),
+            rx_tick_tracker.pop.eq(self.source.valid & self.source.ready),
+            self._tick_status.fields.rx_overflow.eq(rx_tick_tracker.overflow),
+        ]
+        self.sync += If(self._tick_control.fields.read, self._tick_read.status.eq(rx_tick_tracker.now))
+
+        # TX: frame stamps (sys -> rfic) and the fine gate (rfic), right in front of the PHY.
+        self.tx_stamp_cdc = tx_stamp_cdc = stream.ClockDomainCrossing(
+            layout  = tx_stamp_layout(),
+            cd_from = "sys",
+            cd_to   = "rfic",
+            depth   = 8,
+            with_common_rst = True
+        )
+        self.tx_stamp    = tx_stamp_cdc.sink                   # sys: one entry per frame (TimedTXGate).
+        self.fine_enable = self._tick_control.fields.fine_enable  # sys.
+        self.tx_fine = tx_fine = ClockDomainsRenamer("rfic")(TXFineGate())
+        tx_trim_gray = Signal(16)
+        tx_trim_sys  = Signal(16)
+        tx_waiting   = Signal()
+        self.tx_trim_dec = tx_trim_dec = GrayDecoder(16)
+        self.specials += [
+            MultiReg(self._tick_control.fields.fine_enable, tx_fine.enable, odomain="rfic"),
+            MultiReg(tx_trim_gray, tx_trim_sys),
+            MultiReg(tx_fine.waiting, tx_waiting),
+        ]
+        self.sync.rfic += tx_trim_gray.eq(tx_fine.trimmed ^ tx_fine.trimmed[1:])
+        self.comb += [
+            tx_stamp_cdc.source.connect(tx_fine.stamp),
+            tx_fine.tick.eq(tick),
+            tx_fine.inc.eq(tick_inc_rfic),
+            tx_trim_dec.i.eq(tx_trim_sys),
+            self._tick_status.fields.tx_trimmed.eq(tx_trim_dec.o),
+            self._tick_status.fields.tx_waiting.eq(tx_waiting),
+        ]
 
         # Data Flow --------------------------------------------------------------------------------
 
@@ -248,6 +335,7 @@ class AD9361RFIC(LiteXModule):
             tx_bitmode,
             tx_cdc,
             tx_rfic_fifo,
+            tx_fine,
             gpio_tx_unpacker,
         )
         self.comb += [
@@ -262,6 +350,11 @@ class AD9361RFIC(LiteXModule):
         # RX.
         # ---
         # PHY -> GPIORXUnpacker -> optional RX RFIC FIFO -> RX CDC -> RX BitMode -> RX Buffer -> Source.
+        rx_tagged = stream.Endpoint(rx_tick_layout())  # rfic: packed word + its tick.
+        self.comb += [
+            gpio_rx_packer.source.connect(rx_tagged),
+            rx_tagged.tick.eq(tick),                   # The strobe cycle: tick is this word's index.
+        ]
         self.comb += [
             self.phy.source.connect(gpio_rx_packer.sink, keep={"valid", "ready"}),
             gpio_rx_packer.sink.data[0*16:1*16].eq(_sign_extend(self.phy.source.ia, 16)),
@@ -270,9 +363,10 @@ class AD9361RFIC(LiteXModule):
             gpio_rx_packer.sink.data[3*16:4*16].eq(_sign_extend(self.phy.source.qb, 16)),
         ]
         self.rx_pipeline = stream.Pipeline(
-            gpio_rx_packer,
+            rx_tagged,
             rx_rfic_fifo,
             rx_cdc,
+            rx_tick_tracker,
             rx_bitmode,
             rx_buffer,
             self.source,

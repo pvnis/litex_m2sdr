@@ -412,6 +412,19 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
      * round-trips exactly) or, with the device argument time_base=samples, the ticks themselves in
      * every "timeNs" parameter. */
     bool _time_base_samples = false;
+    /* FPGA time base: true = the gateware sample counter (frame stamps and gates in ticks, TX fine
+     * gate); false = time_gen nanoseconds with the tick <-> ns map kept here. Chosen at open
+     * (hardware-timed TX on gateware that has the counter; fpga_timebase=ns forces the old path). */
+    bool      _hw_ticks = false;
+    bool      _tx_fine_gate = true;
+    long long _tx_word_parity = 0;
+    uint16_t  _tx_trimmed_seen = 0;
+    std::chrono::steady_clock::time_point _tx_trimmed_log;
+    uint64_t  _rx_tick_gap_log = 0;
+    bool      _tx_running = false;
+    void      alignTickParity(bool other_stream_running);
+    long long hardwareTicks() const;
+    long long hwUnits(long long samples) const;
     mutable std::mutex _time_map_mutex;
     bool      _time_map_valid = false;
     long long _time_map_ns0 = 0;

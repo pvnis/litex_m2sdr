@@ -66,8 +66,8 @@ long long SoapyLiteXM2SDR::nsAbs(long long tick) const
 long long SoapyLiteXM2SDR::hwNsOfTick(long long tick) const
 {
     const double rate = timeRate();
-    if (rate <= 0.0)
-        return tick;
+    if (rate <= 0.0 || _hw_ticks)
+        return tick;   /* the FPGA's own unit is the tick */
     std::lock_guard<std::mutex> lk(_time_map_mutex);
     if (!_time_map_valid)
         return tb_ticks_to_ns(rate, tick);
@@ -77,7 +77,7 @@ long long SoapyLiteXM2SDR::hwNsOfTick(long long tick) const
 long long SoapyLiteXM2SDR::tickOfHwNs(long long ns) const
 {
     const double rate = timeRate();
-    if (rate <= 0.0)
+    if (rate <= 0.0 || _hw_ticks)
         return ns;
     std::lock_guard<std::mutex> lk(_time_map_mutex);
     if (!_time_map_valid)
@@ -99,6 +99,8 @@ long long SoapyLiteXM2SDR::tickToApi(long long tick) const
  * passed through untouched (TX-only applications keep today's behaviour). */
 long long SoapyLiteXM2SDR::apiToHwNs(long long api) const
 {
+    if (_hw_ticks)
+        return apiToTick(api);
     if (!_time_base_samples) {
         std::lock_guard<std::mutex> lk(_time_map_mutex);
         if (!_time_map_valid)
@@ -109,12 +111,35 @@ long long SoapyLiteXM2SDR::apiToHwNs(long long api) const
 
 long long SoapyLiteXM2SDR::hwNsToApi(long long ns) const
 {
+    if (_hw_ticks)
+        return tickToApi(ns);
     if (!_time_base_samples) {
         std::lock_guard<std::mutex> lk(_time_map_mutex);
         if (!_time_map_valid)
             return ns;
     }
     return tickToApi(tickOfHwNs(ns));
+}
+
+/* 1R1T: a PHY word is two consecutive samples, so word (and frame) boundaries fall on every other
+ * tick. The counter may have been left on the odd ones (it counts by one in 2R2T, the power-up
+ * mode); make it even while nothing is streaming so that round tick values -- a subframe-aligned RX
+ * start, for instance -- are word boundaries. */
+void SoapyLiteXM2SDR::alignTickParity(const bool other_stream_running)
+{
+    if (!_hw_ticks || _nChannels != 1 || other_stream_running)
+        return;
+    const long long t = this->hardwareTicks();
+    if (t & 1) {
+        (void)m2sdr_set_sample_time(_dev, static_cast<uint64_t>(t + 1));
+        SoapySDR::logf(SOAPY_SDR_INFO, "sample counter moved to even parity (%lld -> %lld)", t, t + 1);
+    }
+}
+
+/* A number of samples in the FPGA's time unit (ticks, or nanoseconds on the legacy time base). */
+long long SoapyLiteXM2SDR::hwUnits(long long samples) const
+{
+    return _hw_ticks ? samples : samples_to_ns(_tx_stream.samplerate, samples);
 }
 
 long long SoapyLiteXM2SDR::apiTimeAdvance(long long api, long long samples) const
@@ -132,6 +157,35 @@ long long SoapyLiteXM2SDR::rxFrameLabel(const long long hw_ns, const size_t fram
         return hw_ns;
     const long long n = static_cast<long long>(frame_samples);
     const long long frame_ns = tb_ticks_to_ns(rate, n);
+
+    if (_hw_ticks) {
+        /* The FPGA stamped this frame with the index of its first sample: that is the label. The
+         * running count is only kept to report discontinuities (samples lost in the FPGA or frames
+         * lost on the way to the host). */
+        std::lock_guard<std::mutex> lk(_time_map_mutex);
+        if (!_rx_tick_valid) {
+            const bool timed = _rx_timed_start_pending;
+            if (timed && hw_ns != _rx_timed_start_tick) {
+                SoapySDR::logf(SOAPY_SDR_WARNING,
+                    "RX timed start: first frame is tick %lld, requested %lld (%+lld samples)",
+                    hw_ns, _rx_timed_start_tick, hw_ns - _rx_timed_start_tick);
+            }
+            _rx_timed_start_pending = false;
+            _rx_tick_valid = true;
+            SoapySDR::logf(SOAPY_SDR_INFO,
+                "RX time base: FPGA sample counter, first frame at tick %lld (%s start, API unit: %s)",
+                hw_ns, timed ? "timed" : "immediate", _time_base_samples ? "samples" : "ns");
+        } else if (hw_ns != _rx_next_tick) {
+            _rx_tick_gaps++;
+            if (_rx_tick_gaps <= 5 || (_rx_tick_gaps % 1000) == 0) {
+                SoapySDR::logf(SOAPY_SDR_WARNING,
+                    "RX discontinuity #%llu: frame at tick %lld, expected %lld (%+lld samples)",
+                    (unsigned long long)_rx_tick_gaps, hw_ns, _rx_next_tick, hw_ns - _rx_next_tick);
+            }
+        }
+        _rx_next_tick = hw_ns + n;
+        return _time_base_samples ? hw_ns : tb_ticks_to_ns(rate, hw_ns);
+    }
 
     std::lock_guard<std::mutex> lk(_time_map_mutex);
     if (!_rx_tick_valid) {
@@ -1002,12 +1056,17 @@ int SoapyLiteXM2SDR::activateStream(
                 _rx_timed_start_pending = false;
                 _rx_tick_max_dev_ns = 0;
             }
+            if (_hw_ticks) {
+                /* Frame stamps and the start gate work on the sample counter from here on. */
+                (void)m2sdr_set_sample_timebase(_dev, true, _tx_fine_gate && _tx_stream.timed_tx_hw);
+                this->alignTickParity(_tx_running);
+            }
             if (m2sdr_has_rx_timed_start(_dev)) {
                 const bool want = (flags & SOAPY_SDR_HAS_TIME) && _rx_timed_start &&
                                   _rx_dma_header_bytes != 0 && timeNs > 0;
                 /* The requested time is a tick; the gate gets the board time of that tick. */
                 const long long req_tick = want ? this->apiToTick(timeNs) : 0;
-                const long long start_ns = want ? this->nsAbs(req_tick) : 0;
+                const long long start_ns = want ? (_hw_ticks ? req_tick : this->nsAbs(req_tick)) : 0;
                 int grc = m2sdr_set_rx_timed_start(_dev, want, static_cast<uint64_t>(start_ns));
                 if (grc != M2SDR_ERR_OK) {
                     SoapySDR::logf(SOAPY_SDR_WARNING,
@@ -1079,10 +1138,15 @@ int SoapyLiteXM2SDR::activateStream(
             if (_rx_timed_start_armed) {
                 struct m2sdr_timed_rx_status rs;
                 const bool have = m2sdr_get_rx_timed_start_status(_dev, &rs) == M2SDR_ERR_OK;
-                const long long start_ns = this->nsAbs(this->apiToTick(timeNs));
+                const long long req_tick = this->apiToTick(timeNs);
+                const long long start_ns = _hw_ticks ? req_tick : this->nsAbs(req_tick);
+                const long long now_hw   = _hw_ticks ? this->hardwareTicks() : _rx_stream.time0_ns;
+                const double    ahead_ms = _hw_ticks
+                    ? (double)(start_ns - now_hw) * 1e3 / std::max(1.0, this->timeRate())
+                    : (double)(start_ns - now_hw) / 1e6;
                 SoapySDR::logf(SOAPY_SDR_INFO,
-                    "RX timed start armed: first sample at board time %lld ns (%.3f ms from now)%s",
-                    start_ns, (double)(start_ns - _rx_stream.time0_ns) / 1e6,
+                    "RX timed start armed: first sample at %s %lld (%.3f ms from now)%s",
+                    _hw_ticks ? "tick" : "board time [ns]", start_ns, ahead_ms,
                     (have && rs.late) ? " -- ALREADY IN THE PAST, started immediately" : "");
             } else {
                 SoapySDR::logf(SOAPY_SDR_WARNING,
@@ -1099,6 +1163,20 @@ int SoapyLiteXM2SDR::activateStream(
                 channel_configure(SOAPY_SDR_TX, _tx_stream.channels[i]);
             /* Crossbar Mux: Select PCIe streaming */
             litex_m2sdr_writel(_dev, CSR_CROSSBAR_MUX_SEL_ADDR, 0);
+            if (_tx_stream.timed_tx_hw && _hw_ticks) {
+                /* Sample-count time base, and the RFIC-domain fine gate: each TX word leaves in the
+                 * PHY slot of its own index. In 1R1T a PHY word is two samples, so frames must start
+                 * on the counter's word parity to be exact (see the shift in writeStream). */
+                (void)m2sdr_set_sample_timebase(_dev, true, _tx_fine_gate);
+                this->alignTickParity(_rx_tick_valid);
+                _tx_running = true;
+                _tx_word_parity = (_nChannels == 1) ? (this->hardwareTicks() & 1) : 0;
+                _tx_trimmed_seen = 0;
+                _tx_trimmed_log = std::chrono::steady_clock::now();
+                struct m2sdr_sample_time_status ts;
+                if (m2sdr_get_sample_time_status(_dev, &ts) == M2SDR_ERR_OK)
+                    _tx_trimmed_seen = ts.tx_trimmed;
+            }
             if (_tx_stream.timed_tx_hw && _tx_stream.buf && _tx_buf_count && _tx_buf_stride) {
                 /* The DMA reader free-runs over the ring and prefetches about two buffers before the
                  * first write lands, so stale headers from a previous run would be emitted (or
@@ -1170,14 +1248,21 @@ int SoapyLiteXM2SDR::activateStream(
             initTimedTxTimeline();
         if (_tx_stream.timed_tx_hw && isLitePCIe()) {
             refreshTimedTxDefaults();
-            const uint32_t margin_ns = static_cast<uint32_t>(
-                std::max<long long>(0, _tx_stream.timed_tx_late_margin_ns));
+            /* Late margin. Nanosecond time base: tiny (1 us), because an in-margin late frame shifts
+             * everything after it. Sample time base: half a frame -- the fine gate discards the late
+             * head of such a frame and emits the rest on its exact ticks, nothing shifts. */
+            const long long mtu = static_cast<long long>(this->getStreamMTU(TX_STREAM));
+            const uint32_t margin_ns = _hw_ticks
+                ? static_cast<uint32_t>(_tx_stream.timed_tx_late_margin_configured
+                      ? std::max<long long>(0, _tx_stream.timed_tx_late_margin_ns) : mtu / 2)
+                : static_cast<uint32_t>(std::max<long long>(0, _tx_stream.timed_tx_late_margin_ns));
             /* Half a ring lap: a dropped frame older than this is a re-read of a slot the reader
              * already emitted (the host left a gap), not one of the host's frames arriving late. */
             const uint32_t stale_ns = static_cast<uint32_t>(std::max<long long>(1,
-                samples_to_ns(_tx_stream.samplerate,
-                              static_cast<long long>(_tx_buf_count / 2) *
-                              static_cast<long long>(this->getStreamMTU(TX_STREAM)))));
+                hwUnits(static_cast<long long>(_tx_buf_count / 2) * mtu)));
+            /* Frames are released this early so they are waiting at the fine gate (in front of the
+             * PHY) when their tick comes; 64 samples covers the clock-domain crossing many times. */
+            (void)m2sdr_set_tx_timed_gate_advance(_dev, (_hw_ticks && _tx_fine_gate) ? 64 : 0);
             int rc = m2sdr_set_tx_timed_gate(_dev, true, margin_ns, stale_ns);
             if (rc != M2SDR_ERR_OK) {
                 SoapySDR::logf(SOAPY_SDR_ERROR,
@@ -1193,8 +1278,9 @@ int SoapyLiteXM2SDR::activateStream(
             /* The FPGA owns emission timing: no software anchoring against the DMA counters. */
             _tx_stream.tx_anchor_pending = false;
             SoapySDR::logf(SOAPY_SDR_INFO,
-                "TX hardware timed gate enabled: frames are held/dropped in the FPGA, late_margin_ns=%u",
-                margin_ns);
+                "TX hardware timed gate enabled: frames are held/dropped in the FPGA, late margin %u %s%s",
+                margin_ns, _hw_ticks ? "samples" : "ns",
+                (_hw_ticks && _tx_fine_gate) ? ", per-word fine gate on the sample counter" : "");
         }
         if (flags & SOAPY_SDR_HAS_TIME) {
             SoapySDR::logf(SOAPY_SDR_DEBUG,
@@ -1270,6 +1356,12 @@ void SoapyLiteXM2SDR::stopTxStreamUnlocked()
             (void)m2sdr_set_tx_timed_gate(_dev, false, 0, 0);
             (void)m2sdr_set_tx_ring_lead(_dev, 0);
             (void)m2sdr_set_tx_ring_depth(_dev, 0);
+            _tx_running = false;
+            if (_hw_ticks) {
+                /* Fine gate off with the stream stopped: it drains its stamp queue and resyncs. */
+                (void)m2sdr_set_sample_timebase(_dev, true, false);
+                (void)m2sdr_set_tx_timed_gate_advance(_dev, 0);
+            }
         }
         int rc = m2sdr_stream_deactivate(_dev, M2SDR_TX);
         if (rc != M2SDR_ERR_OK) {
@@ -1434,7 +1526,7 @@ void SoapyLiteXM2SDR::advanceTxTimeline(long long samples)
 {
     _tx_stream.tx_timeline_samples += samples;
     _tx_stream.tx_next_time_ns = _tx_stream.tx_timeline_anchor_ns +
-        samples_to_ns(_tx_stream.samplerate, _tx_stream.tx_timeline_samples);
+        hwUnits(_tx_stream.tx_timeline_samples);
 }
 
 void SoapyLiteXM2SDR::initTimedTxTimeline()
@@ -1455,7 +1547,13 @@ void SoapyLiteXM2SDR::initTimedTxTimeline()
     /* Provisional anchor, kept so behaviour is sane if the hardware counters
      * are unavailable; tryAnchorTxTimeline() replaces it with a measured one
      * as soon as the DMA reader has emitted its first buffer. */
-    setTxTimeline(this->hardwareTimeNs() + lead_ns + _tx_stream.timed_tx_latency_ns);
+    if (_hw_ticks && _tx_stream.timed_tx_hw) {
+        setTxTimeline(this->hardwareTicks() +
+                      static_cast<long long>(_tx_stream.timed_tx_lead_buffers) *
+                      static_cast<long long>(this->getStreamMTU(TX_STREAM)));
+    } else {
+        setTxTimeline(this->hardwareTimeNs() + lead_ns + _tx_stream.timed_tx_latency_ns);
+    }
     _tx_stream.tx_timeline_valid = true;
     _tx_stream.tx_anchor_pending = true;
     _tx_stream.tx_underflow_seen = 0;
@@ -1581,7 +1679,7 @@ int SoapyLiteXM2SDR::submitTxRemainder(
         /* Untimed data in hardware mode: continue the timeline so the gate never sees a 0 stamp. */
         _tx_stream.remainderFlags |= SOAPY_SDR_HAS_TIME;
         _tx_stream.remainderTimeNs = _tx_stream.tx_next_time_ns -
-            samples_to_ns(_tx_stream.samplerate, static_cast<long long>(_tx_stream.remainderOffset));
+            hwUnits(static_cast<long long>(_tx_stream.remainderOffset));
     }
 
     /* The DMA ring and UDP packets are fixed-size: a partial submit still
@@ -1618,9 +1716,7 @@ void SoapyLiteXM2SDR::markTxRemainderTime(const long long payloadTimeNs)
 
     _tx_stream.remainderFlags |= SOAPY_SDR_HAS_TIME;
     _tx_stream.remainderTimeNs =
-        payloadTimeNs -
-        samples_to_ns(_tx_stream.samplerate,
-                      static_cast<long long>(_tx_stream.remainderOffset));
+        payloadTimeNs - hwUnits(static_cast<long long>(_tx_stream.remainderOffset));
 }
 
 int SoapyLiteXM2SDR::appendTxZeros(
@@ -2737,6 +2833,15 @@ int SoapyLiteXM2SDR::writeStream(
             int ret = ensureTxRemainderBuffer(stream, timeoutUs);
             if (ret < 0)
                 return ret;
+            if (_hw_ticks && _nChannels == 1 && _tx_stream.remainderOffset == 0 &&
+                ((timeNs ^ _tx_word_parity) & 1)) {
+                /* 1R1T: a PHY word is two samples and frames start on a word. Start this frame one
+                 * sample earlier with a zero so the caller's sample lands exactly on its tick. */
+                setTxTimeline(timeNs - 1);
+                ret = appendTxZeros(stream, 1, timeoutUs);
+                if (ret < 0)
+                    return ret;
+            }
             markTxRemainderTime(timeNs);
         } else if (_tx_stream.timed_tx_enabled) {
             if (!_tx_stream.tx_timeline_valid)
@@ -2868,6 +2973,17 @@ int SoapyLiteXM2SDR::readStreamStatus(
                                 (unsigned long long)rs);
                             _tx_stream.hw_resync_seen = rs;
                         }
+                    }
+                    if (_hw_ticks && now - _tx_trimmed_log >= std::chrono::seconds(1)) {
+                        struct m2sdr_sample_time_status ts;
+                        if (m2sdr_get_sample_time_status(_dev, &ts) == M2SDR_ERR_OK &&
+                            ts.tx_trimmed != _tx_trimmed_seen) {
+                            SoapySDR::logf(SOAPY_SDR_INFO,
+                                "TX fine gate: %u late word(s) discarded since the last report (rest emitted on time)",
+                                static_cast<unsigned>(static_cast<uint16_t>(ts.tx_trimmed - _tx_trimmed_seen)));
+                            _tx_trimmed_seen = ts.tx_trimmed;
+                        }
+                        _tx_trimmed_log = now;
                     }
                     struct m2sdr_timed_tx_stats st;
                     const bool have_st = m2sdr_get_tx_timed_gate_stats(_dev, &st) == M2SDR_ERR_OK;

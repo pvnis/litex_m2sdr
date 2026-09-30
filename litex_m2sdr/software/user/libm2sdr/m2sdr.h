@@ -726,6 +726,26 @@ bool m2sdr_has_rx_timed_start(struct m2sdr_dev *dev);
 int  m2sdr_set_rx_timed_start(struct m2sdr_dev *dev, bool enable, uint64_t start_time_ns);
 int  m2sdr_get_rx_timed_start_status(struct m2sdr_dev *dev, struct m2sdr_timed_rx_status *status);
 
+/* Sample-count time base (gateware sample_time): the AD9361 core counts samples in the RFIC clock
+ * domain. With the time base set to ticks, RX frame headers carry the index of the frame's first
+ * sample, the TX/RX gates compare frame stamps against the counter, and -- with the fine gate --
+ * every TX word is emitted in the PHY slot of its own index. All "timestamp"/"margin" values of the
+ * timed TX gate and timed RX start are then sample counts instead of nanoseconds. */
+struct m2sdr_sample_time_status {
+    bool     ticks;        /* time base = sample counter */
+    bool     fine_gate;    /* RFIC-domain TX fine gate enabled */
+    bool     rx_overflow;  /* RX tick queue overflowed (sample format not 1:1) */
+    bool     tx_waiting;   /* a TX word is waiting for its slot */
+    uint16_t tx_trimmed;   /* TX words discarded by the fine gate because late (wraps) */
+};
+bool m2sdr_has_sample_timebase(struct m2sdr_dev *dev);
+int  m2sdr_set_sample_timebase(struct m2sdr_dev *dev, bool ticks, bool fine_gate);
+int  m2sdr_get_sample_time(struct m2sdr_dev *dev, uint64_t *tick);
+int  m2sdr_set_sample_time(struct m2sdr_dev *dev, uint64_t tick);
+int  m2sdr_get_sample_time_status(struct m2sdr_dev *dev, struct m2sdr_sample_time_status *status);
+/* Release frames this much (time units) before their stamp so they reach the fine gate in time. */
+int  m2sdr_set_tx_timed_gate_advance(struct m2sdr_dev *dev, uint32_t advance);
+
 /* Hardware-timed TX ring placement. The PCIe DMA reader free-runs over the ring and
  * prefetches about two buffers, so a frame must be written at least a few slots ahead
  * of hw_count or it is never emitted. With min_lead_buffers > 0 the TX buffer acquire

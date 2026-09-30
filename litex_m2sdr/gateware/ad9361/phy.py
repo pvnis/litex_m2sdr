@@ -85,6 +85,8 @@ class AD9361PHY(LiteXModule):
             MultiReg(self.control.fields.mode,     mode,     odomain="rfic"),
             MultiReg(self.control.fields.loopback, loopback, odomain="rfic"),
         ]
+        self.mode_rfic = mode      # o (rfic): 1 = 1R1T (a word is two consecutive samples).
+        self.rx_strobe = Signal()  # o (rfic): one pulse per received PHY word, consumed or not.
 
         # RX PHY -----------------------------------------------------------------------------------
 
@@ -204,6 +206,7 @@ class AD9361PHY(LiteXModule):
         # is free-running: valid pulses for a single cycle per sample set and
         # is not held under backpressure, so samples are dropped when the
         # downstream stalls (overflow accounting happens at the DMA level).
+        self.comb += self.rx_strobe.eq(rx_valid)
         self.sync.rfic += [
             rx_valid.eq(0),
             If(rx_count == 0,

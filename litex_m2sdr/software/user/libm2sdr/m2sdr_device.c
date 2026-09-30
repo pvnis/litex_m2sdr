@@ -2256,6 +2256,106 @@ int m2sdr_set_tx_header(struct m2sdr_dev *dev, bool enable)
 }
 
 /* Hardware timed-TX gate (see m2sdr.h). Compiled out when the CSR map has no timed_tx block. */
+bool m2sdr_has_sample_timebase(struct m2sdr_dev *dev)
+{
+    (void)dev;
+#ifdef CSR_AD9361_TICK_CONTROL_ADDR
+    return true;
+#else
+    return false;
+#endif
+}
+
+int m2sdr_set_sample_timebase(struct m2sdr_dev *dev, bool ticks, bool fine_gate)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_AD9361_TICK_CONTROL_ADDR
+    const uint32_t v = ((ticks ? 1u : 0u) << CSR_AD9361_TICK_CONTROL_TIMEBASE_OFFSET) |
+                       ((fine_gate ? 1u : 0u) << CSR_AD9361_TICK_CONTROL_FINE_ENABLE_OFFSET);
+    return (m2sdr_reg_write(dev, CSR_AD9361_TICK_CONTROL_ADDR, v) == 0) ? M2SDR_ERR_OK : M2SDR_ERR_IO;
+#else
+    (void)ticks; (void)fine_gate;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_get_sample_time(struct m2sdr_dev *dev, uint64_t *tick)
+{
+    if (!dev || !tick)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_AD9361_TICK_CONTROL_ADDR
+    uint32_t ctrl = 0, hi = 0, lo = 0;
+    if (m2sdr_reg_read(dev, CSR_AD9361_TICK_CONTROL_ADDR, &ctrl) != 0)
+        return M2SDR_ERR_IO;
+    /* 'read' is a pulse field: latch the counter, then read the 64-bit snapshot (MSW first). */
+    if (m2sdr_reg_write(dev, CSR_AD9361_TICK_CONTROL_ADDR,
+                        ctrl | (1u << CSR_AD9361_TICK_CONTROL_READ_OFFSET)) != 0)
+        return M2SDR_ERR_IO;
+    if (m2sdr_reg_read(dev, CSR_AD9361_TICK_READ_ADDR, &hi) != 0 ||
+        m2sdr_reg_read(dev, CSR_AD9361_TICK_READ_ADDR + 4, &lo) != 0)
+        return M2SDR_ERR_IO;
+    *tick = ((uint64_t)hi << 32) | lo;
+    return M2SDR_ERR_OK;
+#else
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_set_sample_time(struct m2sdr_dev *dev, uint64_t tick)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_AD9361_TICK_CONTROL_ADDR
+    uint32_t ctrl = 0;
+    if (m2sdr_reg_read(dev, CSR_AD9361_TICK_CONTROL_ADDR, &ctrl) != 0)
+        return M2SDR_ERR_IO;
+    if (m2sdr_reg_write(dev, CSR_AD9361_TICK_WRITE_ADDR,     (uint32_t)(tick >> 32)) != 0 ||
+        m2sdr_reg_write(dev, CSR_AD9361_TICK_WRITE_ADDR + 4, (uint32_t)(tick & 0xffffffffu)) != 0)
+        return M2SDR_ERR_IO;
+    if (m2sdr_reg_write(dev, CSR_AD9361_TICK_CONTROL_ADDR,
+                        ctrl | (1u << CSR_AD9361_TICK_CONTROL_LOAD_OFFSET)) != 0)
+        return M2SDR_ERR_IO;
+    return M2SDR_ERR_OK;
+#else
+    (void)tick;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_get_sample_time_status(struct m2sdr_dev *dev, struct m2sdr_sample_time_status *status)
+{
+    if (!dev || !status)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_AD9361_TICK_CONTROL_ADDR
+    uint32_t ctrl = 0, st = 0;
+    memset(status, 0, sizeof(*status));
+    if (m2sdr_reg_read(dev, CSR_AD9361_TICK_CONTROL_ADDR, &ctrl) != 0 ||
+        m2sdr_reg_read(dev, CSR_AD9361_TICK_STATUS_ADDR, &st) != 0)
+        return M2SDR_ERR_IO;
+    status->ticks       = (ctrl >> CSR_AD9361_TICK_CONTROL_TIMEBASE_OFFSET) & 1u;
+    status->fine_gate   = (ctrl >> CSR_AD9361_TICK_CONTROL_FINE_ENABLE_OFFSET) & 1u;
+    status->rx_overflow = (st >> CSR_AD9361_TICK_STATUS_RX_OVERFLOW_OFFSET) & 1u;
+    status->tx_waiting  = (st >> CSR_AD9361_TICK_STATUS_TX_WAITING_OFFSET) & 1u;
+    status->tx_trimmed  = (uint16_t)((st >> CSR_AD9361_TICK_STATUS_TX_TRIMMED_OFFSET) & 0xffffu);
+    return M2SDR_ERR_OK;
+#else
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
+int m2sdr_set_tx_timed_gate_advance(struct m2sdr_dev *dev, uint32_t advance)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+#ifdef CSR_TIMED_TX_ADVANCE_ADDR
+    return (m2sdr_reg_write(dev, CSR_TIMED_TX_ADVANCE_ADDR, advance) == 0) ? M2SDR_ERR_OK : M2SDR_ERR_IO;
+#else
+    (void)advance;
+    return M2SDR_ERR_UNSUPPORTED;
+#endif
+}
+
 bool m2sdr_has_rx_timed_start(struct m2sdr_dev *dev)
 {
     (void)dev;

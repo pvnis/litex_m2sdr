@@ -840,7 +840,10 @@ class BaseSoC(SoCMini):
         self.header = TXRXHeader(data_width=64)
         self.comb += [
             self.header.rx.header.eq(0x5aa5_5aa5_5aa5_5aa5), # Unused for now, arbitrary.
-            self.header.rx.timestamp.eq(self.time_gen.time),
+            # RX frame stamp: board time when the header is emitted (ns), or in tick mode the sample
+            # index of the frame's first payload word (the inserter then waits for that word).
+            self.header.rx.timestamp.eq(Mux(self.ad9361.tick_mode, self.ad9361.rx_tick, self.time_gen.time)),
+            self.header.rx.stamp_on_payload.eq(self.ad9361.tick_mode),
         ]
 
         # TX/RX Datapath ---------------------------------------------------------------------------
@@ -854,8 +857,13 @@ class BaseSoC(SoCMini):
         # time) so a stamped sample leaves the FPGA at its stamp instead of whenever the DMA ring
         # reaches it. Pass-through unless enabled through its CSR.
         self.timed_tx = TimedTXGate(data_width=64)
+        # Time base: nanoseconds of time_gen (legacy) or the AD9361 sample counter (ticks), selected by
+        # ad9361.tick_control.timebase. In tick mode the header timestamps are sample indices.
+        tick_mode = self.ad9361.tick_mode
         self.comb += [
-            self.timed_tx.time.eq(self.time_gen.time),
+            self.timed_tx.time.eq(Mux(tick_mode, self.ad9361.rx_tick_now, self.time_gen.time)),
+            self.timed_tx.stamp.connect(self.ad9361.tx_stamp),
+            self.timed_tx.stamp_enable.eq(self.ad9361.fine_enable),
             self.timed_tx.timestamp.eq(self.header.tx.timestamp),
             self.timed_tx.frames_active.eq(self.header.tx.header_enable),
             self.timed_tx.reset.eq(self.header.tx.reset),
@@ -875,7 +883,13 @@ class BaseSoC(SoCMini):
         # reaches the programmed start time, so the first DMA frame is stamped with it (the
         # stream_cmd(time_spec) semantics of a USRP). Transparent unless armed through its CSR.
         self.timed_rx = TimedRXStart()
-        self.comb += self.timed_rx.time.eq(self.time_gen.time)
+        self.comb += [
+            self.timed_rx.time.eq(self.time_gen.time),
+            self.timed_rx.tick_mode.eq(tick_mode),
+            self.timed_rx.sink_tick.eq(self.ad9361.rx_tick),
+            self.timed_rx.sink_fire.eq(self.ad9361.source.valid & self.ad9361.source.ready),
+            self.timed_rx.inc.eq(self.ad9361.tick_inc),
+        ]
 
         # RFIC RX -> Loopback -> Header RX.
         self.comb += [

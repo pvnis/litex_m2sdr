@@ -30,6 +30,9 @@ class HeaderInserterExtractor(LiteXModule):
 
         self.enable        = Signal()   # i (CSR).
         self.header_enable = Signal()   # i (CSR).
+        # i (Inserter): emit the timestamp word only once the first payload word is waiting at the
+        # sink, so ``timestamp`` can be a value that travels with that word (its sample index).
+        self.stamp_on_payload = Signal()
         self.frame_cycles  = Signal(32) # i (CSR).
 
         if with_csr:
@@ -84,7 +87,7 @@ class HeaderInserterExtractor(LiteXModule):
             )
             # Timestamp.
             fsm.act("TIMESTAMP",
-                source.valid.eq(1),
+                source.valid.eq(~self.stamp_on_payload | sink.valid),
                 source.data[0:64].eq(self.timestamp),
                 If(source.valid & source.ready,
                     NextValue(self.update, 1),

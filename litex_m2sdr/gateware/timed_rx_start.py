@@ -38,27 +38,47 @@ class TimedRXStart(LiteXModule):
         self.start_time = Signal(64) # i (CSR): board time (ns) of the first RX frame.
         self.lead       = Signal(32, reset=default_lead_ns) # i (CSR): compare-to-stamp latency (ns).
 
+        # Sample-count time base (tick_mode = 1): start_time is a sample index. The inserter drains
+        # its sink while held; ``sink_tick`` is the tick of the word it is draining and ``sink_fire``
+        # pulses when it takes it. The gate opens after the last word before start_time, so the first
+        # word kept -- the first payload word of the first frame -- is the sample start_time itself.
+        self.tick_mode  = Signal()   # i
+        self.sink_tick  = Signal(64) # i
+        self.sink_fire  = Signal()   # i
+        self.inc        = Signal(2)  # i: sample periods per word.
+
         self.hold       = Signal()   # o: keep the RX header inserter in reset (samples dropped).
         self.opened     = Signal()   # o: start time reached since the last arm.
         self.late       = Signal()   # o: start_time was already in the past when armed.
-        self.open_time  = Signal(64) # o: board time at which the gate opened.
+        self.open_time  = Signal(64) # o: board time at which the gate opened (tick mode: last word discarded).
 
         # # #
 
         # Registered compare (64-bit add + compare, never on a single-cycle path with the FSM).
-        reached  = Signal()
-        enable_d = Signal()
+        reached   = Signal()
+        enable_d  = Signal()
+        last_tick = Signal(64)   # tick of the last word to discard (registered: one compare per path).
         self.sync += [
+            last_tick.eq(self.start_time - self.inc),
             reached.eq((self.time + self.lead) >= self.start_time),
             enable_d.eq(self.enable),
             If(~self.enable,
                 self.opened.eq(0),
                 self.late.eq(0),
-            ).Elif(reached & ~self.opened,
-                self.opened.eq(1),
-                self.open_time.eq(self.time),
-                # Armed (enable rose one cycle ago) with the start time already behind us.
-                If(~enable_d, self.late.eq(1)),
+            ).Elif(~self.opened,
+                If(self.tick_mode,
+                    # The word being drained is the last one before start_time (or we are past it).
+                    If(self.sink_fire & (self.sink_tick >= last_tick),
+                        self.opened.eq(1),
+                        self.open_time.eq(self.sink_tick),
+                        If(self.sink_tick >= self.start_time, self.late.eq(1)),
+                    )
+                ).Elif(reached,
+                    self.opened.eq(1),
+                    self.open_time.eq(self.time),
+                    # Armed (enable rose one cycle ago) with the start time already behind us.
+                    If(~enable_d, self.late.eq(1)),
+                )
             ),
         ]
         self.comb += self.hold.eq(self.enable & ~self.opened)

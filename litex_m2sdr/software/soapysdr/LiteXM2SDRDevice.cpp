@@ -617,6 +617,14 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
         /* time_base=samples: every Soapy "timeNs" carries a sample count instead of nanoseconds. */
         const auto tb = args.find("time_base");
         _time_base_samples = (tb != args.end()) && (tb->second == "samples" || tb->second == "ticks");
+        const auto tt = args.find("timed_tx");
+        const bool hw_tx = (tt != args.end()) &&
+                           (tt->second == "hardware" || tt->second == "hw" || tt->second == "fpga");
+        const auto ft = args.find("fpga_timebase");
+        const bool force_ns = (ft != args.end()) && (ft->second == "ns");
+        const auto fg = args.find("tx_fine_gate");
+        _tx_fine_gate = !((fg != args.end()) && (fg->second == "off" || fg->second == "0"));
+        _hw_ticks = hw_tx && !force_ns && m2sdr_has_sample_timebase(nullptr);
     }
     std::string path;
     std::string eth_ip = "192.168.1.50";
@@ -978,6 +986,9 @@ SoapyLiteXM2SDR::SoapyLiteXM2SDR(const SoapySDR::Kwargs &args)
 
 SoapyLiteXM2SDR::~SoapyLiteXM2SDR(void) {
     SoapySDR::log(SOAPY_SDR_INFO, "Power down and cleanup");
+    /* Hand the board back with the nanosecond time base the other tools expect. */
+    if (_hw_ticks && _dev)
+        (void)m2sdr_set_sample_timebase(_dev, false, false);
 
     _rx_stream.stop_requested.store(true);
     _tx_stream.stop_requested.store(true);
@@ -2231,11 +2242,23 @@ bool SoapyLiteXM2SDR::hasHardwareTime(const std::string &) const {
 long long SoapyLiteXM2SDR::getHardwareTime(const std::string &) const
 {
     /* Public API value: nanoseconds, or sample ticks with time_base=samples. */
+    if (_hw_ticks)
+        return this->tickToApi(this->hardwareTicks());
     const long long ns = this->hardwareTimeNs();
     return _time_base_samples ? this->hwNsToApi(ns) : ns;
 }
 
-/* Board time in nanoseconds (internal unit). */
+/* The gateware sample counter (sys view). */
+long long SoapyLiteXM2SDR::hardwareTicks() const
+{
+    uint64_t tick = 0;
+    int rc = m2sdr_get_sample_time(_dev, &tick);
+    if (rc != 0)
+        throw std::runtime_error("m2sdr_get_sample_time() failed: " + std::string(m2sdr_strerror(rc)));
+    return static_cast<long long>(tick);
+}
+
+/* Board time in nanoseconds (time_gen). */
 long long SoapyLiteXM2SDR::hardwareTimeNs() const
 {
     uint64_t time_ns = 0;
@@ -2250,6 +2273,12 @@ long long SoapyLiteXM2SDR::hardwareTimeNs() const
 
 void SoapyLiteXM2SDR::setHardwareTime(const long long timeApi, const std::string &)
 {
+    if (_hw_ticks) {
+        int trc = m2sdr_set_sample_time(_dev, static_cast<uint64_t>(this->apiToTick(timeApi)));
+        if (trc != 0)
+            throw std::runtime_error("m2sdr_set_sample_time() failed: " + std::string(m2sdr_strerror(trc)));
+        return;
+    }
     const long long timeNs = _time_base_samples ? this->nsAbs(timeApi) : timeApi;
     int rc = m2sdr_set_time(_dev, static_cast<uint64_t>(timeNs));
 
