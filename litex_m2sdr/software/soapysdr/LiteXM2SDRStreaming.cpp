@@ -27,6 +27,8 @@
 
 #if USE_LITEETH
 #include "liteeth_udp.h"
+
+static inline long long samples_to_ns(double sample_rate, long long samples);
 #endif
 
 /* Parse Soapy/gr-osmosdr channel arguments:
