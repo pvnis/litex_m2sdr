@@ -669,6 +669,15 @@ SoapySDR::Stream *SoapyLiteXM2SDR::setupStream(
                 const std::string v = get_kwargs_string(searchArgs, _deviceArgs, "timed_rx", "on");
                 _rx_timed_start = !(v == "off" || v == "0" || v == "false" || v == "no");
             }
+            {
+                /* rx_poll=irq (default): the RX thread sleeps until the DMA interrupt (kernel module
+                 * parameter rx_irq_period, buffers per interrupt). rx_poll=busy: it spins on the DMA
+                 * writer's live index like a poll-mode driver (lowest delivery lag, one core busy). */
+                const std::string v = get_kwargs_string(searchArgs, _deviceArgs, "rx_poll", "irq");
+                const bool busy = (v == "busy" || v == "poll" || v == "spin");
+                if (m2sdr_set_rx_busy_poll(_dev, busy) == M2SDR_ERR_OK && busy)
+                    SoapySDR::log(SOAPY_SDR_INFO, "RX wake-up: busy-poll on the DMA writer index (rx_poll=busy)");
+            }
             if (_rx_stream.rxw_depth > 16384)
                 _rx_stream.rxw_depth = 16384;
             int rc = m2sdr_stream_configure(_dev, &config);
@@ -1803,6 +1812,71 @@ int SoapyLiteXM2SDR::appendTxSamples(
 /* Acquire a buffer for reading. */
 
 /***********************************************************************
+ * RX delivery-lag statistics
+ *
+ * M2SDR_RX_LAG_STATS=<report period in seconds>: age of the newest sample of
+ * each DMA buffer when the receiving thread gets it (FPGA pipeline + DMA +
+ * wake-up), as percentiles on stderr. Needs the gateware sample counter and
+ * costs one counter read per measured buffer (M2SDR_RX_LAG_EVERY=<n> measures
+ * every n-th buffer). In the same mode the tail of each buffer as seen at
+ * delivery is compared with the DMA memory one buffer later: a difference
+ * means a buffer was handed out before its last bytes had landed.
+ **********************************************************************/
+void SoapyLiteXM2SDR::rxLagStatsUpdate(long long ts, size_t samples, const void *buffer, size_t bytes)
+{
+    RXStream &rx = _rx_stream;
+    if (rx.lag_period_s < 0.0) {
+        const char *env = std::getenv("M2SDR_RX_LAG_STATS");
+        const char *every = std::getenv("M2SDR_RX_LAG_EVERY");
+        rx.lag_period_s = (env && _hw_ticks) ? std::atof(env) : 0.0;
+        rx.lag_every = std::max(1, every ? std::atoi(every) : 1);
+        if (rx.lag_period_s > 0.0)
+            rx.lag_hist.assign(RXStream::LAG_BINS, 0);
+        rx.lag_t0 = std::chrono::steady_clock::now();
+    }
+    if (rx.lag_period_s <= 0.0)
+        return;
+
+    if (bytes >= RXStream::LAG_TAIL_BYTES) {
+        if (rx.lag_tail_ptr && std::memcmp(rx.lag_tail_ptr, rx.lag_tail_copy, RXStream::LAG_TAIL_BYTES) != 0)
+            rx.lag_tail_mismatch++;
+        rx.lag_tail_ptr = static_cast<const uint8_t *>(buffer) + bytes - RXStream::LAG_TAIL_BYTES;
+        std::memcpy(rx.lag_tail_copy, rx.lag_tail_ptr, RXStream::LAG_TAIL_BYTES);
+    }
+    if ((rx.lag_skip++ % rx.lag_every) != 0)
+        return;
+
+    const double rate = rx.samplerate > 0 ? rx.samplerate : 1.0;
+    const long long age_ticks = this->hardwareTicks() - (ts + (long long)samples);
+    const long long age_us = std::llround((double)age_ticks * 1e6 / rate);
+    rx.lag_min = rx.lag_n ? std::min(rx.lag_min, age_us) : age_us;
+    rx.lag_max = rx.lag_n ? std::max(rx.lag_max, age_us) : age_us;
+    rx.lag_hist[(size_t)std::min<long long>(std::max<long long>(age_us, 0) / RXStream::LAG_BIN_US,
+                                            RXStream::LAG_BINS - 1)]++;
+    rx.lag_n++;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<double>(now - rx.lag_t0).count() < rx.lag_period_s)
+        return;
+    const double q[4] = {0.50, 0.90, 0.99, 0.999};
+    long long pct[4] = {0, 0, 0, 0};
+    uint64_t acc = 0;
+    unsigned qi = 0;
+    for (unsigned b = 0; b < RXStream::LAG_BINS && qi < 4; b++) {
+        acc += rx.lag_hist[b];
+        while (qi < 4 && (double)acc >= q[qi] * (double)rx.lag_n)
+            pct[qi++] = (long long)b * RXStream::LAG_BIN_US;
+    }
+    std::fprintf(stderr, "M2SDR RX delivery lag (us): n=%llu min=%lld p50=%lld p90=%lld p99=%lld p99.9=%lld "
+                 "max=%lld incomplete-at-delivery=%llu\n", (unsigned long long)rx.lag_n, rx.lag_min,
+                 pct[0], pct[1], pct[2], pct[3], rx.lag_max, (unsigned long long)rx.lag_tail_mismatch);
+    std::fflush(stderr);
+    std::fill(rx.lag_hist.begin(), rx.lag_hist.end(), 0);
+    rx.lag_n = 0;
+    rx.lag_t0 = now;
+}
+
+/***********************************************************************
  * RX decoupling worker
  *
  * Drains the DMA ring into a userspace ring and releases each DMA buffer
@@ -1823,6 +1897,7 @@ void SoapyLiteXM2SDR::rxWorkerLoop(void) {
              * the reader can surface END_ABRUPT exactly once per gap. */
             std::lock_guard<std::mutex> lk(_rx_stream.rxw_mutex);
             _rx_stream.rxw_pending_discontinuity = true;
+            _rx_stream.lag_tail_ptr = nullptr;
             continue;
         }
         if (rc != M2SDR_ERR_OK)
@@ -1842,6 +1917,9 @@ void SoapyLiteXM2SDR::rxWorkerLoop(void) {
                 have_ts = true;
             }
         }
+
+        if (have_ts)
+            this->rxLagStatsUpdate(ts, total_samples / _nChannels, buffer, bytes);
 
         size_t idx;
         {
@@ -2110,6 +2188,7 @@ int SoapyLiteXM2SDR::acquireReadBuffer(
         if (rc == M2SDR_ERR_OVERFLOW) {
             _rx_stream.pendingReadBufs.clear();
             _rx_stream.overflow = true;
+            _rx_stream.lag_tail_ptr = nullptr;
             flags |= SOAPY_SDR_END_ABRUPT;
             _rx_stream.time0_ns = this->hardwareTimeNs();
             _rx_stream.time0_count = _rx_stream.user_count;
@@ -2141,6 +2220,8 @@ int SoapyLiteXM2SDR::acquireReadBuffer(
             if (_rx_dma_header_bytes != 0 &&
                 m2sdr_get_buffer_metadata(_dev, M2SDR_RX, buffer, &meta) == M2SDR_ERR_OK &&
                 (meta.flags & M2SDR_META_FLAG_HAS_TIME)) {
+                this->rxLagStatsUpdate(static_cast<long long>(meta.timestamp), samples_per_buffer, buffer,
+                                       samples_per_buffer * _nChannels * _bytesPerComplex);
                 timeNs = this->rxFrameLabel(static_cast<long long>(meta.timestamp), samples_per_buffer);
                 have_hw_time = true;
             } else {

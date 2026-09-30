@@ -190,6 +190,13 @@ Result (gateware v7, OCUDU with the stock lower PHY, `timed_tx=hardware,time_bas
 * gate counters `passed == 11272 frames/s`, `late == stale == 0`, fine gate `trimmed == 0`;
 * timing met: WNS +0.038 ns overall and in the 245.76 MHz RFIC domain.
 
+## RX delivery lag and the TX ring's underrun behaviour
+
+See `doc/rx_delivery_lag.md`: one interrupt per RX buffer (kernel module parameter `rx_irq_period`),
+the completed-buffer count fix, the `rx_poll=busy` device argument (poll-mode wake-up), measurements,
+and why the free-running TX ring, not interrupt latency, is what keeps the application's TX lead above
+1 ms. Probes: `test/probes/`.
+
 ## Test procedure
 
 1. `test/test_timed_tx_gate.py` — simulation (pass-through, untimed, on-time, hold, late, stale,

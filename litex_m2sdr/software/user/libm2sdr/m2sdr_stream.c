@@ -476,6 +476,7 @@ int m2sdr_sync_config(struct m2sdr_dev *dev,
                                     &dma->writer_hw_count, &dma->writer_sw_count);
                 dev->rx_user_count = dma->writer_sw_count;
                 dev->rx_release_count = dma->writer_sw_count;
+                dev->rx_live_valid = 0;
             }
         } else {
             dma->reader_enable = 1;
@@ -871,6 +872,7 @@ int m2sdr_stream_activate(struct m2sdr_dev *dev, enum m2sdr_direction direction)
                                     &dma->writer_sw_count);
                 dev->rx_user_count = dma->writer_hw_count;
                 dev->rx_release_count = dma->writer_hw_count;
+                dev->rx_live_valid = 0;
             }
         } else if (direction == M2SDR_TX && dev->tx_configured) {
             struct litepcie_dma_ctrl *dma = &dev->tx_dma;
@@ -971,23 +973,50 @@ static int m2sdr_wait_rx_buffer(struct m2sdr_dev *dev, char **buf, unsigned time
         struct litepcie_dma_ctrl *dma = &dev->rx_dma;
 
         for (;;) {
-            litepcie_dma_writer(dma->fds.fd, dma->writer_enable,
-                                &dma->writer_hw_count, &dma->writer_sw_count);
             int64_t buffer_count = dma->mmap_dma_info.dma_rx_buf_count;
             if (buffer_count <= 0)
                 return M2SDR_ERR_STATE;
 
-            if ((dma->writer_hw_count - dev->rx_release_count) > (buffer_count / 2)) {
+            /* Completed-buffer count. Interrupt mode: the kernel's count, refreshed by the DMA
+             * interrupt (the poll() below sleeps until the next one). Busy-poll mode: the DMA
+             * writer's live table index, read from the hardware on every iteration - no interrupt
+             * and no sleep in the delivery path, at the price of a spinning thread. */
+            int64_t hw_count;
+            uint32_t loop = 0;
+            if (dev->rx_busy_poll && dev->rx_live_valid &&
+                m2sdr_reg_read(dev, CSR_PCIE_DMA0_WRITER_TABLE_LOOP_STATUS_ADDR, &loop) == 0 && loop != 0) {
+                /* The loop status is the (count, index) of the descriptor completed last, so
+                 * index + 1 buffers of the current loop are complete. (0, 0) is ambiguous - nothing
+                 * or one buffer completed - and is left to the kernel's interrupt-driven count. */
+                const int64_t modulus = (int64_t)65536 * buffer_count;   /* 16-bit loop count x buffers */
+                int64_t live = (int64_t)(loop >> 16) * buffer_count + (int64_t)(loop & 0xffff) + 1;
+                int64_t d = (live - dev->rx_live_count) % modulus;
+                if (d < 0) d += modulus;
+                if (d < modulus / 2)
+                    dev->rx_live_count += d;
+                hw_count = dev->rx_live_count;
+            } else {
+                litepcie_dma_writer(dma->fds.fd, dma->writer_enable,
+                                    &dma->writer_hw_count, &dma->writer_sw_count);
+                hw_count = dma->writer_hw_count;
+                if (dev->rx_busy_poll) {
+                    /* Seed the live counter from the kernel's 64-bit count. */
+                    dev->rx_live_count = hw_count;
+                    dev->rx_live_valid = 1;
+                }
+            }
+
+            if ((hw_count - dev->rx_release_count) > (buffer_count / 2)) {
                 dev->pcie_rx_overflow_events++;
                 dev->pcie_rx_overflow_buffers +=
-                    (uint64_t)(dma->writer_hw_count - dev->rx_release_count);
-                dev->rx_user_count = dma->writer_hw_count;
-                dev->rx_release_count = dma->writer_hw_count;
+                    (uint64_t)(hw_count - dev->rx_release_count);
+                dev->rx_user_count = hw_count;
+                dev->rx_release_count = hw_count;
                 m2sdr_pcie_dma_update_rx_release(dev);
                 return M2SDR_ERR_OVERFLOW;
             }
 
-            if ((dma->writer_hw_count - dev->rx_user_count) > 0) {
+            if ((hw_count - dev->rx_user_count) > 0) {
                 int buf_offset = dev->rx_user_count % buffer_count;
                 *buf = dma->buf_rd + buf_offset * dma->mmap_dma_info.dma_rx_buf_size;
                 dev->rx_user_count++;
@@ -997,6 +1026,8 @@ static int m2sdr_wait_rx_buffer(struct m2sdr_dev *dev, char **buf, unsigned time
                 return M2SDR_ERR_TIMEOUT;
             if (timeout_ms > 0 && (get_time_ms() - start) > (int64_t)timeout_ms)
                 return M2SDR_ERR_TIMEOUT;
+            if (dev->rx_busy_poll)
+                continue;
             int wait_ms = timeout_ms ? (int)timeout_ms : 100;
             (void)poll(&dma->fds, 1, wait_ms);
         }
@@ -1458,6 +1489,15 @@ int m2sdr_set_tx_ring_depth(struct m2sdr_dev *dev, unsigned max_pending_buffers)
     if (!dev)
         return M2SDR_ERR_INVAL;
     dev->tx_max_pending = (int64_t)max_pending_buffers;
+    return M2SDR_ERR_OK;
+}
+
+int m2sdr_set_rx_busy_poll(struct m2sdr_dev *dev, bool enable)
+{
+    if (!dev)
+        return M2SDR_ERR_INVAL;
+    dev->rx_busy_poll = enable ? 1 : 0;
+    dev->rx_live_valid = 0;
     return M2SDR_ERR_OK;
 }
 

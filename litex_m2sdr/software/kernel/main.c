@@ -628,13 +628,33 @@ static int litepcie_dma_init(struct litepcie_device *s)
 	return 0;
 }
 
+/* DMA interrupt cadence, in buffers per MSI. One interrupt per buffer delivers every
+ * frame as soon as it completes (RX delivery lag = one frame + wake-up latency) at the
+ * cost of buffer-rate interrupts; larger values batch the delivery. Read when a stream
+ * starts, so a change through /sys/module/<module>/parameters applies to the next start.
+ */
+static unsigned int rx_irq_period = DMA_BUFFER_PER_IRQ_RX;
+module_param(rx_irq_period, uint, 0644);
+MODULE_PARM_DESC(rx_irq_period, "DMA writer (RX) buffers per interrupt (1..DMA_BUFFER_COUNT)");
+
+static unsigned int tx_irq_period = DMA_BUFFER_PER_IRQ_TX;
+module_param(tx_irq_period, uint, 0644);
+MODULE_PARM_DESC(tx_irq_period, "DMA reader (TX) buffers per interrupt (1..DMA_BUFFER_COUNT)");
+
+static unsigned int litepcie_dma_irq_period(unsigned int period)
+{
+	return clamp_t(unsigned int, period, 1, DMA_BUFFER_COUNT);
+}
+
 /* Start DMA writer for a specific channel */
 static void litepcie_dma_writer_start(struct litepcie_device *s, int chan_num)
 {
 	struct litepcie_dma_chan *dmachan;
 	int i;
+	unsigned int irq_period;
 
 	dmachan = &s->chan[chan_num].dma;
+	irq_period = litepcie_dma_irq_period(READ_ONCE(rx_irq_period));
 
 	/* Fill DMA Writer descriptors */
 	litepcie_writel(s, dmachan->base + PCIE_DMA_WRITER_ENABLE_OFFSET, 0);
@@ -646,7 +666,7 @@ static void litepcie_dma_writer_start(struct litepcie_device *s, int chan_num)
 #ifndef DMA_BUFFER_ALIGNED
 			DMA_LAST_DISABLE |
 #endif
-			(!(i % DMA_BUFFER_PER_IRQ == 0)) * DMA_IRQ_DISABLE | /* Generate an MSI every n buffers */
+			(!(i % irq_period == 0)) * DMA_IRQ_DISABLE | /* Generate an MSI every n buffers */
 			DMA_BUFFER_SIZE);
 		/* Fill 32-bit Address LSB */
 		litepcie_writel(s, dmachan->base + PCIE_DMA_WRITER_TABLE_VALUE_OFFSET + 4, (dmachan->writer_handle[i] >>  0) & 0xffffffff);
@@ -659,6 +679,12 @@ static void litepcie_dma_writer_start(struct litepcie_device *s, int chan_num)
 	dmachan->writer_hw_count = 0;
 	dmachan->writer_hw_count_last = 0;
 	dmachan->writer_sw_count = 0;
+
+#ifdef CSR_PCIE_MSI_CLEAR_ADDR
+	/* Drop a writer interrupt left pending by a previous run: the handler takes every
+	 * writer interrupt as "at least one buffer completed". */
+	litepcie_writel(s, CSR_PCIE_MSI_CLEAR_ADDR, 1 << dmachan->writer_interrupt);
+#endif
 
 	/* Start DMA Writer */
 	litepcie_writel(s, dmachan->base + PCIE_DMA_WRITER_ENABLE_OFFSET, 1);
@@ -707,8 +733,10 @@ static void litepcie_dma_reader_start(struct litepcie_device *s, int chan_num)
 {
 	struct litepcie_dma_chan *dmachan;
 	int i;
+	unsigned int irq_period;
 
 	dmachan = &s->chan[chan_num].dma;
+	irq_period = litepcie_dma_irq_period(READ_ONCE(tx_irq_period));
 
 	/* Fill DMA Reader descriptors */
 	litepcie_writel(s, dmachan->base + PCIE_DMA_READER_ENABLE_OFFSET, 0);
@@ -720,7 +748,7 @@ static void litepcie_dma_reader_start(struct litepcie_device *s, int chan_num)
 #ifndef DMA_BUFFER_ALIGNED
 			DMA_LAST_DISABLE |
 #endif
-			(!(i % DMA_BUFFER_PER_IRQ == 0)) * DMA_IRQ_DISABLE | /* Generate an MSI every n buffers */
+			(!(i % irq_period == 0)) * DMA_IRQ_DISABLE | /* Generate an MSI every n buffers */
 			DMA_BUFFER_SIZE);
 		/* Fill 32-bit Address LSB */
 		litepcie_writel(s, dmachan->base + PCIE_DMA_READER_TABLE_VALUE_OFFSET + 4, (dmachan->reader_handle[i] >>  0) & 0xffffffff);
@@ -846,8 +874,13 @@ static irqreturn_t litepcie_interrupt(int irq, void *data)
 		if (irq_vector & (1 << chan->dma.writer_interrupt)) {
 			loop_status = litepcie_readl(s, chan->dma.base +
 				PCIE_DMA_WRITER_TABLE_LOOP_STATUS_OFFSET);
+			/* The table's loop status is the (count, index) of the descriptor that completed
+			 * LAST, and this interrupt is raised by a completion: index + 1 buffers of the
+			 * current loop are in memory. (Using the bare index, as before, withheld the
+			 * newest complete buffer until the next interrupt: one full buffer of delay.)
+			 */
 			chan->dma.writer_hw_count &= ((~(DMA_BUFFER_COUNT - 1) << 16) & 0xffffffffffff0000);
-			chan->dma.writer_hw_count |= (loop_status >> 16) * DMA_BUFFER_COUNT + (loop_status & 0xffff);
+			chan->dma.writer_hw_count += (loop_status >> 16) * DMA_BUFFER_COUNT + (loop_status & 0xffff) + 1;
 			if (chan->dma.writer_hw_count_last > chan->dma.writer_hw_count)
 				chan->dma.writer_hw_count += (1 << (ilog2(DMA_BUFFER_COUNT) + 16));
 			chan->dma.writer_hw_count_last = chan->dma.writer_hw_count;
@@ -1258,7 +1291,9 @@ static unsigned int litepcie_poll(struct file *file, poll_table *wait)
 		chan->dma.reader_hw_count, chan->dma.reader_sw_count);
 #endif
 
-	if ((chan->dma.writer_hw_count - chan->dma.writer_sw_count) > 2)
+	/* Readable as soon as one buffer is complete: a higher threshold would batch the
+	 * delivery again when the interrupt cadence is one buffer. */
+	if ((chan->dma.writer_hw_count - chan->dma.writer_sw_count) > 0)
 		mask |= POLLIN | POLLRDNORM;
 
 	if ((chan->dma.reader_sw_count - chan->dma.reader_hw_count) < DMA_BUFFER_COUNT/2)

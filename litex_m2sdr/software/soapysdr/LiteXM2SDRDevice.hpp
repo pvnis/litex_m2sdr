@@ -424,6 +424,7 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     bool      _tx_running = false;
     void      alignTickParity(bool other_stream_running);
     long long hardwareTicks() const;
+    void rxLagStatsUpdate(long long ts, size_t samples, const void *buffer, size_t bytes);
     long long hwUnits(long long samples) const;
     mutable std::mutex _time_map_mutex;
     bool      _time_map_valid = false;
@@ -551,6 +552,22 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         bool                          rxw_pending_discontinuity = false;
         std::map<size_t, size_t>      rxw_inflight;   /* handle -> slot index */
         size_t                        rxw_next_handle = 0;
+
+        /* Delivery-lag statistics (M2SDR_RX_LAG_STATS), see rxLagStatsUpdate(). */
+        static constexpr unsigned     LAG_BIN_US = 2;
+        static constexpr unsigned     LAG_BINS = 4096;
+        static constexpr size_t       LAG_TAIL_BYTES = 256;
+        double                        lag_period_s = -1.0;   /* < 0: environment not read yet */
+        unsigned                      lag_every = 1;
+        std::vector<uint32_t>         lag_hist;
+        uint64_t                      lag_n = 0;
+        uint64_t                      lag_skip = 0;
+        long long                     lag_min = 0;
+        long long                     lag_max = 0;
+        std::chrono::steady_clock::time_point lag_t0;
+        const uint8_t                *lag_tail_ptr = nullptr;
+        uint8_t                       lag_tail_copy[LAG_TAIL_BYTES];
+        uint64_t                      lag_tail_mismatch = 0;
     };
 
     struct TXStream: Stream {

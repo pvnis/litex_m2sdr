@@ -29,7 +29,9 @@
 #define DMA_LAST_DISABLE (1<<25)
 
 #define DMA_CHANNEL_COUNT      DMA_CHANNELS
-#define DMA_BUFFER_PER_IRQ     8
+#define DMA_BUFFER_PER_IRQ     8  /* Upstream cadence; upper bound assumed by user space */
+#define DMA_BUFFER_PER_IRQ_RX  1  /* Default RX cadence (module parameter rx_irq_period) */
+#define DMA_BUFFER_PER_IRQ_TX  8  /* Default TX cadence (module parameter tx_irq_period) */
 #define DMA_BUFFER_COUNT       256
 #define DMA_BUFFER_SIZE        8192
 #define DMA_BUFFER_TOTAL_SIZE (DMA_BUFFER_COUNT*DMA_BUFFER_SIZE)

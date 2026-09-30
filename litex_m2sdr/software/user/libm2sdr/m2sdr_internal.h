@@ -83,6 +83,10 @@ struct m2sdr_dev {
      * have not been consumed by the DMA reader yet. 0 = the whole ring. */
     int64_t  tx_max_pending;
     uint64_t pcie_tx_resync_events;
+    /* RX busy-poll mode: completed-buffer count taken from the DMA writer's live table index. */
+    int      rx_busy_poll;
+    int      rx_live_valid;
+    int64_t  rx_live_count;
     struct ad9361_rf_phy *ad9361_phy;
     /* Per-device snapshot of the AD9361_InitParam used at RF bring-up.
      * The header-defined default_init_param template is per translation

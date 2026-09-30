@@ -760,6 +760,11 @@ int  m2sdr_set_tx_ring_lead(struct m2sdr_dev *dev, unsigned min_lead_buffers);
  * once that many submitted buffers are still unconsumed. 0 = whole ring (previous behaviour). */
 int  m2sdr_set_tx_ring_depth(struct m2sdr_dev *dev, unsigned max_pending_buffers);
 uint64_t m2sdr_get_tx_resync_events(struct m2sdr_dev *dev);
+/* RX wake-up mode (PCIe zero-copy). Default: the RX buffer acquire sleeps in poll() until the DMA
+ * interrupt (kernel module parameter rx_irq_period = buffers per interrupt). Busy-poll: the acquire
+ * spins on the DMA writer's live table index instead, the way a poll-mode driver would - no interrupt
+ * or scheduler wake-up between a completed buffer and the caller, one CPU core kept busy. */
+int  m2sdr_set_rx_busy_poll(struct m2sdr_dev *dev, bool enable);
 
 /* GPIO helper (4-bit) */
 int  m2sdr_gpio_config(struct m2sdr_dev *dev, bool enable, bool loopback, bool source_csr);
