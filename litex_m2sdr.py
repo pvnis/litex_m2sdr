@@ -65,6 +65,7 @@ from litex_m2sdr.gateware.pcie        import (
 )
 from litex_m2sdr.gateware.header      import TXRXHeader
 from litex_m2sdr.gateware.timed_tx_gate import TimedTXGate
+from litex_m2sdr.gateware.timed_rx_start import TimedRXStart
 from litex_m2sdr.gateware.etherbone   import SharedLiteEthEtherbone
 from litex_m2sdr.gateware.led         import StatusLed
 from litex_m2sdr.gateware.measurement import MultiClkMeasurement
@@ -312,6 +313,7 @@ class BaseSoC(SoCMini):
         "txrx_loopback"    : 33,
         "pps_in"           : 42, # was auto-allocated here; pinned so adding timed_tx moves nothing
         "timed_tx"         : 43,
+        "timed_rx"         : 44,
 
         # Measurements/Analyzer.
         "clk_measurement"  : 30,
@@ -869,6 +871,12 @@ class BaseSoC(SoCMini):
             self.txrx_loopback.tx_source.connect(self.ad9361.sink),
         ]
 
+        # Timed RX start: holds the RX header inserter in reset (samples dropped) until board time
+        # reaches the programmed start time, so the first DMA frame is stamped with it (the
+        # stream_cmd(time_spec) semantics of a USRP). Transparent unless armed through its CSR.
+        self.timed_rx = TimedRXStart()
+        self.comb += self.timed_rx.time.eq(self.time_gen.time)
+
         # RFIC RX -> Loopback -> Header RX.
         self.comb += [
             self.ad9361.source.connect(self.txrx_loopback.rx_sink),
@@ -943,7 +951,8 @@ class BaseSoC(SoCMini):
                     # inserted headers with the first DMA buffer on every Writer start (frames are
                     # exactly one buffer long, so a phase slip at start would persist for the
                     # whole run).
-                    self.header.rx.reset.eq(~self.pcie_dma0.synchronizer.synced | ~self.pcie_dma0.writer.enable)
+                    self.header.rx.reset.eq(~self.pcie_dma0.synchronizer.synced | ~self.pcie_dma0.writer.enable |
+                                            self.timed_rx.hold)
                 )
             ]
         if with_eth:
