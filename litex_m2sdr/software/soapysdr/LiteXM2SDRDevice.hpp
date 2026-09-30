@@ -543,6 +543,12 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
         bool timed_tx_late_margin_configured = false;
         bool tx_timeline_valid = false;
         long long tx_next_time_ns = 0;
+        /* tx_next_time_ns is derived, never accumulated: anchor stamp + exact sample count since
+         * the anchor. Accumulating per-chunk llround(n * 1e9 / rate) drifted ~1 ppm (0.3 ns per
+         * 2044-sample chunk) and moved the emission of every following untimed write. */
+        long long tx_timeline_anchor_ns = 0;
+        long long tx_timeline_samples = 0;
+        uint64_t  hw_resync_seen = 0;
 
         /* ---- Measured TX emission anchor --------------------------------
          * initTimedTxTimeline() used to anchor the timeline to a bare
@@ -607,6 +613,8 @@ class DLL_EXPORT SoapyLiteXM2SDR : public SoapySDR::Device {
     void cleanupLiteEthUdpIfIdleUnlocked();
     bool tryAnchorTxTimeline(void);
     void resetTimedTxTimeline();
+    void setTxTimeline(long long ns);
+    void advanceTxTimeline(long long samples);
     void refreshTimedTxDefaults();
     void initTimedTxTimeline();
     int ensureTxRemainderBuffer(

@@ -903,8 +903,12 @@ int SoapyLiteXM2SDR::activateStream(
             if (_tx_stream.timed_tx_hw) {
                 /* Write at least this many slots ahead of the free-running reader (it prefetches
                  * about two buffers); the frame timestamps, not the ring position, set emission. */
+                /* Measured against the reader's live table index (libm2sdr): just past its ~3-slot
+                 * prefetch. It must stay well below one frame's sweep time (a skipped slot costs ~8 us
+                 * of DMA time, a frame lasts 88.7 us): a larger jump makes the frame after a hold
+                 * arrive late and be dropped, and the ring then thrashes. */
                 const unsigned lead = static_cast<unsigned>(
-                    std::max<size_t>(4, _tx_stream.timed_tx_lead_buffers ? _tx_stream.timed_tx_lead_buffers : 8));
+                    std::max<size_t>(3, _tx_stream.timed_tx_lead_buffers ? _tx_stream.timed_tx_lead_buffers : 4));
                 (void)m2sdr_set_tx_ring_lead(_dev, lead);
                 /* The kernel arms the DMA synchronizer at reader start: the TX stream (and an RX
                  * stream started alone) then waits for the next PPS edge, up to 1 s. Emission timing
@@ -956,6 +960,7 @@ int SoapyLiteXM2SDR::activateStream(
             }
             (void)m2sdr_reset_tx_timed_gate_counts(_dev);
             _tx_stream.hw_late_seen = 0;
+            _tx_stream.hw_resync_seen = m2sdr_get_tx_resync_events(_dev);
             _tx_stream.hw_stats_poll = std::chrono::steady_clock::now();
             /* The FPGA owns emission timing: no software anchoring against the DMA counters. */
             _tx_stream.tx_anchor_pending = false;
@@ -1158,6 +1163,16 @@ void SoapyLiteXM2SDR::refreshTimedTxDefaults()
             _tx_stream.timed_tx_late_margin_ns = 0;
             return;
         }
+        if (_tx_stream.timed_tx_hw) {
+            /* Hardware gate: a frame that arrives after its stamp but within the margin is emitted
+             * immediately and leaves that lateness as a permanent fill level in the RFIC TX FIFO
+             * (every later frame is held until its stamp, so the level never drains): the emission
+             * offset then depends on the worst in-margin arrival since start. Keep the margin tiny
+             * so the offset is bounded to ~1 us and every late frame is dropped instead (silence,
+             * recovered by HARQ) rather than shifting the DL timing the UE synchronises to. */
+            _tx_stream.timed_tx_late_margin_ns = 1000;
+            return;
+        }
         _tx_stream.timed_tx_late_margin_ns =
             samples_to_ns(_tx_stream.samplerate,
                           static_cast<long long>(this->getStreamMTU(TX_STREAM)));
@@ -1169,6 +1184,24 @@ void SoapyLiteXM2SDR::resetTimedTxTimeline()
 {
     _tx_stream.tx_timeline_valid = false;
     _tx_stream.tx_next_time_ns = 0;
+    _tx_stream.tx_timeline_anchor_ns = 0;
+    _tx_stream.tx_timeline_samples = 0;
+}
+
+/* Anchor the TX timeline: the next sample written is stamped ns. */
+void SoapyLiteXM2SDR::setTxTimeline(long long ns)
+{
+    _tx_stream.tx_timeline_anchor_ns = ns;
+    _tx_stream.tx_timeline_samples = 0;
+    _tx_stream.tx_next_time_ns = ns;
+}
+
+/* Advance the timeline by a number of samples, computed from the anchor so rounding never accumulates. */
+void SoapyLiteXM2SDR::advanceTxTimeline(long long samples)
+{
+    _tx_stream.tx_timeline_samples += samples;
+    _tx_stream.tx_next_time_ns = _tx_stream.tx_timeline_anchor_ns +
+        samples_to_ns(_tx_stream.samplerate, _tx_stream.tx_timeline_samples);
 }
 
 void SoapyLiteXM2SDR::initTimedTxTimeline()
@@ -1189,8 +1222,7 @@ void SoapyLiteXM2SDR::initTimedTxTimeline()
     /* Provisional anchor, kept so behaviour is sane if the hardware counters
      * are unavailable; tryAnchorTxTimeline() replaces it with a measured one
      * as soon as the DMA reader has emitted its first buffer. */
-    _tx_stream.tx_next_time_ns =
-        this->getHardwareTime("") + lead_ns + _tx_stream.timed_tx_latency_ns;
+    setTxTimeline(this->getHardwareTime("") + lead_ns + _tx_stream.timed_tx_latency_ns);
     _tx_stream.tx_timeline_valid = true;
     _tx_stream.tx_anchor_pending = true;
     _tx_stream.tx_underflow_seen = 0;
@@ -1257,11 +1289,10 @@ bool SoapyLiteXM2SDR::tryAnchorTxTimeline(void)
      * reliable sign. */
     const long long buffer_ns =
         samples_to_ns(_tx_stream.samplerate, (long long)buf_samples);
-    _tx_stream.tx_next_time_ns =
-        T + samples_to_ns(_tx_stream.samplerate, queued_samples)
+    setTxTimeline(T + samples_to_ns(_tx_stream.samplerate, queued_samples)
           - buffer_ns
           - _tx_stream.tx_anchor_margin_ns
-          + _tx_stream.timed_tx_latency_ns;
+          + _tx_stream.timed_tx_latency_ns);
     _tx_stream.tx_timeline_valid = true;
     _tx_stream.tx_anchor_pending = false;
     _tx_stream.tx_underflow_seen = st.underflow_events;
@@ -1325,9 +1356,7 @@ int SoapyLiteXM2SDR::submitTxRemainder(
      * That tail occupies air time, so the timeline must account for it. */
     if (_tx_stream.timed_tx_enabled && _tx_stream.tx_timeline_valid &&
         _tx_stream.remainderSamps != 0) {
-        _tx_stream.tx_next_time_ns +=
-            samples_to_ns(_tx_stream.samplerate,
-                          static_cast<long long>(_tx_stream.remainderSamps));
+        advanceTxTimeline(static_cast<long long>(_tx_stream.remainderSamps));
     }
 
     int submit_flags = _tx_stream.remainderFlags;
@@ -1383,8 +1412,7 @@ int SoapyLiteXM2SDR::appendTxZeros(
         numElems -= n;
 
         if (_tx_stream.timed_tx_enabled && _tx_stream.tx_timeline_valid) {
-            _tx_stream.tx_next_time_ns +=
-                samples_to_ns(_tx_stream.samplerate, static_cast<long long>(n));
+            advanceTxTimeline(static_cast<long long>(n));
         }
 
         ret = submitTxRemainder(stream, false);
@@ -1430,8 +1458,7 @@ int SoapyLiteXM2SDR::appendTxSamples(
         numElems -= n;
 
         if (_tx_stream.timed_tx_enabled && _tx_stream.tx_timeline_valid) {
-            _tx_stream.tx_next_time_ns +=
-                samples_to_ns(_tx_stream.samplerate, static_cast<long long>(n));
+            advanceTxTimeline(static_cast<long long>(n));
         }
 
         if (!(holdLast && numElems == 0)) {
@@ -2470,7 +2497,7 @@ int SoapyLiteXM2SDR::writeStream(
              * The software timeline is kept only so untimed writes that follow get contiguous stamps. */
             if (!_tx_stream.tx_timeline_valid)
                 initTimedTxTimeline();
-            _tx_stream.tx_next_time_ns = timeNs;
+            setTxTimeline(timeNs);
             _tx_stream.tx_timeline_valid = true;
             int ret = ensureTxRemainderBuffer(stream, timeoutUs);
             if (ret < 0)
@@ -2497,7 +2524,7 @@ int SoapyLiteXM2SDR::writeStream(
                     const long long hw_floor_ns =
                         this->getHardwareTime("") + _tx_stream.timed_tx_latency_ns;
                     if (_tx_stream.tx_next_time_ns < hw_floor_ns)
-                        _tx_stream.tx_next_time_ns = hw_floor_ns;
+                        setTxTimeline(hw_floor_ns);
                 } catch (const std::exception &e) {
                     SoapySDR::logf(SOAPY_SDR_WARNING,
                         "TX timed write could not read board time: %s", e.what());
@@ -2598,6 +2625,15 @@ int SoapyLiteXM2SDR::readStreamStatus(
                 const auto now = std::chrono::steady_clock::now();
                 if (now - _tx_stream.hw_stats_poll >= std::chrono::milliseconds(10)) {
                     _tx_stream.hw_stats_poll = now;
+                    {
+                        const uint64_t rs = m2sdr_get_tx_resync_events(_dev);
+                        if (rs != _tx_stream.hw_resync_seen) {
+                            SoapySDR::logf(SOAPY_SDR_WARNING,
+                                "TX ring resync #%llu: the write pointer had fallen within the DMA reader's lead, moved ahead",
+                                (unsigned long long)rs);
+                            _tx_stream.hw_resync_seen = rs;
+                        }
+                    }
                     struct m2sdr_timed_tx_stats st;
                     if (m2sdr_get_tx_timed_gate_stats(_dev, &st) == M2SDR_ERR_OK &&
                         st.late_count != _tx_stream.hw_late_seen) {

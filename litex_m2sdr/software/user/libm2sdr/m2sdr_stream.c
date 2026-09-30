@@ -1038,12 +1038,27 @@ static int m2sdr_wait_tx_buffer(struct m2sdr_dev *dev, char **buf, unsigned time
             if (buffer_count <= 0)
                 return M2SDR_ERR_STATE;
 
-            int64_t buffers_pending = dev->tx_user_count - dma->reader_hw_count;
+            int64_t hw_now = dma->reader_hw_count;
+            if (dev->tx_min_lead > 0) {
+                /* The kernel refreshes hw_count only on the DMA IRQ (every 8 buffers); read the
+                 * reader's live table index so the lead is measured from where the reader really is. */
+                uint32_t loop = 0;
+                if (m2sdr_reg_read(dev, CSR_PCIE_DMA0_READER_TABLE_LOOP_STATUS_ADDR, &loop) == 0) {
+                    const int64_t modulus = (int64_t)65536 * buffer_count;   /* 16-bit loop count x buffers */
+                    int64_t live = (int64_t)(loop >> 16) * buffer_count + (int64_t)(loop & 0xffff);
+                    int64_t d = (live - hw_now) % modulus;
+                    if (d < 0) d += modulus;
+                    if (d >= modulus / 2) d -= modulus;
+                    if (d > 0)
+                        hw_now += d;
+                }
+            }
+            int64_t buffers_pending = dev->tx_user_count - hw_now;
             if (dev->tx_min_lead > 0 && buffers_pending < dev->tx_min_lead) {
                 /* Hardware-timed TX: keep the write pointer clear of the reader's prefetch.
                  * Skipped slots hold stale (late -> dropped) or zeroed (untimed silence) frames. */
                 dev->pcie_tx_resync_events++;
-                dev->tx_user_count = dma->reader_hw_count + dev->tx_min_lead;
+                dev->tx_user_count = hw_now + dev->tx_min_lead;
                 dev->tx_submit_count = dev->tx_user_count;
                 m2sdr_pcie_dma_update_tx_submit(dev);
                 buffers_pending = dev->tx_min_lead;
